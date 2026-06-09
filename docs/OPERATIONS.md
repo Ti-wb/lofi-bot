@@ -98,7 +98,8 @@ If `/status` says OBS is disconnected:
 
 - confirm OBS is open;
 - confirm WebSocket is enabled;
-- confirm `OBS_HOST`, `OBS_PORT`, and `OBS_PASSWORD`;
+- confirm `OBS_HOST` and `OBS_PORT`;
+- if OBS WebSocket authentication is enabled, set `OBS_PASSWORD`; otherwise leave it empty;
 - confirm macOS firewall is not blocking local WebSocket access.
 
 If uploads fail after acceptance:

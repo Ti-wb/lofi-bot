@@ -247,13 +247,9 @@ func (c *Client) handshake(ctx context.Context, conn *websocket.Conn) error {
 		return fmt.Errorf("decode OBS hello: %w", err)
 	}
 
-	identify := identifyData{RPCVersion: data.RPCVersion}
-	if data.Authentication != nil {
-		auth, err := buildAuthentication(c.opts.Password, data.Authentication.Salt, data.Authentication.Challenge)
-		if err != nil {
-			return err
-		}
-		identify.Authentication = auth
+	identify, err := buildIdentify(data, c.opts.Password)
+	if err != nil {
+		return err
 	}
 
 	if err := writeJSON(ctx, conn, envelope{Op: opIdentify, D: mustMarshal(identify)}); err != nil {
@@ -465,6 +461,19 @@ func writeJSON(ctx context.Context, conn *websocket.Conn, value any) error {
 	case err := <-done:
 		return err
 	}
+}
+
+func buildIdentify(data helloData, password string) (identifyData, error) {
+	identify := identifyData{RPCVersion: data.RPCVersion}
+	if data.Authentication == nil {
+		return identify, nil
+	}
+	auth, err := buildAuthentication(password, data.Authentication.Salt, data.Authentication.Challenge)
+	if err != nil {
+		return identifyData{}, err
+	}
+	identify.Authentication = auth
+	return identify, nil
 }
 
 func buildAuthentication(password, salt, challenge string) (string, error) {

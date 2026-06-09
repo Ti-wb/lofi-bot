@@ -73,6 +73,7 @@ make test
 - Files are retained by `RETENTION_DAYS` and `RETENTION_MAX_FILES`.
 - SQLite state is stored under `DATA_DIR` so the queue survives restarts.
 - `FALLBACK_MODE=random_played` keeps the channel alive by replaying completed history when the queue is empty.
+- `OBS_PASSWORD` can be left empty when OBS WebSocket authentication is disabled.
 
 More detail:
 
