@@ -23,7 +23,7 @@ func TestLoadReadsDotEnvAndDefaults(t *testing.T) {
 	}
 
 	body := []byte(`
-ENV_SCHEMA_VERSION=1
+ENV_SCHEMA_VERSION=2
 TELEGRAM_BOT_TOKEN=token
 TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
 ALLOWED_CHAT_ID=-1001
@@ -117,7 +117,7 @@ func TestLoadRejectsInvalidFallbackMode(t *testing.T) {
 	}
 
 	body := []byte(`
-ENV_SCHEMA_VERSION=1
+ENV_SCHEMA_VERSION=2
 TELEGRAM_BOT_TOKEN=token
 TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
 ALLOWED_CHAT_ID=-1001
@@ -156,9 +156,46 @@ OBS_MEDIA_SOURCE_NAME=player
 		t.Fatalf("max video size = %d", cfg.MaxVideoSizeBytes)
 	}
 	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=1")
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=2")
 	assertContains(t, migrated, "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081")
 	assertContains(t, migrated, "MAX_VIDEO_SIZE_MB=2000")
+	assertContains(t, migrated, "TELEGRAM_API_ID=replace-with-telegram-api-id")
+	assertContains(t, migrated, "TELEGRAM_API_HASH=replace-with-telegram-api-hash")
+	assertContains(t, migrated, "TELEGRAM_BOT_API_BIN=telegram-bot-api")
+	assertContains(t, migrated, "TELEGRAM_BOT_API_HOST=127.0.0.1")
+	assertContains(t, migrated, "TELEGRAM_BOT_API_PORT=8081")
+	assertContains(t, migrated, "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api")
+	if backups := backupFiles(t, dir); len(backups) != 1 {
+		t.Fatalf("backups = %v, want 1 backup", backups)
+	}
+}
+
+func TestLoadMigratesVersionOneDotEnvToVersionTwo(t *testing.T) {
+	clearConfigEnv(t)
+	dir := chdirTemp(t)
+	envPath := filepath.Join(dir, ".env")
+	body := []byte(`
+ENV_SCHEMA_VERSION=1
+TELEGRAM_BOT_TOKEN=token
+TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
+ALLOWED_CHAT_ID=-1001
+MAX_VIDEO_SIZE_MB=2000
+`)
+	if err := os.WriteFile(envPath, body, 0o600); err != nil {
+		t.Fatalf("write env: %v", err)
+	}
+
+	if _, err := Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	migrated := readFile(t, envPath)
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=2")
+	assertContains(t, migrated, "TELEGRAM_API_ID=replace-with-telegram-api-id")
+	assertContains(t, migrated, "TELEGRAM_API_HASH=replace-with-telegram-api-hash")
+	assertContains(t, migrated, "TELEGRAM_BOT_API_BIN=telegram-bot-api")
+	assertContains(t, migrated, "TELEGRAM_BOT_API_HOST=127.0.0.1")
+	assertContains(t, migrated, "TELEGRAM_BOT_API_PORT=8081")
+	assertContains(t, migrated, "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api")
 	if backups := backupFiles(t, dir); len(backups) != 1 {
 		t.Fatalf("backups = %v, want 1 backup", backups)
 	}
@@ -171,6 +208,8 @@ func TestLoadMigrationDoesNotOverwriteExistingValues(t *testing.T) {
 	body := []byte(`
 TELEGRAM_BOT_TOKEN=token
 TELEGRAM_API_BASE_URL=http://10.0.0.1:9000
+TELEGRAM_API_ID=custom-id
+TELEGRAM_BOT_API_PORT=9090
 ALLOWED_CHAT_ID=-1001
 MAX_VIDEO_SIZE_MB=123
 `)
@@ -189,10 +228,18 @@ MAX_VIDEO_SIZE_MB=123
 		t.Fatalf("max video size = %d", cfg.MaxVideoSizeBytes)
 	}
 	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=1")
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=2")
 	if countSubstring(migrated, "TELEGRAM_API_BASE_URL=") != 1 {
 		t.Fatalf("telegram api base url should not be duplicated:\n%s", migrated)
 	}
+	if countSubstring(migrated, "TELEGRAM_API_ID=") != 1 {
+		t.Fatalf("telegram api id should not be duplicated:\n%s", migrated)
+	}
+	assertContains(t, migrated, "TELEGRAM_API_ID=custom-id")
+	if countSubstring(migrated, "TELEGRAM_BOT_API_PORT=") != 1 {
+		t.Fatalf("telegram bot api port should not be duplicated:\n%s", migrated)
+	}
+	assertContains(t, migrated, "TELEGRAM_BOT_API_PORT=9090")
 	if countSubstring(migrated, "MAX_VIDEO_SIZE_MB=") != 1 {
 		t.Fatalf("max video size should not be duplicated:\n%s", migrated)
 	}
@@ -218,8 +265,9 @@ ALLOWED_CHAT_ID=-1001
 	if countSubstring(migrated, "ENV_SCHEMA_VERSION=") != 1 {
 		t.Fatalf("schema version should not be duplicated:\n%s", migrated)
 	}
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=1")
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=2")
 	assertContains(t, migrated, "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081")
+	assertContains(t, migrated, "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api")
 }
 
 func TestLoadDoesNotRemigrateCurrentDotEnv(t *testing.T) {
@@ -227,9 +275,15 @@ func TestLoadDoesNotRemigrateCurrentDotEnv(t *testing.T) {
 	dir := chdirTemp(t)
 	envPath := filepath.Join(dir, ".env")
 	body := []byte(`
-ENV_SCHEMA_VERSION=1
+ENV_SCHEMA_VERSION=2
 TELEGRAM_BOT_TOKEN=token
 TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
+TELEGRAM_API_ID=replace-with-telegram-api-id
+TELEGRAM_API_HASH=replace-with-telegram-api-hash
+TELEGRAM_BOT_API_BIN=telegram-bot-api
+TELEGRAM_BOT_API_HOST=127.0.0.1
+TELEGRAM_BOT_API_PORT=8081
+TELEGRAM_BOT_API_DIR=./data/telegram-bot-api
 ALLOWED_CHAT_ID=-1001
 `)
 	if err := os.WriteFile(envPath, body, 0o600); err != nil {
@@ -273,6 +327,12 @@ func clearConfigEnv(t *testing.T) {
 		"ENV_SCHEMA_VERSION",
 		"TELEGRAM_BOT_TOKEN",
 		"TELEGRAM_API_BASE_URL",
+		"TELEGRAM_API_ID",
+		"TELEGRAM_API_HASH",
+		"TELEGRAM_BOT_API_BIN",
+		"TELEGRAM_BOT_API_HOST",
+		"TELEGRAM_BOT_API_PORT",
+		"TELEGRAM_BOT_API_DIR",
 		"ALLOWED_CHAT_ID",
 		"OBS_HOST",
 		"OBS_PORT",

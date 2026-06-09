@@ -12,11 +12,10 @@
 
    - create a bot with BotFather;
    - obtain `api_id` and `api_hash` from Telegram;
-   - run the server with `--local`;
-   - use a fixed data directory;
-   - set `TELEGRAM_API_BASE_URL` in `.env`, for example `http://127.0.0.1:8081`.
+   - fill the shared root `.env`;
+   - run the server with `deploy/telegram-bot-api/run.sh`.
 
-   The public Telegram Bot API is not supported. The Local Bot API Server must return absolute local file paths from `getFile`.
+   The public Telegram Bot API is not supported. The Local Bot API Server must run with `--local` and return absolute local file paths from `getFile`. See [deploy/telegram-bot-api](../deploy/telegram-bot-api/README.md) for the setup scripts, health check, and manual public API logout step.
 
 3. Configure OBS:
 
@@ -47,7 +46,7 @@ Before deploying a new build, manually back up the production `.env`.
 
 On startup, the app checks `.env` against the supported schema version. If the file uses an older schema, it backs up the current file to `.env.backup.<unix_timestamp>` and appends the fields required by the migration.
 
-After migration, confirm `TELEGRAM_API_BASE_URL` points to the production Telegram Local Bot API Server. If the appended default is wrong, edit `.env` and restart the app.
+After migration, confirm the appended Telegram Local Bot API Server defaults are correct for production. If they are wrong, edit `.env` and restart the relevant process.
 
 ## Local Runbook
 
@@ -139,6 +138,4 @@ If videos do not visually change in OBS:
 
 ## Suggested LaunchAgent
 
-For unattended use, build once and create macOS LaunchAgents for both the Telegram Local Bot API Server and `dist/tg-obs-bot`. Keep fixed Local Bot API data, `.env`, `data/`, and logs on local disk.
-
-The `deploy/telegram-bot-api/` folder is reserved for future LaunchAgent plists and helper scripts.
+For unattended use, build once and create macOS LaunchAgents for both `deploy/telegram-bot-api/run.sh` and `dist/tg-obs-bot`. Keep fixed Local Bot API data, `.env`, `data/`, and logs on local disk.

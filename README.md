@@ -37,9 +37,9 @@ brew install go ffmpeg
 4. Keep the Go backend, Local Bot API Server, and OBS on the same machine, or use shared paths readable by all three processes.
 5. Add the bot to the target group.
 6. Find the group chat ID.
-7. Copy `.env.example` to `.env` and fill values, including `TELEGRAM_API_BASE_URL`.
+7. Copy `.env.example` to `.env` and fill the shared bot, group, OBS, and Local Bot API Server values.
 
-See [deploy/telegram-bot-api](deploy/telegram-bot-api/README.md) for the reserved Local Bot API Server deployment notes.
+See [deploy/telegram-bot-api](deploy/telegram-bot-api/README.md) for Local Bot API Server setup scripts and the shared `.env` contract.
 
 ## Run
 
@@ -51,9 +51,9 @@ make run
 
 ## Config Upgrades
 
-`.env` is local runtime config and is ignored by git. `.env.example` is the versioned schema; keep `ENV_SCHEMA_VERSION` at the top when creating or reviewing config.
+`.env` is local runtime config and is ignored by git. `.env.example` is the versioned schema shared by the Go backend and Telegram Local Bot API Server helpers; keep `ENV_SCHEMA_VERSION` at the top when creating or reviewing config.
 
-Before deploying a new build, back up the production `.env`. On startup, the app migrates older `.env` files by copying the original to `.env.backup.<unix_timestamp>` and appending missing fields required by the supported schema version. If the default `TELEGRAM_API_BASE_URL` is not correct for the production Local Bot API Server, edit `.env` and restart the app.
+Before deploying a new build, back up the production `.env`. On startup, the app migrates older `.env` files by copying the original to `.env.backup.<unix_timestamp>` and appending missing fields required by the supported schema version. If appended Local Bot API Server defaults are not correct for production, edit `.env` and restart the relevant process.
 
 Build a local binary:
 

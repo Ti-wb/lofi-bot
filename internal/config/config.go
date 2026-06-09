@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const currentEnvSchemaVersion = 1
+const currentEnvSchemaVersion = 2
 
 type Config struct {
 	TelegramBotToken   string
@@ -169,13 +169,33 @@ func envMigrationAdditions(version int, values map[string]string) []string {
 	var additions []string
 	if version < 1 {
 		if _, ok := values["ENV_SCHEMA_VERSION"]; !ok {
-			additions = append(additions, "ENV_SCHEMA_VERSION=1")
+			additions = append(additions, "ENV_SCHEMA_VERSION=2")
 		}
 		if _, ok := values["TELEGRAM_API_BASE_URL"]; !ok {
 			additions = append(additions, "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081")
 		}
 		if _, ok := values["MAX_VIDEO_SIZE_MB"]; !ok {
 			additions = append(additions, "MAX_VIDEO_SIZE_MB=2000")
+		}
+	}
+	if version < 2 {
+		if _, ok := values["TELEGRAM_API_ID"]; !ok {
+			additions = append(additions, "TELEGRAM_API_ID=replace-with-telegram-api-id")
+		}
+		if _, ok := values["TELEGRAM_API_HASH"]; !ok {
+			additions = append(additions, "TELEGRAM_API_HASH=replace-with-telegram-api-hash")
+		}
+		if _, ok := values["TELEGRAM_BOT_API_BIN"]; !ok {
+			additions = append(additions, "TELEGRAM_BOT_API_BIN=telegram-bot-api")
+		}
+		if _, ok := values["TELEGRAM_BOT_API_HOST"]; !ok {
+			additions = append(additions, "TELEGRAM_BOT_API_HOST=127.0.0.1")
+		}
+		if _, ok := values["TELEGRAM_BOT_API_PORT"]; !ok {
+			additions = append(additions, "TELEGRAM_BOT_API_PORT=8081")
+		}
+		if _, ok := values["TELEGRAM_BOT_API_DIR"]; !ok {
+			additions = append(additions, "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api")
 		}
 	}
 	return additions
