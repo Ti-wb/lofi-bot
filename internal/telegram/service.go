@@ -8,27 +8,38 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-const defaultUpdateTimeout = 30
+const (
+	defaultUpdateTimeout = 30
+	adminCacheTTL        = 60 * time.Second
+)
 
 type Config struct {
 	Token              string
 	AllowedChatID      int64
-	AdminUserIDs       map[int64]struct{}
 	MaxUploadSizeBytes int64
 	UpdateTimeout      int
 	Debug              bool
 }
 
 type Service struct {
-	bot    botAPI
-	cfg    Config
-	hooks  Hooks
-	logger *slog.Logger
+	bot             botAPI
+	cfg             Config
+	hooks           Hooks
+	logger          *slog.Logger
+	now             func() time.Time
+	adminCacheMutex sync.Mutex
+	adminCache      map[int64]adminCacheEntry
+}
+
+type adminCacheEntry struct {
+	adminIDs  map[int64]struct{}
+	expiresAt time.Time
 }
 
 type Hooks struct {
@@ -87,9 +98,11 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 	}
 
 	s := &Service{
-		cfg:    cfg,
-		hooks:  hooks,
-		logger: logger,
+		cfg:        cfg,
+		hooks:      hooks,
+		logger:     logger,
+		now:        time.Now,
+		adminCache: make(map[int64]adminCacheEntry),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -173,7 +186,7 @@ func (s *Service) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery
 		return
 	}
 
-	response, err := s.routeAction(ctx, cb.From, cb.Data)
+	response, err := s.routeAction(ctx, cb.Message.Chat.ID, cb.From, cb.Data)
 	if err != nil {
 		response = friendlyError(err)
 	}
@@ -188,7 +201,7 @@ func (s *Service) handleCommand(ctx context.Context, msg *tgbotapi.Message) (str
 	args := strings.Fields(msg.CommandArguments())
 	switch command {
 	case "start", "help":
-		return helpText(s.isAdmin(msg.From)), nil
+		return helpText(s.isAdmin(ctx, msg.Chat.ID, msg.From)), nil
 	case "queue", "list":
 		return s.callSimple(ctx, "list queue", s.hooks.ListQueue)
 	case "now":
@@ -198,7 +211,7 @@ func (s *Service) handleCommand(ctx context.Context, msg *tgbotapi.Message) (str
 	case "status":
 		return s.callSimple(ctx, "status", s.hooks.Status)
 	case "remove":
-		if !s.isAdmin(msg.From) {
+		if !s.isAdmin(ctx, msg.Chat.ID, msg.From) {
 			return "", errAdminOnly
 		}
 		id, err := parseIDArg(args, "remove")
@@ -207,7 +220,7 @@ func (s *Service) handleCommand(ctx context.Context, msg *tgbotapi.Message) (str
 		}
 		return s.callID(ctx, "remove", s.hooks.Remove, id)
 	case "move":
-		if !s.isAdmin(msg.From) {
+		if !s.isAdmin(ctx, msg.Chat.ID, msg.From) {
 			return "", errAdminOnly
 		}
 		id, position, err := parseMoveArgs(args)
@@ -216,7 +229,7 @@ func (s *Service) handleCommand(ctx context.Context, msg *tgbotapi.Message) (str
 		}
 		return s.callMove(ctx, s.hooks.Move, id, position)
 	case "skip":
-		if !s.isAdmin(msg.From) {
+		if !s.isAdmin(ctx, msg.Chat.ID, msg.From) {
 			return "", errAdminOnly
 		}
 		return s.callSimple(ctx, "skip", s.hooks.Skip)
@@ -225,7 +238,7 @@ func (s *Service) handleCommand(ctx context.Context, msg *tgbotapi.Message) (str
 	}
 }
 
-func (s *Service) routeAction(ctx context.Context, user *tgbotapi.User, data string) (string, error) {
+func (s *Service) routeAction(ctx context.Context, chatID int64, user *tgbotapi.User, data string) (string, error) {
 	parts := strings.Fields(strings.ReplaceAll(data, ":", " "))
 	if len(parts) == 0 {
 		return "", nil
@@ -242,7 +255,7 @@ func (s *Service) routeAction(ctx context.Context, user *tgbotapi.User, data str
 	case "status":
 		return s.callSimple(ctx, "status", s.hooks.Status)
 	case "remove":
-		if !s.isAdmin(user) {
+		if !s.isAdmin(ctx, chatID, user) {
 			return "", errAdminOnly
 		}
 		id, err := parseIDArg(parts[1:], "remove")
@@ -251,7 +264,7 @@ func (s *Service) routeAction(ctx context.Context, user *tgbotapi.User, data str
 		}
 		return s.callID(ctx, "remove", s.hooks.Remove, id)
 	case "move":
-		if !s.isAdmin(user) {
+		if !s.isAdmin(ctx, chatID, user) {
 			return "", errAdminOnly
 		}
 		id, position, err := parseMoveArgs(parts[1:])
@@ -260,7 +273,7 @@ func (s *Service) routeAction(ctx context.Context, user *tgbotapi.User, data str
 		}
 		return s.callMove(ctx, s.hooks.Move, id, position)
 	case "skip":
-		if !s.isAdmin(user) {
+		if !s.isAdmin(ctx, chatID, user) {
 			return "", errAdminOnly
 		}
 		return s.callSimple(ctx, "skip", s.hooks.Skip)
@@ -407,12 +420,63 @@ func (s *Service) answerCallback(ctx context.Context, callbackID string, text st
 	}
 }
 
-func (s *Service) isAdmin(user *tgbotapi.User) bool {
+func (s *Service) isAdmin(ctx context.Context, chatID int64, user *tgbotapi.User) bool {
 	if user == nil {
 		return false
 	}
-	_, ok := s.cfg.AdminUserIDs[int64(user.ID)]
+	userID := int64(user.ID)
+	adminIDs, _, err := s.getAdminIDs(ctx, chatID, false)
+	if err != nil {
+		s.logger.Warn("get telegram chat administrators", "chat_id", chatID, "error", err)
+		return false
+	}
+	if _, ok := adminIDs[userID]; ok {
+		return true
+	}
+
+	adminIDs, _, err = s.getAdminIDs(ctx, chatID, true)
+	if err != nil {
+		s.logger.Warn("refresh telegram chat administrators", "chat_id", chatID, "error", err)
+		return false
+	}
+	_, ok := adminIDs[userID]
 	return ok
+}
+
+func (s *Service) getAdminIDs(ctx context.Context, chatID int64, force bool) (map[int64]struct{}, bool, error) {
+	if !force {
+		s.adminCacheMutex.Lock()
+		entry, ok := s.adminCache[chatID]
+		if ok && s.now().Before(entry.expiresAt) {
+			s.adminCacheMutex.Unlock()
+			return entry.adminIDs, true, nil
+		}
+		s.adminCacheMutex.Unlock()
+	}
+
+	admins, err := s.bot.GetChatAdministrators(tgbotapi.ChatAdministratorsConfig{
+		ChatConfig: tgbotapi.ChatConfig{ChatID: chatID},
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	adminIDs := make(map[int64]struct{}, len(admins))
+	for _, admin := range admins {
+		if admin.User == nil || admin.User.IsBot {
+			continue
+		}
+		if admin.IsCreator() || admin.IsAdministrator() {
+			adminIDs[int64(admin.User.ID)] = struct{}{}
+		}
+	}
+
+	s.adminCacheMutex.Lock()
+	s.adminCache[chatID] = adminCacheEntry{
+		adminIDs:  adminIDs,
+		expiresAt: s.now().Add(adminCacheTTL),
+	}
+	s.adminCacheMutex.Unlock()
+	return adminIDs, false, nil
 }
 
 func parseIDArg(args []string, command string) (int64, error) {
@@ -568,4 +632,5 @@ type botAPI interface {
 	Send(tgbotapi.Chattable) (tgbotapi.Message, error)
 	Request(tgbotapi.Chattable) (*tgbotapi.APIResponse, error)
 	GetFile(tgbotapi.FileConfig) (tgbotapi.File, error)
+	GetChatAdministrators(tgbotapi.ChatAdministratorsConfig) ([]tgbotapi.ChatMember, error)
 }

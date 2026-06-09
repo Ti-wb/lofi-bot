@@ -23,7 +23,6 @@ func TestLoadReadsDotEnvAndDefaults(t *testing.T) {
 	body := []byte(`
 TELEGRAM_BOT_TOKEN=token
 ALLOWED_CHAT_ID=-1001
-ADMIN_USER_IDS=11,22
 DATA_DIR=./state
 OBS_MEDIA_SOURCE_NAME=player
 `)
@@ -40,9 +39,6 @@ OBS_MEDIA_SOURCE_NAME=player
 	}
 	if cfg.AllowedChatID != -1001 {
 		t.Fatalf("unexpected chat id: %d", cfg.AllowedChatID)
-	}
-	if _, ok := cfg.AdminUserIDs[11]; !ok {
-		t.Fatalf("missing admin id 11")
 	}
 	if cfg.MediaDir != "state/media" && cfg.MediaDir != "state\\media" {
 		t.Fatalf("unexpected media dir: %q", cfg.MediaDir)
@@ -76,7 +72,6 @@ func clearConfigEnv(t *testing.T) {
 	keys := []string{
 		"TELEGRAM_BOT_TOKEN",
 		"ALLOWED_CHAT_ID",
-		"ADMIN_USER_IDS",
 		"OBS_HOST",
 		"OBS_PORT",
 		"OBS_PASSWORD",

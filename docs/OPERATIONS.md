@@ -20,7 +20,7 @@
    - create a bot with BotFather;
    - add it to the target group;
    - collect the group chat ID;
-   - collect admin Telegram user IDs.
+   - make sure queue managers are Telegram group admins.
 
 4. Create local config:
 
@@ -59,6 +59,8 @@ make run
 The built binary is written to `dist/tg-obs-bot`.
 
 ## Telegram Admin Commands
+
+Telegram group admins can use these management commands. Anonymous admins should disable anonymous admin mode before issuing commands, because Telegram does not expose their real user ID to the bot.
 
 - `/queue`: show current and upcoming videos.
 - `/now`: show the current video.

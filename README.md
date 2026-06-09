@@ -5,7 +5,7 @@ Go backend for a 24h Lo-Fi Music channel workflow:
 - Telegram group members submit videos.
 - The bot validates and queues videos.
 - OBS plays queued videos through one Media Source controlled by OBS WebSocket.
-- Admins manage queue order from Telegram.
+- Telegram group admins manage queue order from Telegram.
 
 ## Requirements
 
@@ -32,7 +32,7 @@ brew install go ffmpeg
 
 1. Create a bot with BotFather.
 2. Add the bot to the target group.
-3. Find the group chat ID and admin user IDs.
+3. Find the group chat ID.
 4. Copy `.env.example` to `.env` and fill values.
 
 ## Run
@@ -57,6 +57,7 @@ make test
 
 ## Commands
 
+- Telegram group admins can manage queue playback automatically; no separate admin ID list is required.
 - `/queue` shows now playing and upcoming videos.
 - `/now` shows the current video.
 - `/remove <id>` cancels a queued video.

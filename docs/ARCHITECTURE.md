@@ -7,7 +7,7 @@
 - `cmd/tg-obs-bot`: process entrypoint, config loading, signal handling.
 - `internal/config`: `.env` and environment variable parsing.
 - `internal/app`: orchestration between Telegram, queue, media storage, and OBS.
-- `internal/telegram`: Telegram update loop, uploads, commands, admin checks.
+- `internal/telegram`: Telegram update loop, uploads, commands, and live group admin checks.
 - `internal/obs`: OBS WebSocket v5 client, auth handshake, media source control, playback-ended events.
 - `internal/queue`: SQLite-backed queue state and ordering.
 - `internal/media`: Telegram file download, file naming, `ffprobe` metadata, disk usage.
@@ -22,6 +22,10 @@
 6. If OBS is connected and idle, app service starts playback immediately.
 7. OBS client updates the configured Media Source and triggers restart.
 8. OBS playback-ended events cause app service to mark the current item played and advance to the next ready item.
+
+## Management Authorization
+
+The service uses Telegram's live group administrator list for management permissions. Admin-only commands call `getChatAdministrators` through the Telegram Bot API, cache the result briefly, and deny access if lookup fails.
 
 ## Queue States
 

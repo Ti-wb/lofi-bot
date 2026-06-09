@@ -83,7 +83,6 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 	bot, err := telegram.New(telegram.Config{
 		Token:              cfg.TelegramBotToken,
 		AllowedChatID:      cfg.AllowedChatID,
-		AdminUserIDs:       cfg.AdminUserIDs,
 		MaxUploadSizeBytes: cfg.MaxVideoSizeBytes,
 	}, service.telegramHooks(), logger.With("component", "telegram"))
 	if err != nil {

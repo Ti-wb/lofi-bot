@@ -14,7 +14,6 @@ import (
 type Config struct {
 	TelegramBotToken string
 	AllowedChatID    int64
-	AdminUserIDs     map[int64]struct{}
 
 	OBSHost            string
 	OBSPort            int
@@ -41,7 +40,6 @@ func Load() (Config, error) {
 	cfg := Config{
 		TelegramBotToken:        getenv("TELEGRAM_BOT_TOKEN", ""),
 		AllowedChatID:           getenvInt64("ALLOWED_CHAT_ID", 0),
-		AdminUserIDs:            parseInt64Set(getenv("ADMIN_USER_IDS", "")),
 		OBSHost:                 getenv("OBS_HOST", "127.0.0.1"),
 		OBSPort:                 getenvInt("OBS_PORT", 4455),
 		OBSPassword:             getenv("OBS_PASSWORD", ""),
@@ -64,9 +62,6 @@ func Load() (Config, error) {
 	}
 	if cfg.AllowedChatID == 0 {
 		return cfg, errors.New("ALLOWED_CHAT_ID is required")
-	}
-	if len(cfg.AdminUserIDs) == 0 {
-		return cfg, errors.New("ADMIN_USER_IDS is required")
 	}
 	if cfg.OBSMediaSourceName == "" {
 		return cfg, errors.New("OBS_MEDIA_SOURCE_NAME is required")
@@ -133,21 +128,6 @@ func getenvInt64(key string, fallback int64) int64 {
 		return fallback
 	}
 	return parsed
-}
-
-func parseInt64Set(raw string) map[int64]struct{} {
-	result := make(map[int64]struct{})
-	for _, part := range strings.Split(raw, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		value, err := strconv.ParseInt(part, 10, 64)
-		if err == nil {
-			result[value] = struct{}{}
-		}
-	}
-	return result
 }
 
 func parseLogLevel(raw string) slog.Level {
