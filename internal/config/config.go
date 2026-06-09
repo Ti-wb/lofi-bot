@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const currentEnvSchemaVersion = 1
+
 type Config struct {
 	TelegramBotToken   string
 	TelegramAPIBaseURL string
@@ -37,6 +39,9 @@ type Config struct {
 }
 
 func Load() (Config, error) {
+	if err := migrateDotEnv(".env"); err != nil {
+		return Config{}, err
+	}
 	_ = loadDotEnv(".env")
 
 	cfg := Config{
@@ -50,7 +55,7 @@ func Load() (Config, error) {
 		OBSFallbackFile:         getenv("OBS_FALLBACK_FILE", ""),
 		FallbackMode:            getenv("FALLBACK_MODE", "random_played"),
 		DataDir:                 getenv("DATA_DIR", "./data"),
-		MaxVideoSizeBytes:       int64(getenvInt("MAX_VIDEO_SIZE_MB", 500)) * 1024 * 1024,
+		MaxVideoSizeBytes:       int64(getenvInt("MAX_VIDEO_SIZE_MB", 2000)) * 1024 * 1024,
 		MaxVideoDurationSeconds: getenvInt("MAX_VIDEO_DURATION_SECONDS", 7200),
 		MaxQueueLength:          getenvInt("MAX_QUEUE_LENGTH", 50),
 		RetentionDays:           getenvInt("RETENTION_DAYS", 7),
@@ -84,6 +89,116 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func migrateDotEnv(path string) error {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
+	values := parseDotEnv(body)
+	version := 0
+	if rawVersion, ok := values["ENV_SCHEMA_VERSION"]; ok {
+		parsed, err := strconv.Atoi(strings.TrimSpace(rawVersion))
+		if err != nil {
+			return fmt.Errorf("ENV_SCHEMA_VERSION must be an integer")
+		}
+		version = parsed
+	}
+	if version > currentEnvSchemaVersion {
+		return fmt.Errorf("ENV_SCHEMA_VERSION %d is newer than this binary supports (%d)", version, currentEnvSchemaVersion)
+	}
+	if version == currentEnvSchemaVersion {
+		return nil
+	}
+
+	updatedBody := append([]byte(nil), body...)
+	if _, ok := values["ENV_SCHEMA_VERSION"]; ok {
+		updatedBody = setDotEnvValue(updatedBody, "ENV_SCHEMA_VERSION", strconv.Itoa(currentEnvSchemaVersion))
+		values["ENV_SCHEMA_VERSION"] = strconv.Itoa(currentEnvSchemaVersion)
+	}
+	additions := envMigrationAdditions(version, values)
+	if len(additions) == 0 && string(updatedBody) == string(body) {
+		return nil
+	}
+
+	backupPath := fmt.Sprintf("%s.backup.%d", path, time.Now().Unix())
+	if err := os.WriteFile(backupPath, body, 0o600); err != nil {
+		return fmt.Errorf("backup .env: %w", err)
+	}
+
+	updated := updatedBody
+	if len(updated) > 0 && updated[len(updated)-1] != '\n' {
+		updated = append(updated, '\n')
+	}
+	if len(additions) > 0 {
+		updated = append(updated, "\n# Added automatically by tg-obs-bot env migration.\n"...)
+		for _, addition := range additions {
+			updated = append(updated, addition...)
+			updated = append(updated, '\n')
+		}
+	}
+	if err := os.WriteFile(path, updated, 0o600); err != nil {
+		return fmt.Errorf("write migrated .env: %w", err)
+	}
+	return nil
+}
+
+func setDotEnvValue(body []byte, key string, value string) []byte {
+	lines := strings.Split(string(body), "\n")
+	for idx, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		rawKey, _, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(rawKey) != key {
+			continue
+		}
+		lines[idx] = key + "=" + value
+		return []byte(strings.Join(lines, "\n"))
+	}
+	return body
+}
+
+func envMigrationAdditions(version int, values map[string]string) []string {
+	var additions []string
+	if version < 1 {
+		if _, ok := values["ENV_SCHEMA_VERSION"]; !ok {
+			additions = append(additions, "ENV_SCHEMA_VERSION=1")
+		}
+		if _, ok := values["TELEGRAM_API_BASE_URL"]; !ok {
+			additions = append(additions, "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081")
+		}
+		if _, ok := values["MAX_VIDEO_SIZE_MB"]; !ok {
+			additions = append(additions, "MAX_VIDEO_SIZE_MB=2000")
+		}
+	}
+	return additions
+}
+
+func parseDotEnv(body []byte) map[string]string {
+	values := make(map[string]string)
+	for _, rawLine := range strings.Split(string(body), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		if key != "" {
+			values[key] = value
+		}
+	}
+	return values
 }
 
 func validFallbackMode(mode string) bool {

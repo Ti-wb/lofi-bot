@@ -37,9 +37,17 @@
    cp .env.example .env
    ```
 
-6. Fill `.env`.
+6. Fill `.env`. `.env` is ignored by git; `.env.example` is the versioned schema and starts with `ENV_SCHEMA_VERSION`.
 
 The Go backend, Telegram Local Bot API Server, and OBS should run on the same machine. If they do not, their media paths must be on shared storage and readable at the same absolute paths by the backend and OBS.
+
+## Production Config Upgrades
+
+Before deploying a new build, manually back up the production `.env`.
+
+On startup, the app checks `.env` against the supported schema version. If the file uses an older schema, it backs up the current file to `.env.backup.<unix_timestamp>` and appends the fields required by the migration.
+
+After migration, confirm `TELEGRAM_API_BASE_URL` points to the production Telegram Local Bot API Server. If the appended default is wrong, edit `.env` and restart the app.
 
 ## Local Runbook
 

@@ -49,6 +49,12 @@ make tidy
 make run
 ```
 
+## Config Upgrades
+
+`.env` is local runtime config and is ignored by git. `.env.example` is the versioned schema; keep `ENV_SCHEMA_VERSION` at the top when creating or reviewing config.
+
+Before deploying a new build, back up the production `.env`. On startup, the app migrates older `.env` files by copying the original to `.env.backup.<unix_timestamp>` and appending missing fields required by the supported schema version. If the default `TELEGRAM_API_BASE_URL` is not correct for the production Local Bot API Server, edit `.env` and restart the app.
+
 Build a local binary:
 
 ```sh
