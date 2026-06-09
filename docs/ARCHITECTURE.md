@@ -27,6 +27,10 @@
 
 The service uses Telegram's live group administrator list for management permissions. Admin-only commands call `getChatAdministrators` through the Telegram Bot API, cache the result briefly, and deny access if lookup fails.
 
+## Telegram Interaction UX
+
+Text commands remain supported, but the bot also registers Telegram command menu entries at startup and attaches inline keyboards to queue, status, now-playing, history, and upload-accepted messages. Callback buttons reuse the same authorization and hook paths as text commands.
+
 ## Queue States
 
 - `downloading`: accepted by Telegram and being downloaded.

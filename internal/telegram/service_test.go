@@ -24,8 +24,8 @@ func TestAdminCreatorAuthorized(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handle command: %v", err)
 	}
-	if response != "skipped" {
-		t.Fatalf("response = %q, want skipped", response)
+	if response.text != "skipped" {
+		t.Fatalf("response = %q, want skipped", response.text)
 	}
 }
 
@@ -41,8 +41,8 @@ func TestAdminAdministratorAuthorized(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handle command: %v", err)
 	}
-	if response != "skipped" {
-		t.Fatalf("response = %q, want skipped", response)
+	if response.text != "skipped" {
+		t.Fatalf("response = %q, want skipped", response.text)
 	}
 }
 
@@ -77,16 +77,16 @@ func TestAdminStaleDenyForceRefreshes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prime cache command: %v", err)
 	}
-	if response != "skipped" {
-		t.Fatalf("prime response = %q, want skipped", response)
+	if response.text != "skipped" {
+		t.Fatalf("prime response = %q, want skipped", response.text)
 	}
 
 	response, err = svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
 	if err != nil {
 		t.Fatalf("second handle command: %v", err)
 	}
-	if response != "skipped" {
-		t.Fatalf("response = %q, want skipped", response)
+	if response.text != "skipped" {
+		t.Fatalf("response = %q, want skipped", response.text)
 	}
 	if bot.adminCallCount != 2 {
 		t.Fatalf("admin API calls = %d, want 2", bot.adminCallCount)
@@ -122,6 +122,82 @@ func TestAdminLookupErrorDenies(t *testing.T) {
 	}
 }
 
+func TestQueueCommandIncludesPublicKeyboard(t *testing.T) {
+	bot := &fakeBotAPI{
+		adminResponses: []adminResponse{
+			{admins: []tgbotapi.ChatMember{}},
+			{admins: []tgbotapi.ChatMember{}},
+		},
+	}
+	svc := newTestService(t, bot)
+	svc.hooks.ListQueue = func(context.Context) (string, error) {
+		return "queue", nil
+	}
+
+	response, err := svc.handleCommand(context.Background(), commandMessage(42, "/queue"))
+	if err != nil {
+		t.Fatalf("handle command: %v", err)
+	}
+	assertButton(t, response.markup, "Refresh", "queue")
+	assertButton(t, response.markup, "Now", "now")
+	assertNoButton(t, response.markup, "Skip")
+}
+
+func TestQueueCommandIncludesAdminKeyboard(t *testing.T) {
+	bot := &fakeBotAPI{
+		adminResponses: []adminResponse{
+			{admins: []tgbotapi.ChatMember{chatMember(42, "administrator")}},
+		},
+	}
+	svc := newTestService(t, bot)
+	svc.hooks.ListQueue = func(context.Context) (string, error) {
+		return "目前佇列：\n#10 [第 2 位] song.mp4", nil
+	}
+
+	response, err := svc.handleCommand(context.Background(), commandMessage(42, "/queue"))
+	if err != nil {
+		t.Fatalf("handle command: %v", err)
+	}
+	assertButton(t, response.markup, "Skip", "skip")
+	assertButton(t, response.markup, "Remove #10", "remove:10")
+	assertButton(t, response.markup, "Up", "move:10:1")
+	assertButton(t, response.markup, "Down", "move:10:3")
+}
+
+func TestCallbackRefreshEditsMessage(t *testing.T) {
+	bot := &fakeBotAPI{
+		adminResponses: []adminResponse{
+			{admins: []tgbotapi.ChatMember{}},
+			{admins: []tgbotapi.ChatMember{}},
+		},
+	}
+	svc := newTestService(t, bot)
+	svc.hooks.ListQueue = func(context.Context) (string, error) {
+		return "queue refreshed", nil
+	}
+
+	svc.handleCallback(context.Background(), callbackQuery(42, "queue"))
+
+	if bot.editTextCount != 1 {
+		t.Fatalf("edit calls = %d, want 1", bot.editTextCount)
+	}
+	if bot.sendCount != 0 {
+		t.Fatalf("send calls = %d, want 0", bot.sendCount)
+	}
+}
+
+func TestRegisterCommandsSetsPublicAndAdminScopes(t *testing.T) {
+	bot := &fakeBotAPI{}
+	svc := newTestService(t, bot)
+
+	if err := svc.registerCommands(context.Background()); err != nil {
+		t.Fatalf("register commands: %v", err)
+	}
+	if bot.setCommandsCount != 2 {
+		t.Fatalf("set command calls = %d, want 2", bot.setCommandsCount)
+	}
+}
+
 func newTestService(t *testing.T, bot *fakeBotAPI) *Service {
 	t.Helper()
 
@@ -154,6 +230,18 @@ func commandMessage(userID int64, text string) *tgbotapi.Message {
 	}
 }
 
+func callbackQuery(userID int64, data string) *tgbotapi.CallbackQuery {
+	return &tgbotapi.CallbackQuery{
+		ID:   "callback-id",
+		From: &tgbotapi.User{ID: userID},
+		Message: &tgbotapi.Message{
+			MessageID: 99,
+			Chat:      &tgbotapi.Chat{ID: testChatID},
+		},
+		Data: data,
+	}
+}
+
 func chatMember(userID int64, status string) tgbotapi.ChatMember {
 	return tgbotapi.ChatMember{
 		User:   &tgbotapi.User{ID: userID},
@@ -174,8 +262,11 @@ type adminResponse struct {
 }
 
 type fakeBotAPI struct {
-	adminResponses []adminResponse
-	adminCallCount int
+	adminResponses   []adminResponse
+	adminCallCount   int
+	sendCount        int
+	editTextCount    int
+	setCommandsCount int
 }
 
 func (f *fakeBotAPI) GetUpdatesChan(tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel {
@@ -185,10 +276,17 @@ func (f *fakeBotAPI) GetUpdatesChan(tgbotapi.UpdateConfig) tgbotapi.UpdatesChann
 func (f *fakeBotAPI) StopReceivingUpdates() {}
 
 func (f *fakeBotAPI) Send(tgbotapi.Chattable) (tgbotapi.Message, error) {
+	f.sendCount++
 	return tgbotapi.Message{}, nil
 }
 
-func (f *fakeBotAPI) Request(tgbotapi.Chattable) (*tgbotapi.APIResponse, error) {
+func (f *fakeBotAPI) Request(req tgbotapi.Chattable) (*tgbotapi.APIResponse, error) {
+	switch req.(type) {
+	case tgbotapi.EditMessageTextConfig:
+		f.editTextCount++
+	case tgbotapi.SetMyCommandsConfig:
+		f.setCommandsCount++
+	}
 	return &tgbotapi.APIResponse{}, nil
 }
 
@@ -204,4 +302,33 @@ func (f *fakeBotAPI) GetChatAdministrators(tgbotapi.ChatAdministratorsConfig) ([
 	response := f.adminResponses[0]
 	f.adminResponses = f.adminResponses[1:]
 	return response.admins, response.err
+}
+
+func assertButton(t *testing.T, markup *tgbotapi.InlineKeyboardMarkup, text, data string) {
+	t.Helper()
+	if markup == nil {
+		t.Fatalf("expected markup with button %q", text)
+	}
+	for _, row := range markup.InlineKeyboard {
+		for _, button := range row {
+			if button.Text == text && button.CallbackData != nil && *button.CallbackData == data {
+				return
+			}
+		}
+	}
+	t.Fatalf("missing button %q with data %q in %#v", text, data, markup.InlineKeyboard)
+}
+
+func assertNoButton(t *testing.T, markup *tgbotapi.InlineKeyboardMarkup, text string) {
+	t.Helper()
+	if markup == nil {
+		return
+	}
+	for _, row := range markup.InlineKeyboard {
+		for _, button := range row {
+			if button.Text == text {
+				t.Fatalf("unexpected button %q in %#v", text, markup.InlineKeyboard)
+			}
+		}
+	}
 }

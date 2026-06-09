@@ -58,6 +58,7 @@ make test
 ## Commands
 
 - Telegram group admins can manage queue playback automatically; no separate admin ID list is required.
+- The bot registers Telegram command menus and adds inline buttons to common responses.
 - `/queue` shows now playing and upcoming videos.
 - `/now` shows the current video.
 - `/remove <id>` cancels a queued video.

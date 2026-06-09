@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,8 @@ const (
 	defaultUpdateTimeout = 30
 	adminCacheTTL        = 60 * time.Second
 )
+
+var queueItemPattern = regexp.MustCompile(`#([0-9]+).*第 ([0-9]+) 位`)
 
 type Config struct {
 	Token              string
@@ -57,6 +60,11 @@ type EnqueueUploadFunc func(context.Context, Upload) (string, error)
 type SimpleFunc func(context.Context) (string, error)
 type IDFunc func(context.Context, int64) (string, error)
 type MoveFunc func(context.Context, int64, int) (string, error)
+
+type botResponse struct {
+	text   string
+	markup *tgbotapi.InlineKeyboardMarkup
+}
 
 type Upload struct {
 	FileID          string
@@ -124,7 +132,34 @@ func WithBotAPI(bot botAPI) Option {
 	}
 }
 
+func (s *Service) registerCommands(ctx context.Context) error {
+	publicCommands := []tgbotapi.BotCommand{
+		{Command: "queue", Description: "Show queued videos"},
+		{Command: "now", Description: "Show what is playing"},
+		{Command: "status", Description: "Show bot, OBS, queue, and disk status"},
+		{Command: "history", Description: "Show recent completed items"},
+		{Command: "help", Description: "Show help"},
+	}
+	adminCommands := []tgbotapi.BotCommand{
+		{Command: "queue", Description: "Show queued videos"},
+		{Command: "now", Description: "Show what is playing"},
+		{Command: "status", Description: "Show bot, OBS, queue, and disk status"},
+		{Command: "history", Description: "Show recent completed items"},
+		{Command: "skip", Description: "Skip current playback"},
+		{Command: "help", Description: "Show help"},
+	}
+
+	if err := s.request(ctx, tgbotapi.NewSetMyCommandsWithScope(tgbotapi.NewBotCommandScopeChat(s.cfg.AllowedChatID), publicCommands...)); err != nil {
+		return err
+	}
+	return s.request(ctx, tgbotapi.NewSetMyCommandsWithScope(tgbotapi.NewBotCommandScopeChatAdministrators(s.cfg.AllowedChatID), adminCommands...))
+}
+
 func (s *Service) Run(ctx context.Context) error {
+	if err := s.registerCommands(ctx); err != nil {
+		s.logger.Warn("register telegram commands", "error", err)
+	}
+
 	updateConfig := tgbotapi.NewUpdate(0)
 	updateConfig.Timeout = s.cfg.UpdateTimeout
 
@@ -145,11 +180,16 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 func (s *Service) SendMessage(ctx context.Context, chatID int64, text string) error {
+	return s.SendMessageWithMarkup(ctx, chatID, text, nil)
+}
+
+func (s *Service) SendMessageWithMarkup(ctx context.Context, chatID int64, text string, markup *tgbotapi.InlineKeyboardMarkup) error {
 	if text == "" {
 		return nil
 	}
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.DisableWebPagePreview = true
+	msg.ReplyMarkup = markup
 	return s.send(ctx, msg)
 }
 
@@ -188,119 +228,128 @@ func (s *Service) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery
 
 	response, err := s.routeAction(ctx, cb.Message.Chat.ID, cb.From, cb.Data)
 	if err != nil {
-		response = friendlyError(err)
+		response = botResponse{text: friendlyError(err)}
 	}
-	s.answerCallback(ctx, cb.ID, truncateCallbackText(response))
-	if response != "" {
-		_ = s.SendMessage(ctx, cb.Message.Chat.ID, response)
+	s.answerCallback(ctx, cb.ID, truncateCallbackText(response.text))
+	if response.text != "" {
+		if isRefreshAction(cb.Data) {
+			if err := s.editCallbackMessage(ctx, cb.Message.Chat.ID, cb.Message.MessageID, response); err != nil {
+				s.logger.Warn("edit telegram callback message", "error", err)
+				_ = s.SendMessageWithMarkup(ctx, cb.Message.Chat.ID, response.text, response.markup)
+			}
+			return
+		}
+		_ = s.SendMessageWithMarkup(ctx, cb.Message.Chat.ID, response.text, response.markup)
 	}
 }
 
-func (s *Service) handleCommand(ctx context.Context, msg *tgbotapi.Message) (string, error) {
+func (s *Service) handleCommand(ctx context.Context, msg *tgbotapi.Message) (botResponse, error) {
 	command := strings.ToLower(msg.Command())
 	args := strings.Fields(msg.CommandArguments())
+	admin := s.isAdmin(ctx, msg.Chat.ID, msg.From)
 	switch command {
 	case "start", "help":
-		return helpText(s.isAdmin(ctx, msg.Chat.ID, msg.From)), nil
+		return botResponse{text: helpText(admin), markup: homeKeyboard(admin)}, nil
 	case "queue", "list":
-		return s.callSimple(ctx, "list queue", s.hooks.ListQueue)
+		return s.responseFromQueue(ctx, admin)
 	case "now":
-		return s.callSimple(ctx, "current video", s.hooks.Now)
+		return s.responseFromSimple(ctx, "current video", s.hooks.Now, nowKeyboard(admin))
 	case "history":
-		return s.callSimple(ctx, "history", s.hooks.History)
+		return s.responseFromSimple(ctx, "history", s.hooks.History, historyKeyboard(admin))
 	case "status":
-		return s.callSimple(ctx, "status", s.hooks.Status)
+		return s.responseFromSimple(ctx, "status", s.hooks.Status, statusKeyboard(admin))
 	case "remove":
-		if !s.isAdmin(ctx, msg.Chat.ID, msg.From) {
-			return "", errAdminOnly
+		if !admin {
+			return botResponse{}, errAdminOnly
 		}
 		id, err := parseIDArg(args, "remove")
 		if err != nil {
-			return "", err
+			return botResponse{}, err
 		}
-		return s.callID(ctx, "remove", s.hooks.Remove, id)
+		return s.responseFromID(ctx, "remove", s.hooks.Remove, id, queueKeyboard(admin, ""))
 	case "move":
-		if !s.isAdmin(ctx, msg.Chat.ID, msg.From) {
-			return "", errAdminOnly
+		if !admin {
+			return botResponse{}, errAdminOnly
 		}
 		id, position, err := parseMoveArgs(args)
 		if err != nil {
-			return "", err
+			return botResponse{}, err
 		}
-		return s.callMove(ctx, s.hooks.Move, id, position)
+		return s.responseFromMove(ctx, s.hooks.Move, id, position, queueKeyboard(admin, ""))
 	case "skip":
-		if !s.isAdmin(ctx, msg.Chat.ID, msg.From) {
-			return "", errAdminOnly
+		if !admin {
+			return botResponse{}, errAdminOnly
 		}
-		return s.callSimple(ctx, "skip", s.hooks.Skip)
+		return s.responseFromSimple(ctx, "skip", s.hooks.Skip, queueKeyboard(admin, ""))
 	default:
-		return "I do not know that command. Try /queue, /now, /status, or /help.", nil
+		return botResponse{text: "I do not know that command. Try /queue, /now, /status, or /help.", markup: homeKeyboard(admin)}, nil
 	}
 }
 
-func (s *Service) routeAction(ctx context.Context, chatID int64, user *tgbotapi.User, data string) (string, error) {
+func (s *Service) routeAction(ctx context.Context, chatID int64, user *tgbotapi.User, data string) (botResponse, error) {
 	parts := strings.Fields(strings.ReplaceAll(data, ":", " "))
 	if len(parts) == 0 {
-		return "", nil
+		return botResponse{}, nil
 	}
 
 	action := strings.ToLower(parts[0])
+	admin := s.isAdmin(ctx, chatID, user)
 	switch action {
 	case "queue", "list":
-		return s.callSimple(ctx, "list queue", s.hooks.ListQueue)
+		return s.responseFromQueue(ctx, admin)
 	case "now":
-		return s.callSimple(ctx, "current video", s.hooks.Now)
+		return s.responseFromSimple(ctx, "current video", s.hooks.Now, nowKeyboard(admin))
 	case "history":
-		return s.callSimple(ctx, "history", s.hooks.History)
+		return s.responseFromSimple(ctx, "history", s.hooks.History, historyKeyboard(admin))
 	case "status":
-		return s.callSimple(ctx, "status", s.hooks.Status)
+		return s.responseFromSimple(ctx, "status", s.hooks.Status, statusKeyboard(admin))
 	case "remove":
-		if !s.isAdmin(ctx, chatID, user) {
-			return "", errAdminOnly
+		if !admin {
+			return botResponse{}, errAdminOnly
 		}
 		id, err := parseIDArg(parts[1:], "remove")
 		if err != nil {
-			return "", err
+			return botResponse{}, err
 		}
-		return s.callID(ctx, "remove", s.hooks.Remove, id)
+		return s.responseFromID(ctx, "remove", s.hooks.Remove, id, queueKeyboard(admin, ""))
 	case "move":
-		if !s.isAdmin(ctx, chatID, user) {
-			return "", errAdminOnly
+		if !admin {
+			return botResponse{}, errAdminOnly
 		}
 		id, position, err := parseMoveArgs(parts[1:])
 		if err != nil {
-			return "", err
+			return botResponse{}, err
 		}
-		return s.callMove(ctx, s.hooks.Move, id, position)
+		return s.responseFromMove(ctx, s.hooks.Move, id, position, queueKeyboard(admin, ""))
 	case "skip":
-		if !s.isAdmin(ctx, chatID, user) {
-			return "", errAdminOnly
+		if !admin {
+			return botResponse{}, errAdminOnly
 		}
-		return s.callSimple(ctx, "skip", s.hooks.Skip)
+		return s.responseFromSimple(ctx, "skip", s.hooks.Skip, queueKeyboard(admin, ""))
 	default:
-		return "", nil
+		return botResponse{}, nil
 	}
 }
 
-func (s *Service) handleUpload(ctx context.Context, msg *tgbotapi.Message) (string, error) {
+func (s *Service) handleUpload(ctx context.Context, msg *tgbotapi.Message) (botResponse, error) {
 	if s.hooks.EnqueueUpload == nil {
-		return "", errHookNotConfigured("enqueue upload")
+		return botResponse{}, errHookNotConfigured("enqueue upload")
 	}
 
 	upload, err := uploadFromMessage(msg)
 	if err != nil {
-		return "", err
+		return botResponse{}, err
 	}
 	if s.cfg.MaxUploadSizeBytes > 0 && upload.SizeBytes > s.cfg.MaxUploadSizeBytes {
-		return "", fmt.Errorf("%w: %s is larger than the limit of %s", errUploadTooLarge, formatBytes(upload.SizeBytes), formatBytes(s.cfg.MaxUploadSizeBytes))
+		return botResponse{}, fmt.Errorf("%w: %s is larger than the limit of %s", errUploadTooLarge, formatBytes(upload.SizeBytes), formatBytes(s.cfg.MaxUploadSizeBytes))
 	}
 
 	file, err := s.bot.GetFile(tgbotapi.FileConfig{FileID: upload.FileID})
 	if err != nil {
-		return "", fmt.Errorf("inspect Telegram file: %w", err)
+		return botResponse{}, fmt.Errorf("inspect Telegram file: %w", err)
 	}
 	if s.cfg.MaxUploadSizeBytes > 0 && file.FileSize > 0 && int64(file.FileSize) > s.cfg.MaxUploadSizeBytes {
-		return "", fmt.Errorf("%w: %s is larger than the limit of %s", errUploadTooLarge, formatBytes(int64(file.FileSize)), formatBytes(s.cfg.MaxUploadSizeBytes))
+		return botResponse{}, fmt.Errorf("%w: %s is larger than the limit of %s", errUploadTooLarge, formatBytes(int64(file.FileSize)), formatBytes(s.cfg.MaxUploadSizeBytes))
 	}
 	upload.DownloadURL = file.Link(s.cfg.Token)
 	if upload.SizeBytes <= 0 && file.FileSize > 0 {
@@ -309,12 +358,12 @@ func (s *Service) handleUpload(ctx context.Context, msg *tgbotapi.Message) (stri
 
 	response, err := s.hooks.EnqueueUpload(ctx, upload)
 	if err != nil {
-		return "", err
+		return botResponse{}, err
 	}
 	if strings.TrimSpace(response) == "" {
-		return fmt.Sprintf("Queued %s.", displayName(upload)), nil
+		response = fmt.Sprintf("Queued %s.", displayName(upload))
 	}
-	return response, nil
+	return botResponse{text: response, markup: uploadAcceptedKeyboard()}, nil
 }
 
 func uploadFromMessage(msg *tgbotapi.Message) (Upload, error) {
@@ -380,14 +429,46 @@ func (s *Service) callMove(ctx context.Context, hook MoveFunc, id int64, positio
 	return hook(ctx, id, position)
 }
 
-func (s *Service) reply(ctx context.Context, chatID int64, response string, err error) {
+func (s *Service) responseFromSimple(ctx context.Context, name string, hook SimpleFunc, markup *tgbotapi.InlineKeyboardMarkup) (botResponse, error) {
+	text, err := s.callSimple(ctx, name, hook)
 	if err != nil {
-		response = friendlyError(err)
+		return botResponse{}, err
 	}
-	if response == "" {
+	return botResponse{text: text, markup: markup}, nil
+}
+
+func (s *Service) responseFromQueue(ctx context.Context, admin bool) (botResponse, error) {
+	text, err := s.callSimple(ctx, "list queue", s.hooks.ListQueue)
+	if err != nil {
+		return botResponse{}, err
+	}
+	return botResponse{text: text, markup: queueKeyboard(admin, text)}, nil
+}
+
+func (s *Service) responseFromID(ctx context.Context, name string, hook IDFunc, id int64, markup *tgbotapi.InlineKeyboardMarkup) (botResponse, error) {
+	text, err := s.callID(ctx, name, hook, id)
+	if err != nil {
+		return botResponse{}, err
+	}
+	return botResponse{text: text, markup: markup}, nil
+}
+
+func (s *Service) responseFromMove(ctx context.Context, hook MoveFunc, id int64, position int, markup *tgbotapi.InlineKeyboardMarkup) (botResponse, error) {
+	text, err := s.callMove(ctx, hook, id, position)
+	if err != nil {
+		return botResponse{}, err
+	}
+	return botResponse{text: text, markup: markup}, nil
+}
+
+func (s *Service) reply(ctx context.Context, chatID int64, response botResponse, err error) {
+	if err != nil {
+		response = botResponse{text: friendlyError(err)}
+	}
+	if response.text == "" {
 		return
 	}
-	if sendErr := s.SendMessage(ctx, chatID, response); sendErr != nil {
+	if sendErr := s.SendMessageWithMarkup(ctx, chatID, response.text, response.markup); sendErr != nil {
 		s.logger.Warn("send telegram message", "error", sendErr)
 	}
 }
@@ -410,14 +491,46 @@ func (s *Service) send(ctx context.Context, msg tgbotapi.Chattable) error {
 	}
 }
 
+func (s *Service) request(ctx context.Context, req tgbotapi.Chattable) error {
+	type result struct {
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		_, err := s.bot.Request(req)
+		done <- result{err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case res := <-done:
+		return res.err
+	}
+}
+
 func (s *Service) answerCallback(ctx context.Context, callbackID string, text string) {
 	if callbackID == "" {
 		return
 	}
 	callback := tgbotapi.NewCallback(callbackID, text)
-	if _, err := s.bot.Request(callback); err != nil && !errors.Is(ctx.Err(), context.Canceled) {
+	if err := s.request(ctx, callback); err != nil && !errors.Is(ctx.Err(), context.Canceled) {
 		s.logger.Warn("answer telegram callback", "error", err)
 	}
+}
+
+func (s *Service) editCallbackMessage(ctx context.Context, chatID int64, messageID int, response botResponse) error {
+	if response.text == "" {
+		return nil
+	}
+	if response.markup != nil {
+		edit := tgbotapi.NewEditMessageTextAndMarkup(chatID, messageID, response.text, *response.markup)
+		edit.DisableWebPagePreview = true
+		return s.request(ctx, edit)
+	}
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, response.text)
+	edit.DisableWebPagePreview = true
+	return s.request(ctx, edit)
 }
 
 func (s *Service) isAdmin(ctx context.Context, chatID int64, user *tgbotapi.User) bool {
@@ -574,6 +687,145 @@ func helpText(admin bool) string {
 		)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func homeKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
+			tgbotapi.NewInlineKeyboardButtonData("Now", "now"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Status", "status"),
+			tgbotapi.NewInlineKeyboardButtonData("History", "history"),
+		),
+	}
+	if admin {
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Skip", "skip")))
+	}
+	return inlineKeyboard(rows...)
+}
+
+func queueKeyboard(admin bool, queueText string) *tgbotapi.InlineKeyboardMarkup {
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Refresh", "queue"),
+			tgbotapi.NewInlineKeyboardButtonData("Now", "now"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Status", "status"),
+			tgbotapi.NewInlineKeyboardButtonData("History", "history"),
+		),
+	}
+	if admin {
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Skip", "skip")))
+		for _, item := range queueItems(queueText) {
+			row := []tgbotapi.InlineKeyboardButton{
+				tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("Remove #%d", item.id), fmt.Sprintf("remove:%d", item.id)),
+			}
+			if item.position > 1 {
+				row = append(row, tgbotapi.NewInlineKeyboardButtonData("Up", fmt.Sprintf("move:%d:%d", item.id, item.position-1)))
+			}
+			row = append(row, tgbotapi.NewInlineKeyboardButtonData("Down", fmt.Sprintf("move:%d:%d", item.id, item.position+1)))
+			rows = append(rows, row)
+		}
+	}
+	return inlineKeyboard(rows...)
+}
+
+type queueItem struct {
+	id       int64
+	position int
+}
+
+func queueItems(text string) []queueItem {
+	var items []queueItem
+	for _, match := range queueItemPattern.FindAllStringSubmatch(text, -1) {
+		if len(match) != 3 {
+			continue
+		}
+		id, err := strconv.ParseInt(match[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		position, err := strconv.Atoi(match[2])
+		if err != nil {
+			continue
+		}
+		items = append(items, queueItem{id: id, position: position})
+		if len(items) >= 5 {
+			break
+		}
+	}
+	return items
+}
+
+func nowKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
+			tgbotapi.NewInlineKeyboardButtonData("Status", "status"),
+		),
+	}
+	if admin {
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Skip", "skip")))
+	}
+	return inlineKeyboard(rows...)
+}
+
+func statusKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Refresh", "status"),
+			tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
+		),
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Now", "now")),
+	}
+	if admin {
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Skip", "skip")))
+	}
+	return inlineKeyboard(rows...)
+}
+
+func historyKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
+			tgbotapi.NewInlineKeyboardButtonData("Status", "status"),
+		),
+	}
+	if admin {
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Skip", "skip")))
+	}
+	return inlineKeyboard(rows...)
+}
+
+func uploadAcceptedKeyboard() *tgbotapi.InlineKeyboardMarkup {
+	return inlineKeyboard(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
+			tgbotapi.NewInlineKeyboardButtonData("Now", "now"),
+		),
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Status", "status")),
+	)
+}
+
+func inlineKeyboard(rows ...[]tgbotapi.InlineKeyboardButton) *tgbotapi.InlineKeyboardMarkup {
+	markup := tgbotapi.NewInlineKeyboardMarkup(rows...)
+	return &markup
+}
+
+func isRefreshAction(data string) bool {
+	parts := strings.Fields(strings.ReplaceAll(data, ":", " "))
+	if len(parts) == 0 {
+		return false
+	}
+	switch strings.ToLower(parts[0]) {
+	case "queue", "list", "now", "status", "history":
+		return true
+	default:
+		return false
+	}
 }
 
 func formatBytes(value int64) string {

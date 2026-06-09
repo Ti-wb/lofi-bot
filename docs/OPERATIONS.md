@@ -62,6 +62,12 @@ The built binary is written to `dist/tg-obs-bot`.
 
 Telegram group admins can use these management commands. Anonymous admins should disable anonymous admin mode before issuing commands, because Telegram does not expose their real user ID to the bot.
 
+The bot registers Telegram's command menu on startup. Most responses also include inline buttons for common actions:
+
+- queue/status/now/history navigation;
+- refresh buttons that update the current message;
+- admin-only skip, remove, and move buttons where applicable.
+
 - `/queue`: show current and upcoming videos.
 - `/now`: show the current video.
 - `/status`: show OBS status, queue counts, media size, disk space, and last error.
