@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,14 +25,41 @@ type Service struct {
 	logger *slog.Logger
 	store  *queue.Store
 	media  *media.Manager
-	obs    *obs.Client
-	bot    *telegram.Service
+	obs    obsController
+	bot    telegramMessenger
 
-	mu         sync.Mutex
-	playbackMu sync.Mutex
-	lastErr    string
-	shutdown   []func() error
+	mu                   sync.Mutex
+	playbackMu           sync.Mutex
+	lastErr              string
+	playback             playbackKind
+	randomFallbackID     int64
+	randomFallbackPath   string
+	randomFallbackNotice bool
+	shutdown             []func() error
 }
+
+type obsController interface {
+	Connect(context.Context) error
+	Close() error
+	Events() <-chan obs.Event
+	PlayFile(context.Context, string) error
+	StopCurrent(context.Context) error
+	Status() obs.Status
+}
+
+type telegramMessenger interface {
+	Run(context.Context) error
+	SendMessage(context.Context, int64, string) error
+}
+
+type playbackKind string
+
+const (
+	playbackIdle   playbackKind = "idle"
+	playbackNormal playbackKind = "normal_queue"
+	playbackRandom playbackKind = "random_played"
+	playbackFile   playbackKind = "fallback_file"
+)
 
 type UploadRequest struct {
 	FileURL          string
@@ -77,6 +105,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 		store:    store,
 		media:    manager,
 		obs:      obsClient,
+		playback: playbackIdle,
 		shutdown: []func() error{obsClient.Close, store.Close},
 	}
 
@@ -206,13 +235,7 @@ func (s *Service) advancePlayback(ctx context.Context) (*queue.Video, error) {
 		return nil, err
 	}
 	if video == nil {
-		if s.cfg.OBSFallbackFile != "" {
-			if err := s.obs.PlayFile(ctx, s.cfg.OBSFallbackFile); err != nil {
-				s.setLastErr(err)
-				return nil, err
-			}
-		}
-		return nil, nil
+		return nil, s.advanceFallbackLocked(ctx)
 	}
 	if err := s.obs.PlayFile(ctx, video.LocalPath); err != nil {
 		s.setLastErr(err)
@@ -224,6 +247,7 @@ func (s *Service) advancePlayback(ctx context.Context) (*queue.Video, error) {
 		s.setLastErr(err)
 		return nil, err
 	}
+	s.setPlaybackState(playbackNormal, 0, "")
 	return &playing, nil
 }
 
@@ -236,6 +260,9 @@ func (s *Service) playIfIdle(ctx context.Context) error {
 		return nil
 	}
 	if s.obs.Status().State != obs.StateConnected {
+		return nil
+	}
+	if s.playbackState() != playbackIdle {
 		return nil
 	}
 	_, err = s.advancePlayback(ctx)
@@ -258,6 +285,7 @@ func (s *Service) skipCurrent(ctx context.Context) (string, error) {
 			s.setLastErr(err)
 			return "", err
 		}
+		s.setPlaybackState(playbackIdle, 0, "")
 		return "已跳過，目前沒有下一支影片。", nil
 	}
 	video, err := s.advancePlayback(ctx)
@@ -268,6 +296,69 @@ func (s *Service) skipCurrent(ctx context.Context) (string, error) {
 		return "已跳過，目前沒有下一支影片。", nil
 	}
 	return fmt.Sprintf("已跳到下一支：#%d %s", video.ID, video.FileName), nil
+}
+
+func (s *Service) advanceFallbackLocked(ctx context.Context) error {
+	switch s.cfg.FallbackMode {
+	case "off":
+		s.setPlaybackState(playbackIdle, 0, "")
+		return nil
+	case "file":
+		return s.playFallbackFileLocked(ctx)
+	case "random_played":
+		if video, err := s.playRandomFallbackLocked(ctx); err != nil {
+			return err
+		} else if video != nil {
+			return nil
+		}
+		return s.playFallbackFileLocked(ctx)
+	default:
+		s.setPlaybackState(playbackIdle, 0, "")
+		return nil
+	}
+}
+
+func (s *Service) playFallbackFileLocked(ctx context.Context) error {
+	if s.cfg.OBSFallbackFile == "" {
+		s.setPlaybackState(playbackIdle, 0, "")
+		return nil
+	}
+	if err := s.obs.PlayFile(ctx, s.cfg.OBSFallbackFile); err != nil {
+		s.setLastErr(err)
+		return err
+	}
+	s.setPlaybackState(playbackFile, 0, s.cfg.OBSFallbackFile)
+	return nil
+}
+
+func (s *Service) playRandomFallbackLocked(ctx context.Context) (*queue.Video, error) {
+	candidates, err := s.store.PlayedFallbackCandidates(ctx, 0)
+	if err != nil {
+		s.setLastErr(err)
+		return nil, err
+	}
+	for len(candidates) > 0 {
+		idx := rand.Intn(len(candidates))
+		video := candidates[idx]
+		candidates = append(candidates[:idx], candidates[idx+1:]...)
+		if video.LocalPath == "" {
+			continue
+		}
+		if _, err := os.Stat(video.LocalPath); err != nil {
+			s.logger.Warn("skip missing random fallback file", "video_id", video.ID, "path", video.LocalPath, "error", err)
+			continue
+		}
+		if err := s.obs.PlayFile(ctx, video.LocalPath); err != nil {
+			s.setLastErr(err)
+			return nil, err
+		}
+		notify := s.setPlaybackState(playbackRandom, video.ID, video.LocalPath)
+		if notify {
+			_ = s.bot.SendMessage(ctx, s.cfg.AllowedChatID, fmt.Sprintf("佇列已播放完，正在隨機播放歷史影片：#%d %s", video.ID, video.FileName))
+		}
+		return &video, nil
+	}
+	return nil, nil
 }
 
 func (s *Service) RemoveQueued(ctx context.Context, id int64) error {
@@ -355,12 +446,14 @@ func (s *Service) StatusText(ctx context.Context, obsConnected bool) (string, er
 		lastErr = "無"
 	}
 	return fmt.Sprintf(
-		"狀態：\nOBS：%s\nReady：%d\nDownloading：%d\nPlayed：%d\nFailed：%d\nMedia DB：%s\nDisk：%s\nLast error：%s",
+		"狀態：\nOBS：%s\nReady：%d\nDownloading：%d\nPlayed：%d\nFailed：%d\nFallback：%s (%s)\nMedia DB：%s\nDisk：%s\nLast error：%s",
 		boolText(obsConnected),
 		stats.ReadyCount,
 		stats.DownloadingCount,
 		stats.PlayedCount,
 		stats.FailedCount,
+		s.cfg.FallbackMode,
+		s.playbackState(),
 		formatBytes(stats.TotalBytes),
 		diskText,
 		lastErr,
@@ -463,6 +556,7 @@ func (s *Service) CleanupRetention(ctx context.Context) error {
 		return err
 	}
 	deleteIDs := make(map[int64]queue.Video)
+	fallbackID, fallbackPath := s.randomFallbackLock()
 	if maxAge := s.cfg.RetentionMaxAge(); maxAge > 0 {
 		cutoff := time.Now().UTC().Add(-maxAge)
 		for _, video := range videos {
@@ -477,6 +571,9 @@ func (s *Service) CleanupRetention(ctx context.Context) error {
 		}
 	}
 	for _, video := range deleteIDs {
+		if video.ID == fallbackID || (fallbackPath != "" && video.LocalPath == fallbackPath) {
+			continue
+		}
 		if err := media.RemoveFile(video.LocalPath); err != nil {
 			return err
 		}
@@ -497,6 +594,38 @@ func (s *Service) lastError() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastErr
+}
+
+func (s *Service) setPlaybackState(kind playbackKind, randomID int64, path string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	notify := kind == playbackRandom && !s.randomFallbackNotice
+	s.playback = kind
+	if kind == playbackRandom {
+		s.randomFallbackID = randomID
+		s.randomFallbackPath = path
+		s.randomFallbackNotice = true
+	} else {
+		s.randomFallbackID = 0
+		s.randomFallbackPath = ""
+		s.randomFallbackNotice = false
+	}
+	return notify
+}
+
+func (s *Service) playbackState() playbackKind {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.playback
+}
+
+func (s *Service) randomFallbackLock() (int64, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.playback != playbackRandom {
+		return 0, ""
+	}
+	return s.randomFallbackID, s.randomFallbackPath
 }
 
 func formatDuration(seconds int) string {

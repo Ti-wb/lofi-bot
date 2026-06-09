@@ -20,6 +20,7 @@ type Config struct {
 	OBSPassword        string
 	OBSMediaSourceName string
 	OBSFallbackFile    string
+	FallbackMode       string
 
 	DataDir                 string
 	MediaDir                string
@@ -45,6 +46,7 @@ func Load() (Config, error) {
 		OBSPassword:             getenv("OBS_PASSWORD", ""),
 		OBSMediaSourceName:      getenv("OBS_MEDIA_SOURCE_NAME", "tg_queue_player"),
 		OBSFallbackFile:         getenv("OBS_FALLBACK_FILE", ""),
+		FallbackMode:            getenv("FALLBACK_MODE", "random_played"),
 		DataDir:                 getenv("DATA_DIR", "./data"),
 		MaxVideoSizeBytes:       int64(getenvInt("MAX_VIDEO_SIZE_MB", 500)) * 1024 * 1024,
 		MaxVideoDurationSeconds: getenvInt("MAX_VIDEO_DURATION_SECONDS", 7200),
@@ -66,6 +68,9 @@ func Load() (Config, error) {
 	if cfg.OBSMediaSourceName == "" {
 		return cfg, errors.New("OBS_MEDIA_SOURCE_NAME is required")
 	}
+	if !validFallbackMode(cfg.FallbackMode) {
+		return cfg, fmt.Errorf("FALLBACK_MODE must be one of random_played, file, off")
+	}
 	if cfg.MaxVideoSizeBytes <= 0 {
 		return cfg, errors.New("MAX_VIDEO_SIZE_MB must be positive")
 	}
@@ -74,6 +79,15 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func validFallbackMode(mode string) bool {
+	switch mode {
+	case "random_played", "file", "off":
+		return true
+	default:
+		return false
+	}
 }
 
 func loadDotEnv(path string) error {

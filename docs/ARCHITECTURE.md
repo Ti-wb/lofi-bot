@@ -56,6 +56,11 @@ On restart:
 - OBS playback failure leaves the next `ready` item in the queue instead of marking it played.
 - A canceled item that finishes downloading cannot become `ready`; the downloaded file is removed by app logic.
 - Retention cleanup removes old played files by age and maximum file count.
+- Random fallback playback locks the active history file so retention cleanup cannot delete it mid-playback.
+
+## Fallback Playback
+
+When the normal queue is empty, `FALLBACK_MODE=random_played` randomly selects a previously played video whose local file still exists. The bot announces when it enters random fallback mode, then keeps rotating through history until a new ready queue item is available. `FALLBACK_MODE=file` uses `OBS_FALLBACK_FILE`, and `FALLBACK_MODE=off` leaves OBS idle when the queue is empty.
 
 ## Intentional MVP Constraints
 

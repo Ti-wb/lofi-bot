@@ -72,6 +72,7 @@ make test
 - The MVP avoids transcoding to keep CPU use low on the MacBook.
 - Files are retained by `RETENTION_DAYS` and `RETENTION_MAX_FILES`.
 - SQLite state is stored under `DATA_DIR` so the queue survives restarts.
+- `FALLBACK_MODE=random_played` keeps the channel alive by replaying completed history when the queue is empty.
 
 More detail:
 

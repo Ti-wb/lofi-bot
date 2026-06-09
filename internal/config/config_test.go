@@ -46,6 +46,9 @@ OBS_MEDIA_SOURCE_NAME=player
 	if cfg.DatabasePath != "state/queue.db" && cfg.DatabasePath != "state\\queue.db" {
 		t.Fatalf("unexpected db path: %q", cfg.DatabasePath)
 	}
+	if cfg.FallbackMode != "random_played" {
+		t.Fatalf("unexpected fallback mode: %q", cfg.FallbackMode)
+	}
 }
 
 func TestLoadRequiresCoreSettings(t *testing.T) {
@@ -67,6 +70,34 @@ func TestLoadRequiresCoreSettings(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsInvalidFallbackMode(t *testing.T) {
+	clearConfigEnv(t)
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get wd: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(oldwd)
+	})
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	body := []byte(`
+TELEGRAM_BOT_TOKEN=token
+ALLOWED_CHAT_ID=-1001
+FALLBACK_MODE=surprise
+`)
+	if err := os.WriteFile(filepath.Join(dir, ".env"), body, 0o600); err != nil {
+		t.Fatalf("write env: %v", err)
+	}
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected invalid fallback mode error")
+	}
+}
+
 func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	keys := []string{
@@ -77,6 +108,7 @@ func clearConfigEnv(t *testing.T) {
 		"OBS_PASSWORD",
 		"OBS_MEDIA_SOURCE_NAME",
 		"OBS_FALLBACK_FILE",
+		"FALLBACK_MODE",
 		"DATA_DIR",
 		"MEDIA_DIR",
 		"DATABASE_PATH",

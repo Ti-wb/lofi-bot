@@ -80,9 +80,12 @@ The bot registers Telegram's command menu on startup. Most responses also includ
 
 `RETENTION_DAYS` and `RETENTION_MAX_FILES` are both active. A played item can be deleted when it is older than the age limit or when the played history exceeds the file count limit.
 
+When `FALLBACK_MODE=random_played`, the currently playing random fallback file is protected from retention cleanup. This prevents the active OBS file from being deleted during 24h fallback playback.
+
 Set conservative values on the MacBook first, for example:
 
 ```env
+FALLBACK_MODE=random_played
 RETENTION_DAYS=7
 RETENTION_MAX_FILES=100
 MAX_VIDEO_SIZE_MB=500

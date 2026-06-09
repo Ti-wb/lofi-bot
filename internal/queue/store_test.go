@@ -116,6 +116,69 @@ func TestMarkReadyFailsAfterCancel(t *testing.T) {
 	}
 }
 
+func TestPlayedFallbackCandidatesOnlyReturnsPlayedWithLocalPath(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	played := addReady(t, ctx, store, "played.mp4")
+	if _, err := store.StartNext(ctx); err != nil {
+		t.Fatalf("start played: %v", err)
+	}
+	if err := store.FinishCurrent(ctx); err != nil {
+		t.Fatalf("finish played: %v", err)
+	}
+	_ = addReady(t, ctx, store, "ready.mp4")
+
+	candidates, err := store.PlayedFallbackCandidates(ctx, 10)
+	if err != nil {
+		t.Fatalf("fallback candidates: %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("expected 1 candidate, got %d: %#v", len(candidates), candidates)
+	}
+	if candidates[0].ID != played.ID {
+		t.Fatalf("expected played candidate id %d, got %d", played.ID, candidates[0].ID)
+	}
+}
+
+func TestPlayedFallbackCandidatesZeroLimitReturnsAll(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	playedIDs := make(map[int64]bool)
+	for _, name := range []string{"first.mp4", "second.mp4", "third.mp4"} {
+		ready := addReady(t, ctx, store, name)
+		playedIDs[ready.ID] = true
+		if _, err := store.StartNext(ctx); err != nil {
+			t.Fatalf("start %s: %v", name, err)
+		}
+		if err := store.FinishCurrent(ctx); err != nil {
+			t.Fatalf("finish %s: %v", name, err)
+		}
+	}
+
+	candidates, err := store.PlayedFallbackCandidates(ctx, 0)
+	if err != nil {
+		t.Fatalf("fallback candidates: %v", err)
+	}
+	if len(candidates) != len(playedIDs) {
+		t.Fatalf("expected %d candidates, got %d: %#v", len(playedIDs), len(candidates), candidates)
+	}
+	for _, candidate := range candidates {
+		if !playedIDs[candidate.ID] {
+			t.Fatalf("unexpected candidate id %d", candidate.ID)
+		}
+	}
+}
+
 func addReady(t *testing.T, ctx context.Context, store *Store, name string) Video {
 	t.Helper()
 	video, err := store.AddDownloading(ctx, Video{

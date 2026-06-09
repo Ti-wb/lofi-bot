@@ -369,6 +369,20 @@ ORDER BY finished_at ASC, updated_at ASC
 `, string(StatusPlayed))
 }
 
+func (s *Store) PlayedFallbackCandidates(ctx context.Context, limit int) ([]Video, error) {
+	query := `
+SELECT * FROM videos
+WHERE status = ? AND local_path <> ''
+ORDER BY finished_at DESC, updated_at DESC
+`
+	if limit <= 0 {
+		return s.list(ctx, query, string(StatusPlayed))
+	}
+	return s.list(ctx, query+`
+LIMIT ?
+`, string(StatusPlayed), limit)
+}
+
 func (s *Store) Delete(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM videos WHERE id = ?`, id)
 	return err
