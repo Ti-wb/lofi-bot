@@ -4,6 +4,16 @@ This folder contains local deployment helpers for the official Telegram Bot API 
 
 The server must run with `--local`. `tg-obs-bot` relies on `getFile.file_path` being an absolute local path, and the public Telegram Bot API does not provide that contract.
 
+For day-to-day operation, prefer the repository root entrypoint. From this directory, run:
+
+```sh
+../../run.sh up
+../../run.sh bot-api
+../../run.sh health
+```
+
+The scripts in this folder are lower-level implementation scripts used by the root entrypoint.
+
 ## Shared `.env`
 
 Use the repository root `.env` for both `tg-obs-bot` and Telegram Bot API Server. Do not create a second secret file for this folder.
@@ -38,19 +48,19 @@ TELEGRAM_BOT_API_DIR=./data/telegram-bot-api
 3. Log the bot out from the public Telegram Bot API. This is a manual operator step and is not run automatically:
 
    ```sh
-   deploy/telegram-bot-api/logout-public.sh
+   ./run.sh logout-public
    ```
 
 4. Start the local server:
 
    ```sh
-   deploy/telegram-bot-api/run.sh
+   ./run.sh bot-api
    ```
 
 5. In another terminal, verify the local endpoint:
 
    ```sh
-   deploy/telegram-bot-api/healthcheck.sh
+   ./run.sh health
    ```
 
 ## Runtime Contract

@@ -13,9 +13,9 @@
    - create a bot with BotFather;
    - obtain `api_id` and `api_hash` from Telegram;
    - fill the shared root `.env`;
-   - run the server with `deploy/telegram-bot-api/run.sh`.
+   - run the stack with `./run.sh up`.
 
-   The public Telegram Bot API is not supported. The Local Bot API Server must run with `--local` and return absolute local file paths from `getFile`. See [deploy/telegram-bot-api](../deploy/telegram-bot-api/README.md) for the setup scripts, health check, and manual public API logout step.
+   The public Telegram Bot API is not supported. The Local Bot API Server must run with `--local` and return absolute local file paths from `getFile`. Use `./run.sh logout-public` for the manual public API logout step before first switching to the local server.
 
 3. Configure OBS:
 
@@ -50,28 +50,46 @@ After migration, confirm the appended Telegram Local Bot API Server defaults are
 
 ## Local Runbook
 
+Unified runtime entrypoint:
+
+```sh
+./run.sh help
+./run.sh doctor
+./run.sh up
+```
+
+Common commands:
+
+```sh
+./run.sh bot-api         # start only Telegram Local Bot API Server
+./run.sh app             # start only tg-obs-bot
+./run.sh health          # check Local Bot API /getMe
+./run.sh env             # print sanitized runtime config
+./run.sh logout-public   # manually log out from public Bot API
+```
+
 Download dependencies:
 
 ```sh
-make tidy
+./run.sh tidy
 ```
 
 Run tests:
 
 ```sh
-make test
+./run.sh test
 ```
 
 Build:
 
 ```sh
-make build
+./run.sh build
 ```
 
 Run:
 
 ```sh
-make run
+./run.sh up
 ```
 
 The built binary is written to `dist/tg-obs-bot`.
@@ -138,4 +156,4 @@ If videos do not visually change in OBS:
 
 ## Suggested LaunchAgent
 
-For unattended use, build once and create macOS LaunchAgents for both `deploy/telegram-bot-api/run.sh` and `dist/tg-obs-bot`. Keep fixed Local Bot API data, `.env`, `data/`, and logs on local disk.
+For unattended use, build once and create macOS LaunchAgents for the underlying long-running services: `deploy/telegram-bot-api/run.sh` and `dist/tg-obs-bot`. Keep fixed Local Bot API data, `.env`, `data/`, and logs on local disk. The root `run.sh` is the local operator entrypoint, not a replacement for future LaunchAgent plists.

@@ -3,7 +3,7 @@ GOMODCACHE_DIR := $(CURDIR)/.cache/go-mod
 GO ?= go
 GOENV := GOCACHE=$(GOCACHE_DIR) GOMODCACHE=$(GOMODCACHE_DIR)
 
-.PHONY: tidy test build run
+.PHONY: tidy test build run run-app run-bot-api doctor health
 
 tidy:
 	mkdir -p $(GOCACHE_DIR) $(GOMODCACHE_DIR)
@@ -18,5 +18,16 @@ build:
 	$(GOENV) $(GO) build -o dist/tg-obs-bot ./cmd/tg-obs-bot
 
 run:
-	mkdir -p $(GOCACHE_DIR) $(GOMODCACHE_DIR)
-	$(GOENV) $(GO) run ./cmd/tg-obs-bot
+	./run.sh up
+
+run-app:
+	./run.sh app
+
+run-bot-api:
+	./run.sh bot-api
+
+doctor:
+	./run.sh doctor
+
+health:
+	./run.sh health

@@ -46,7 +46,8 @@ See [deploy/telegram-bot-api](deploy/telegram-bot-api/README.md) for Local Bot A
 ```sh
 cp .env.example .env
 make tidy
-make run
+./run.sh doctor
+./run.sh up
 ```
 
 ## Config Upgrades
@@ -65,6 +66,18 @@ Run tests:
 
 ```sh
 make test
+```
+
+Common runtime commands:
+
+```sh
+./run.sh up              # start Telegram Local Bot API Server and tg-obs-bot
+./run.sh app             # start only tg-obs-bot
+./run.sh bot-api         # start only Telegram Local Bot API Server
+./run.sh health          # check local Telegram Bot API /getMe
+./run.sh doctor          # check config, tools, data dir, and common ports
+./run.sh env             # print sanitized runtime config
+./run.sh logout-public   # manually log out from public Telegram Bot API
 ```
 
 ## Commands
