@@ -1,6 +1,6 @@
 GOCACHE_DIR := $(CURDIR)/.cache/go-build
 GOMODCACHE_DIR := $(CURDIR)/.cache/go-mod
-GO := /opt/homebrew/bin/go
+GO ?= go
 GOENV := GOCACHE=$(GOCACHE_DIR) GOMODCACHE=$(GOMODCACHE_DIR)
 
 .PHONY: tidy test build run
