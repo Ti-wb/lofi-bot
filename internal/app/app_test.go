@@ -2,11 +2,13 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -187,6 +189,97 @@ func TestEnqueueUploadUsesLocalPath(t *testing.T) {
 	}
 }
 
+func TestEnqueueUploadMarksFailedWhenProbeFails(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newLocalUploadTestService(t, config.Config{
+		MaxVideoSizeBytes:       1024,
+		MaxVideoDurationSeconds: 120,
+	})
+	manager, err := media.NewManager(t.TempDir(), fakeFailingFFProbe(t))
+	if err != nil {
+		t.Fatalf("new media manager: %v", err)
+	}
+	svc.media = manager
+	path := filepath.Join(t.TempDir(), "bad-probe.mp4")
+	writeTestFile(t, path)
+
+	_, err = svc.EnqueueUpload(ctx, UploadRequest{
+		LocalPath:        path,
+		TelegramFileID:   "file",
+		TelegramUniqueID: "unique",
+		FileName:         "bad-probe.mp4",
+		SizeBytes:        5,
+	})
+	if err == nil {
+		t.Fatalf("enqueue upload should fail")
+	}
+	assertFailedUploadVisible(t, ctx, svc, "bad-probe.mp4", "ffprobe failed")
+}
+
+func TestEnqueueUploadMarksFailedWhenValidateFails(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newLocalUploadTestService(t, config.Config{
+		MaxVideoSizeBytes:       1024,
+		MaxVideoDurationSeconds: 30,
+	})
+	path := filepath.Join(t.TempDir(), "too-long.mp4")
+	writeTestFile(t, path)
+
+	_, err := svc.EnqueueUpload(ctx, UploadRequest{
+		LocalPath:        path,
+		TelegramFileID:   "file",
+		TelegramUniqueID: "unique",
+		FileName:         "too-long.mp4",
+		SizeBytes:        5,
+	})
+	if err == nil {
+		t.Fatalf("enqueue upload should fail")
+	}
+	assertFailedUploadVisible(t, ctx, svc, "too-long.mp4", "video exceeds max duration")
+}
+
+func TestAdvancePlaybackDoesNotMarkReadyPlayedWhenOBSPlayFails(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	ready := addReadyVideo(t, ctx, svc.store, "ready.mp4")
+	fakeOBS.playErr = errors.New("obs play failed")
+
+	video, err := svc.advancePlayback(ctx)
+	if err == nil {
+		t.Fatalf("advance playback should fail")
+	}
+	if video != nil {
+		t.Fatalf("video = %#v, want nil", video)
+	}
+	if got := svc.lastError(); !strings.Contains(got, "obs play failed") {
+		t.Fatalf("last error = %q, want OBS error", got)
+	}
+	stored, err := svc.store.Get(ctx, ready.ID)
+	if err != nil {
+		t.Fatalf("get ready video: %v", err)
+	}
+	if stored.Status != queue.StatusReady {
+		t.Fatalf("status = %s, want %s", stored.Status, queue.StatusReady)
+	}
+	if current, err := svc.store.Current(ctx); err != nil {
+		t.Fatalf("current: %v", err)
+	} else if current != nil {
+		t.Fatalf("current = %#v, want nil", current)
+	}
+	statusText, err := svc.StatusText(ctx, true)
+	if err != nil {
+		t.Fatalf("status text: %v", err)
+	}
+	for _, want := range []string{"Ready：1", "Played：0", "Last error：obs play failed"} {
+		if !strings.Contains(statusText, want) {
+			t.Fatalf("status text = %q, want %q", statusText, want)
+		}
+	}
+	if svc.playbackState() != playbackIdle {
+		t.Fatalf("playback state = %s, want %s", svc.playbackState(), playbackIdle)
+	}
+}
+
 func TestRemoveQueuedDoesNotDeleteLocalBotAPIFile(t *testing.T) {
 	ctx := context.Background()
 	svc, _, _ := newLocalUploadTestService(t, config.Config{
@@ -218,6 +311,45 @@ func TestRemoveQueuedDoesNotDeleteLocalBotAPIFile(t *testing.T) {
 	}
 	if !fileExists(ready.LocalPath) {
 		t.Fatalf("queued local bot api file should remain")
+	}
+}
+
+func assertFailedUploadVisible(t *testing.T, ctx context.Context, svc *Service, fileName, errText string) {
+	t.Helper()
+	history, err := svc.store.History(ctx, 10)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(history) != 1 {
+		t.Fatalf("history length = %d, want 1", len(history))
+	}
+	video := history[0]
+	if video.FileName != fileName {
+		t.Fatalf("history file = %q, want %q", video.FileName, fileName)
+	}
+	if video.Status != queue.StatusFailed {
+		t.Fatalf("status = %s, want %s", video.Status, queue.StatusFailed)
+	}
+	if !strings.Contains(video.Error, errText) {
+		t.Fatalf("row error = %q, want %q", video.Error, errText)
+	}
+	statusText, err := svc.StatusText(ctx, true)
+	if err != nil {
+		t.Fatalf("status text: %v", err)
+	}
+	for _, want := range []string{"Ready：0", "Failed：1", "Last error：" + errText} {
+		if !strings.Contains(statusText, want) {
+			t.Fatalf("status text = %q, want %q", statusText, want)
+		}
+	}
+	historyText, err := svc.HistoryText(ctx)
+	if err != nil {
+		t.Fatalf("history text: %v", err)
+	}
+	for _, want := range []string{"[failed]", fileName} {
+		if !strings.Contains(historyText, want) {
+			t.Fatalf("history text = %q, want %q", historyText, want)
+		}
 	}
 }
 
@@ -326,6 +458,16 @@ func fakeFFProbe(t *testing.T, duration int) string {
 	return path
 }
 
+func fakeFailingFFProbe(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ffprobe")
+	body := []byte("#!/bin/sh\nprintf 'probe exploded' >&2\nexit 2\n")
+	if err := osWriteFile(path, body, 0o700); err != nil {
+		t.Fatalf("write fake ffprobe: %v", err)
+	}
+	return path
+}
+
 func formatTestInt(value int) string {
 	return fmt.Sprintf("%d", value)
 }
@@ -344,12 +486,16 @@ var (
 type fakeOBS struct {
 	state      obs.State
 	lastPlayed string
+	playErr    error
 }
 
 func (f *fakeOBS) Connect(context.Context) error { return nil }
 func (f *fakeOBS) Close() error                  { return nil }
 func (f *fakeOBS) Events() <-chan obs.Event      { return nil }
 func (f *fakeOBS) PlayFile(_ context.Context, path string) error {
+	if f.playErr != nil {
+		return f.playErr
+	}
 	f.lastPlayed = path
 	return nil
 }

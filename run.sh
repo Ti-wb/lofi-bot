@@ -8,6 +8,7 @@ BOT_API_HEALTH="$REPO_ROOT/deploy/telegram-bot-api/healthcheck.sh"
 BOT_API_LOGOUT="$REPO_ROOT/deploy/telegram-bot-api/logout-public.sh"
 GO_CACHE_DIR="$REPO_ROOT/.cache/go-build"
 GO_MOD_CACHE_DIR="$REPO_ROOT/.cache/go-mod"
+CURRENT_ENV_SCHEMA_VERSION=2
 
 die() {
   printf '%s\n' "error: $1" >&2
@@ -29,6 +30,7 @@ Commands:
   health          Check Local Bot API /getMe
   doctor          Check local config, tools, data dirs, and common ports
   env             Print sanitized runtime config
+  migrate-env     Back up and append missing .env fields for the supported schema
   logout-public   Manually log the bot out from the public Telegram Bot API
   test            Run make test
   build           Run make build
@@ -54,8 +56,168 @@ masked_state() {
   fi
 }
 
-load_env() {
+dotenv_value() {
+  key=$1
+  awk -v want="$key" '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line == "" || substr(line, 1, 1) == "#") {
+        next
+      }
+      pos = index(line, "=")
+      if (pos == 0) {
+        next
+      }
+      rawKey = substr(line, 1, pos - 1)
+      value = substr(line, pos + 1)
+      sub(/^[[:space:]]+/, "", rawKey)
+      sub(/[[:space:]]+$/, "", rawKey)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      if ((substr(value, 1, 1) == "\"" && substr(value, length(value), 1) == "\"") ||
+          (substr(value, 1, 1) == "'"'"'" && substr(value, length(value), 1) == "'"'"'")) {
+        value = substr(value, 2, length(value) - 2)
+      }
+      if (rawKey == want) {
+        print value
+        found = 1
+      }
+    }
+    END {
+      exit found ? 0 : 0
+    }
+  ' "$ENV_FILE" | tail -n 1
+}
+
+dotenv_has_key() {
+  key=$1
+  awk -v want="$key" '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line == "" || substr(line, 1, 1) == "#") {
+        next
+      }
+      pos = index(line, "=")
+      if (pos == 0) {
+        next
+      }
+      rawKey = substr(line, 1, pos - 1)
+      sub(/^[[:space:]]+/, "", rawKey)
+      sub(/[[:space:]]+$/, "", rawKey)
+      if (rawKey == want) {
+        found = 1
+      }
+    }
+    END {
+      exit found ? 0 : 1
+    }
+  ' "$ENV_FILE"
+}
+
+add_env_migration_line() {
+  ENV_MIGRATION_ADDITIONS="${ENV_MIGRATION_ADDITIONS}${1}
+"
+}
+
+migrate_env() {
   [ -f "$ENV_FILE" ] || die ".env is required at repo root"
+
+  raw_version=$(dotenv_value ENV_SCHEMA_VERSION)
+  if [ -z "$raw_version" ]; then
+    version=0
+  elif printf '%s\n' "$raw_version" | awk '/^-?[0-9]+$/ { exit 0 } { exit 1 }'; then
+    version=$raw_version
+  else
+    die "ENV_SCHEMA_VERSION must be an integer"
+  fi
+
+  if [ "$version" -gt "$CURRENT_ENV_SCHEMA_VERSION" ]; then
+    die "ENV_SCHEMA_VERSION $version is newer than this helper supports ($CURRENT_ENV_SCHEMA_VERSION)"
+  fi
+
+  ENV_MIGRATION_ADDITIONS=
+  update_schema_version=0
+
+  if [ "$version" -lt "$CURRENT_ENV_SCHEMA_VERSION" ] && dotenv_has_key ENV_SCHEMA_VERSION; then
+    update_schema_version=1
+  fi
+
+  if [ "$version" -lt 1 ]; then
+    if ! dotenv_has_key ENV_SCHEMA_VERSION; then
+      add_env_migration_line "ENV_SCHEMA_VERSION=$CURRENT_ENV_SCHEMA_VERSION"
+    fi
+    if ! dotenv_has_key TELEGRAM_API_BASE_URL; then
+      add_env_migration_line "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081"
+    fi
+    if ! dotenv_has_key MAX_VIDEO_SIZE_MB; then
+      add_env_migration_line "MAX_VIDEO_SIZE_MB=2000"
+    fi
+  fi
+
+  for line in \
+    "TELEGRAM_API_ID=replace-with-telegram-api-id" \
+    "TELEGRAM_API_HASH=replace-with-telegram-api-hash" \
+    "TELEGRAM_BOT_API_BIN=telegram-bot-api" \
+    "TELEGRAM_BOT_API_HOST=127.0.0.1" \
+    "TELEGRAM_BOT_API_PORT=8081" \
+    "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api"
+  do
+    key=${line%%=*}
+    if ! dotenv_has_key "$key"; then
+      add_env_migration_line "$line"
+    fi
+  done
+
+  if [ "$update_schema_version" -eq 0 ] && [ -z "$ENV_MIGRATION_ADDITIONS" ]; then
+    return 0
+  fi
+
+  backup_path="$ENV_FILE.backup.$(date +%s)"
+  tmp_path="$ENV_FILE.tmp.$$"
+  cp "$ENV_FILE" "$backup_path"
+  chmod 600 "$backup_path"
+
+  if [ "$update_schema_version" -eq 1 ]; then
+    awk -v want="ENV_SCHEMA_VERSION" -v replacement="ENV_SCHEMA_VERSION=$CURRENT_ENV_SCHEMA_VERSION" '
+      {
+        line = $0
+        trimmed = line
+        sub(/^[[:space:]]+/, "", trimmed)
+        sub(/[[:space:]]+$/, "", trimmed)
+        pos = index(trimmed, "=")
+        if (!done && trimmed != "" && substr(trimmed, 1, 1) != "#" && pos > 0) {
+          rawKey = substr(trimmed, 1, pos - 1)
+          sub(/^[[:space:]]+/, "", rawKey)
+          sub(/[[:space:]]+$/, "", rawKey)
+          if (rawKey == want) {
+            print replacement
+            done = 1
+            next
+          }
+        }
+        print line
+      }
+    ' "$ENV_FILE" > "$tmp_path"
+  else
+    cp "$ENV_FILE" "$tmp_path"
+  fi
+
+  if [ -n "$ENV_MIGRATION_ADDITIONS" ]; then
+    printf '\n# Added automatically by tg-obs-bot env migration.\n' >> "$tmp_path"
+    printf '%s' "$ENV_MIGRATION_ADDITIONS" >> "$tmp_path"
+  fi
+
+  chmod 600 "$tmp_path"
+  mv "$tmp_path" "$ENV_FILE"
+  info "Migrated .env for schema v$CURRENT_ENV_SCHEMA_VERSION; backup: $backup_path"
+}
+
+load_env() {
+  migrate_env
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"
@@ -295,6 +457,7 @@ case "$cmd" in
   health) health ;;
   doctor) doctor ;;
   env) print_env ;;
+  migrate-env) migrate_env ;;
   logout-public)
     load_env
     require_value TELEGRAM_BOT_TOKEN

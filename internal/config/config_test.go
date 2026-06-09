@@ -132,6 +132,97 @@ FALLBACK_MODE=surprise
 	}
 }
 
+func TestLoadRejectsMalformedNumericEnv(t *testing.T) {
+	tests := []string{
+		"ALLOWED_CHAT_ID",
+		"OBS_PORT",
+		"MAX_VIDEO_SIZE_MB",
+		"MAX_VIDEO_DURATION_SECONDS",
+		"MAX_QUEUE_LENGTH",
+		"RETENTION_DAYS",
+		"RETENTION_MAX_FILES",
+	}
+
+	for _, key := range tests {
+		t.Run(key, func(t *testing.T) {
+			clearConfigEnv(t)
+			chdirTemp(t)
+			setValidConfigEnv(t)
+			t.Setenv(key, "abc")
+
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), key+" must be an integer") {
+				t.Fatalf("err = %v, want invalid integer error for %s", err, key)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidNumericRanges(t *testing.T) {
+	tests := []struct {
+		key     string
+		value   string
+		wantErr string
+	}{
+		{key: "OBS_PORT", value: "0", wantErr: "OBS_PORT must be between 1 and 65535"},
+		{key: "OBS_PORT", value: "65536", wantErr: "OBS_PORT must be between 1 and 65535"},
+		{key: "MAX_VIDEO_SIZE_MB", value: "0", wantErr: "MAX_VIDEO_SIZE_MB must be positive"},
+		{key: "MAX_VIDEO_DURATION_SECONDS", value: "-1", wantErr: "MAX_VIDEO_DURATION_SECONDS must be non-negative"},
+		{key: "MAX_QUEUE_LENGTH", value: "0", wantErr: "MAX_QUEUE_LENGTH must be positive"},
+		{key: "RETENTION_DAYS", value: "-1", wantErr: "RETENTION_DAYS must be non-negative"},
+		{key: "RETENTION_MAX_FILES", value: "-1", wantErr: "RETENTION_MAX_FILES must be non-negative"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
+			clearConfigEnv(t)
+			chdirTemp(t)
+			setValidConfigEnv(t)
+			t.Setenv(tt.key, tt.value)
+
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadAllowsZeroDurationAndRetentionLimits(t *testing.T) {
+	clearConfigEnv(t)
+	chdirTemp(t)
+	setValidConfigEnv(t)
+	t.Setenv("MAX_VIDEO_DURATION_SECONDS", "0")
+	t.Setenv("RETENTION_DAYS", "0")
+	t.Setenv("RETENTION_MAX_FILES", "0")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.MaxVideoDurationSeconds != 0 {
+		t.Fatalf("duration = %d, want 0", cfg.MaxVideoDurationSeconds)
+	}
+	if cfg.RetentionDays != 0 {
+		t.Fatalf("retention days = %d, want 0", cfg.RetentionDays)
+	}
+	if cfg.RetentionMaxFiles != 0 {
+		t.Fatalf("retention max files = %d, want 0", cfg.RetentionMaxFiles)
+	}
+}
+
+func TestLoadRejectsBlankMediaSourceName(t *testing.T) {
+	clearConfigEnv(t)
+	chdirTemp(t)
+	setValidConfigEnv(t)
+	t.Setenv("OBS_MEDIA_SOURCE_NAME", " \t ")
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "OBS_MEDIA_SOURCE_NAME is required") {
+		t.Fatalf("err = %v, want blank media source error", err)
+	}
+}
+
 func TestLoadMigratesOldDotEnv(t *testing.T) {
 	clearConfigEnv(t)
 	dir := chdirTemp(t)
@@ -354,6 +445,13 @@ func clearConfigEnv(t *testing.T) {
 	for _, key := range keys {
 		t.Setenv(key, "")
 	}
+}
+
+func setValidConfigEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081")
+	t.Setenv("ALLOWED_CHAT_ID", "-1001")
 }
 
 func chdirTemp(t *testing.T) string {

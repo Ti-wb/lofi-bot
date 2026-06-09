@@ -54,7 +54,11 @@ make tidy
 
 `.env` is local runtime config and is ignored by git. `.env.example` is the versioned schema shared by the Go backend and Telegram Local Bot API Server helpers; keep `ENV_SCHEMA_VERSION` at the top when creating or reviewing config.
 
-Before deploying a new build, back up the production `.env`. On startup, the app migrates older `.env` files by copying the original to `.env.backup.<unix_timestamp>` and appending missing fields required by the supported schema version. If appended Local Bot API Server defaults are not correct for production, edit `.env` and restart the relevant process.
+Before deploying a new build, back up the production `.env`. You can run `./run.sh migrate-env` to apply the stack helper's lightweight `.env` repair without starting the Go app. It copies the original to `.env.backup.<unix_timestamp>`, updates older schema markers, and appends missing fields needed by the Local Bot API helper. If appended Local Bot API Server defaults are not correct for production, edit `.env` before starting the stack.
+
+Numeric config values must be valid integers; malformed values fail startup instead of silently falling back to defaults. `OBS_PORT` must be `1..65535`; `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` must be positive; `MAX_VIDEO_DURATION_SECONDS`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES` may be `0` to disable that limit where supported.
+
+The stack helpers run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing the v2 Local Bot API defaults.
 
 Build a local binary:
 
@@ -77,6 +81,7 @@ Common runtime commands:
 ./run.sh health          # check local Telegram Bot API /getMe
 ./run.sh doctor          # check config, tools, data dir, and common ports
 ./run.sh env             # print sanitized runtime config
+./run.sh migrate-env     # back up .env and append missing schema defaults
 ./run.sh logout-public   # manually log out from public Telegram Bot API
 ```
 

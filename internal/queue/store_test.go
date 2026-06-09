@@ -2,9 +2,113 @@ package queue
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 )
+
+func TestOpenConfiguresSQLitePragmasAndSequentialWritesPreservePositions(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	if got := store.db.Stats().MaxOpenConnections; got != 1 {
+		t.Fatalf("expected max open connections 1, got %d", got)
+	}
+
+	var busyTimeout int
+	if err := store.db.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+		t.Fatalf("read busy_timeout: %v", err)
+	}
+	if busyTimeout != 5000 {
+		t.Fatalf("expected busy_timeout 5000, got %d", busyTimeout)
+	}
+
+	var foreignKeys int
+	if err := store.db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		t.Fatalf("read foreign_keys: %v", err)
+	}
+	if foreignKeys != 1 {
+		t.Fatalf("expected foreign_keys on, got %d", foreignKeys)
+	}
+
+	var expected []int64
+	for i := 1; i <= 5; i++ {
+		ready := addReady(t, ctx, store, fmt.Sprintf("write-%d.mp4", i))
+		expected = append(expected, ready.ID)
+	}
+
+	items, err := store.ListQueue(ctx, 10)
+	if err != nil {
+		t.Fatalf("list queue: %v", err)
+	}
+	assertOrder(t, items, expected)
+	assertPositions(t, items)
+}
+
+func TestOpenMigratesLegacyVideosTableMissingLocalPath(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	legacyID := createLegacyQueueDB(t, ctx, dbPath)
+
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	defer store.Close()
+
+	legacy, err := store.Get(ctx, legacyID)
+	if err != nil {
+		t.Fatalf("get migrated legacy video: %v", err)
+	}
+	if legacy.LocalPath != "" {
+		t.Fatalf("expected legacy local_path default empty, got %q", legacy.LocalPath)
+	}
+
+	readyLegacy, err := store.MarkReady(ctx, legacy.ID, "/tmp/legacy.mp4", 123, 45)
+	if err != nil {
+		t.Fatalf("mark migrated legacy video ready: %v", err)
+	}
+	if readyLegacy.LocalPath != "/tmp/legacy.mp4" {
+		t.Fatalf("expected marked local_path, got %q", readyLegacy.LocalPath)
+	}
+
+	added, err := store.AddDownloading(ctx, Video{
+		TelegramFileID:   "new-file",
+		TelegramUniqueID: "new-unique",
+		FileName:         "new.mp4",
+	})
+	if err != nil {
+		t.Fatalf("add downloading after migration: %v", err)
+	}
+	readyAdded, err := store.MarkReady(ctx, added.ID, "/tmp/new.mp4", 456, 67)
+	if err != nil {
+		t.Fatalf("mark new video ready after migration: %v", err)
+	}
+
+	items, err := store.ListQueue(ctx, 10)
+	if err != nil {
+		t.Fatalf("list queue after migration: %v", err)
+	}
+	assertOrder(t, items, []int64{readyLegacy.ID, readyAdded.ID})
+	assertPositions(t, items)
+
+	for _, indexName := range []string{"idx_videos_status_position", "idx_videos_created"} {
+		var count int
+		if err := store.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?
+`, indexName).Scan(&count); err != nil {
+			t.Fatalf("check index %s: %v", indexName, err)
+		}
+		if count != 1 {
+			t.Fatalf("expected index %s to exist, count=%d", indexName, count)
+		}
+	}
+}
 
 func TestQueueMoveCancelAndStartNext(t *testing.T) {
 	ctx := context.Background()
@@ -179,6 +283,56 @@ func TestPlayedFallbackCandidatesZeroLimitReturnsAll(t *testing.T) {
 	}
 }
 
+func createLegacyQueueDB(t *testing.T, ctx context.Context, path string) int64 {
+	t.Helper()
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE videos (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	telegram_file_id TEXT NOT NULL,
+	telegram_unique_id TEXT NOT NULL,
+	submitter_id INTEGER NOT NULL,
+	submitter_name TEXT NOT NULL,
+	chat_id INTEGER NOT NULL,
+	message_id INTEGER NOT NULL,
+	file_name TEXT NOT NULL,
+	mime_type TEXT NOT NULL,
+	size_bytes INTEGER NOT NULL DEFAULT 0,
+	duration_seconds INTEGER NOT NULL DEFAULT 0,
+	queue_position INTEGER NOT NULL DEFAULT 0,
+	status TEXT NOT NULL,
+	error TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL,
+	started_at TEXT,
+	finished_at TEXT
+);
+`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+
+	res, err := db.ExecContext(ctx, `
+INSERT INTO videos (
+	telegram_file_id, telegram_unique_id, submitter_id, submitter_name, chat_id, message_id,
+	file_name, mime_type, size_bytes, duration_seconds, queue_position, status, error, created_at, updated_at
+) VALUES (?, ?, 0, '', 0, 0, ?, '', 0, 0, 0, ?, '', ?, ?)
+`, "legacy-file", "legacy-unique", "legacy.mp4", string(StatusDownloading), "2026-06-10T00:00:00Z", "2026-06-10T00:00:00Z")
+	if err != nil {
+		t.Fatalf("insert legacy video: %v", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("legacy id: %v", err)
+	}
+	return id
+}
+
 func addReady(t *testing.T, ctx context.Context, store *Store, name string) Video {
 	t.Helper()
 	video, err := store.AddDownloading(ctx, Video{
@@ -205,6 +359,15 @@ func assertOrder(t *testing.T, videos []Video, expected []int64) {
 	for idx, want := range expected {
 		if videos[idx].ID != want {
 			t.Fatalf("position %d: expected id %d, got %d", idx, want, videos[idx].ID)
+		}
+	}
+}
+
+func assertPositions(t *testing.T, videos []Video) {
+	t.Helper()
+	for idx, video := range videos {
+		if video.QueuePosition != idx+1 {
+			t.Fatalf("position %d: expected queue position %d, got %d", idx, idx+1, video.QueuePosition)
 		}
 	}
 }

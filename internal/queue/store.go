@@ -16,6 +16,13 @@ type Store struct {
 	db *sql.DB
 }
 
+const videoColumns = `
+	id, telegram_file_id, telegram_unique_id, submitter_id, submitter_name,
+	chat_id, message_id, file_name, local_path, mime_type, size_bytes,
+	duration_seconds, queue_position, status, error, created_at, updated_at,
+	started_at, finished_at
+`
+
 func Open(ctx context.Context, path string) (*Store, error) {
 	if err := ensureParent(path); err != nil {
 		return nil, err
@@ -24,6 +31,8 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
+
 	store := &Store{db: db}
 	if err := store.migrate(ctx); err != nil {
 		_ = db.Close()
@@ -45,9 +54,15 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) migrate(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `
+	if _, err := s.db.ExecContext(ctx, `
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=5000;
+`); err != nil {
+		return err
+	}
+
+	if _, err := s.db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS videos (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	telegram_file_id TEXT NOT NULL,
@@ -69,10 +84,54 @@ CREATE TABLE IF NOT EXISTS videos (
 	started_at TEXT,
 	finished_at TEXT
 );
+`); err != nil {
+		return err
+	}
+
+	if err := s.ensureVideoColumn(ctx, "local_path", `ALTER TABLE videos ADD COLUMN local_path TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+
+	_, err := s.db.ExecContext(ctx, `
 CREATE INDEX IF NOT EXISTS idx_videos_status_position ON videos(status, queue_position);
 CREATE INDEX IF NOT EXISTS idx_videos_created ON videos(created_at);
 `)
 	return err
+}
+
+func (s *Store) ensureVideoColumn(ctx context.Context, name, alter string) error {
+	hasColumn, err := s.videoColumnExists(ctx, name)
+	if err != nil {
+		return err
+	}
+	if hasColumn {
+		return nil
+	}
+	_, err = s.db.ExecContext(ctx, alter)
+	return err
+}
+
+func (s *Store) videoColumnExists(ctx context.Context, name string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(videos)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var columnName, columnType string
+		var notNull int
+		var defaultValue sql.NullString
+		var primaryKey int
+		if err := rows.Scan(&cid, &columnName, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if columnName == name {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) AddDownloading(ctx context.Context, v Video) (Video, error) {
@@ -329,7 +388,7 @@ func (s *Store) ListQueue(ctx context.Context, limit int) ([]Video, error) {
 		limit = 20
 	}
 	return s.list(ctx, `
-SELECT * FROM videos
+SELECT `+videoColumns+` FROM videos
 WHERE status IN (?, ?)
 ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END, queue_position ASC, created_at ASC
 LIMIT ?
@@ -341,7 +400,7 @@ func (s *Store) History(ctx context.Context, limit int) ([]Video, error) {
 		limit = 10
 	}
 	return s.list(ctx, `
-SELECT * FROM videos WHERE status IN (?, ?, ?)
+SELECT `+videoColumns+` FROM videos WHERE status IN (?, ?, ?)
 ORDER BY updated_at DESC LIMIT ?
 `, string(StatusPlayed), string(StatusCanceled), string(StatusFailed), limit)
 }
@@ -363,7 +422,7 @@ FROM videos
 
 func (s *Store) Played(ctx context.Context) ([]Video, error) {
 	return s.list(ctx, `
-SELECT * FROM videos
+SELECT `+videoColumns+` FROM videos
 WHERE status = ?
 ORDER BY finished_at ASC, updated_at ASC
 `, string(StatusPlayed))
@@ -371,7 +430,7 @@ ORDER BY finished_at ASC, updated_at ASC
 
 func (s *Store) PlayedFallbackCandidates(ctx context.Context, limit int) ([]Video, error) {
 	query := `
-SELECT * FROM videos
+SELECT ` + videoColumns + ` FROM videos
 WHERE status = ? AND local_path <> ''
 ORDER BY finished_at DESC, updated_at DESC
 `
@@ -389,7 +448,7 @@ func (s *Store) Delete(ctx context.Context, id int64) error {
 }
 
 func (s *Store) Get(ctx context.Context, id int64) (Video, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT * FROM videos WHERE id = ?`, id)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+videoColumns+` FROM videos WHERE id = ?`, id)
 	if err != nil {
 		return Video{}, err
 	}
@@ -402,7 +461,7 @@ func (s *Store) Get(ctx context.Context, id int64) (Video, error) {
 
 func (s *Store) firstByStatus(ctx context.Context, status Status) (*Video, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT * FROM videos WHERE status = ? ORDER BY queue_position ASC, created_at ASC LIMIT 1
+SELECT `+videoColumns+` FROM videos WHERE status = ? ORDER BY queue_position ASC, created_at ASC LIMIT 1
 `, string(status))
 	if err != nil {
 		return nil, err
