@@ -24,6 +24,7 @@ var queueItemPattern = regexp.MustCompile(`#([0-9]+).*第 ([0-9]+) 位`)
 
 type Config struct {
 	Token              string
+	APIBaseURL         string
 	AllowedChatID      int64
 	MaxUploadSizeBytes int64
 	UpdateTimeout      int
@@ -73,7 +74,7 @@ type Upload struct {
 	MimeType        string
 	SizeBytes       int64
 	DurationSeconds int
-	DownloadURL     string
+	LocalPath       string
 	Kind            UploadKind
 	ChatID          int64
 	MessageID       int
@@ -95,9 +96,13 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 	if cfg.Token == "" {
 		return nil, errors.New("telegram token is required")
 	}
+	if strings.TrimSpace(cfg.APIBaseURL) == "" {
+		return nil, errors.New("telegram api base url is required")
+	}
 	if cfg.AllowedChatID == 0 {
 		return nil, errors.New("telegram allowed chat id is required")
 	}
+	cfg.APIBaseURL = strings.TrimRight(strings.TrimSpace(cfg.APIBaseURL), "/")
 	if cfg.UpdateTimeout <= 0 {
 		cfg.UpdateTimeout = defaultUpdateTimeout
 	}
@@ -116,7 +121,7 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 		opt(s)
 	}
 	if s.bot == nil {
-		bot, err := tgbotapi.NewBotAPI(cfg.Token)
+		bot, err := tgbotapi.NewBotAPIWithAPIEndpoint(cfg.Token, cfg.APIBaseURL+"/bot%s/%s")
 		if err != nil {
 			return nil, fmt.Errorf("create telegram bot: %w", err)
 		}
@@ -351,7 +356,10 @@ func (s *Service) handleUpload(ctx context.Context, msg *tgbotapi.Message) (botR
 	if s.cfg.MaxUploadSizeBytes > 0 && file.FileSize > 0 && int64(file.FileSize) > s.cfg.MaxUploadSizeBytes {
 		return botResponse{}, fmt.Errorf("%w: %s is larger than the limit of %s", errUploadTooLarge, formatBytes(int64(file.FileSize)), formatBytes(s.cfg.MaxUploadSizeBytes))
 	}
-	upload.DownloadURL = file.Link(s.cfg.Token)
+	if strings.TrimSpace(file.FilePath) == "" || !filepath.IsAbs(file.FilePath) {
+		return botResponse{}, fmt.Errorf("Local Bot API Server must run with --local and return an absolute file path")
+	}
+	upload.LocalPath = file.FilePath
 	if upload.SizeBytes <= 0 && file.FileSize > 0 {
 		upload.SizeBytes = int64(file.FileSize)
 	}

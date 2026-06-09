@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tiwb/tg-obs-bot/internal/config"
+	"github.com/tiwb/tg-obs-bot/internal/media"
 	"github.com/tiwb/tg-obs-bot/internal/obs"
 	"github.com/tiwb/tg-obs-bot/internal/queue"
 )
@@ -85,6 +87,31 @@ func TestCleanupRetentionSkipsCurrentRandomFallback(t *testing.T) {
 	}
 }
 
+func TestCleanupRetentionDoesNotDeleteLocalBotAPIFile(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newFallbackTestService(t, config.Config{
+		FallbackMode:      "random_played",
+		RetentionMaxFiles: 1,
+		RetentionDays:     0,
+	})
+	removeCandidate := addPlayedVideo(t, ctx, svc.store, "old.mp4", true)
+	time.Sleep(time.Millisecond)
+	keepCandidate := addPlayedVideo(t, ctx, svc.store, "new.mp4", true)
+
+	if err := svc.CleanupRetention(ctx); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if _, err := svc.store.Get(ctx, removeCandidate.ID); err == nil {
+		t.Fatalf("old row should be removed")
+	}
+	if _, err := svc.store.Get(ctx, keepCandidate.ID); err != nil {
+		t.Fatalf("new row should remain: %v", err)
+	}
+	if !fileExists(removeCandidate.LocalPath) {
+		t.Fatalf("local bot api file should remain after retention removes row")
+	}
+}
+
 func TestMissingRandomFallbackUsesStaticFile(t *testing.T) {
 	ctx := context.Background()
 	staticPath := filepath.Join(t.TempDir(), "fallback.mp4")
@@ -130,6 +157,70 @@ func TestFallbackFileModeAndOffMode(t *testing.T) {
 	}
 }
 
+func TestEnqueueUploadUsesLocalPath(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{
+		MaxVideoSizeBytes:       1024,
+		MaxVideoDurationSeconds: 120,
+	})
+	path := filepath.Join(t.TempDir(), "upload.mp4")
+	writeTestFile(t, path)
+
+	video, err := svc.EnqueueUpload(ctx, UploadRequest{
+		LocalPath:        path,
+		TelegramFileID:   "file",
+		TelegramUniqueID: "unique",
+		FileName:         "upload.mp4",
+		SizeBytes:        5,
+	})
+	if err != nil {
+		t.Fatalf("enqueue upload: %v", err)
+	}
+	if video.LocalPath != path {
+		t.Fatalf("local path = %q, want %q", video.LocalPath, path)
+	}
+	if video.DurationSeconds != 60 {
+		t.Fatalf("duration = %d, want 60", video.DurationSeconds)
+	}
+	if fakeOBS.lastPlayed != path {
+		t.Fatalf("played path = %q, want %q", fakeOBS.lastPlayed, path)
+	}
+}
+
+func TestRemoveQueuedDoesNotDeleteLocalBotAPIFile(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newLocalUploadTestService(t, config.Config{
+		MaxVideoSizeBytes:       1024,
+		MaxVideoDurationSeconds: 120,
+	})
+	path := filepath.Join(t.TempDir(), "upload.mp4")
+	writeTestFile(t, path)
+
+	video, err := svc.EnqueueUpload(ctx, UploadRequest{
+		LocalPath:        path,
+		TelegramFileID:   "file",
+		TelegramUniqueID: "unique",
+		FileName:         "upload.mp4",
+		SizeBytes:        5,
+	})
+	if err != nil {
+		t.Fatalf("enqueue upload: %v", err)
+	}
+	if err := svc.store.FinishCurrent(ctx); err != nil {
+		t.Fatalf("finish current: %v", err)
+	}
+	ready := addReadyVideo(t, ctx, svc.store, "queued.mp4")
+	if err := svc.RemoveQueued(ctx, ready.ID); err != nil {
+		t.Fatalf("remove queued: %v", err)
+	}
+	if !fileExists(path) {
+		t.Fatalf("local bot api file for played video #%d should remain", video.ID)
+	}
+	if !fileExists(ready.LocalPath) {
+		t.Fatalf("queued local bot api file should remain")
+	}
+}
+
 func newFallbackTestService(t *testing.T, cfg config.Config) (*Service, *fakeOBS, *fakeBot) {
 	t.Helper()
 	ctx := context.Background()
@@ -157,6 +248,23 @@ func newFallbackTestService(t *testing.T, cfg config.Config) (*Service, *fakeOBS
 		bot:      fakeBot,
 		playback: playbackIdle,
 	}, fakeOBS, fakeBot
+}
+
+func newLocalUploadTestService(t *testing.T, cfg config.Config) (*Service, *fakeOBS, *fakeBot) {
+	t.Helper()
+	svc, fakeOBS, fakeBot := newFallbackTestService(t, cfg)
+	manager, err := media.NewManager(t.TempDir(), fakeFFProbe(t, 60))
+	if err != nil {
+		t.Fatalf("new media manager: %v", err)
+	}
+	svc.media = manager
+	if svc.cfg.MaxQueueLength == 0 {
+		svc.cfg.MaxQueueLength = 50
+	}
+	if svc.cfg.MaxVideoSizeBytes == 0 {
+		svc.cfg.MaxVideoSizeBytes = 1024
+	}
+	return svc, fakeOBS, fakeBot
 }
 
 func addReadyVideo(t *testing.T, ctx context.Context, store *queue.Store, name string) queue.Video {
@@ -206,6 +314,20 @@ func writeTestFile(t *testing.T, path string) {
 	if err := osWriteFile(path, []byte("video"), 0o600); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
+}
+
+func fakeFFProbe(t *testing.T, duration int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ffprobe")
+	body := []byte("#!/bin/sh\nprintf '{\"format\":{\"duration\":\"" + formatTestInt(duration) + "\"}}'\n")
+	if err := osWriteFile(path, body, 0o700); err != nil {
+		t.Fatalf("write fake ffprobe: %v", err)
+	}
+	return path
+}
+
+func formatTestInt(value int) string {
+	return fmt.Sprintf("%d", value)
 }
 
 func fileExists(path string) bool {

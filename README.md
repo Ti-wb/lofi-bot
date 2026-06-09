@@ -13,6 +13,7 @@ Go backend for a 24h Lo-Fi Music channel workflow:
 - OBS WebSocket enabled, usually port `4455`
 - Go 1.22+
 - `ffmpeg` / `ffprobe`
+- Telegram Local Bot API Server running with `--local`
 
 On macOS:
 
@@ -31,9 +32,14 @@ brew install go ffmpeg
 ## Telegram Setup
 
 1. Create a bot with BotFather.
-2. Add the bot to the target group.
-3. Find the group chat ID.
-4. Copy `.env.example` to `.env` and fill values.
+2. Run a Telegram Local Bot API Server for that bot. Public Telegram Bot API is not supported.
+3. Start the Local Bot API Server with `--local` so `getFile` returns an absolute file path.
+4. Keep the Go backend, Local Bot API Server, and OBS on the same machine, or use shared paths readable by all three processes.
+5. Add the bot to the target group.
+6. Find the group chat ID.
+7. Copy `.env.example` to `.env` and fill values, including `TELEGRAM_API_BASE_URL`.
+
+See [deploy/telegram-bot-api](deploy/telegram-bot-api/README.md) for the reserved Local Bot API Server deployment notes.
 
 ## Run
 
@@ -70,10 +76,11 @@ make test
 ## Notes
 
 - The MVP avoids transcoding to keep CPU use low on the MacBook.
-- Files are retained by `RETENTION_DAYS` and `RETENTION_MAX_FILES`.
+- Played queue history is retained by `RETENTION_DAYS` and `RETENTION_MAX_FILES`; uploaded files are owned by Telegram Local Bot API Server.
 - SQLite state is stored under `DATA_DIR` so the queue survives restarts.
 - `FALLBACK_MODE=random_played` keeps the channel alive by replaying completed history when the queue is empty.
 - `OBS_PASSWORD` can be left empty when OBS WebSocket authentication is disabled.
+- `TELEGRAM_API_BASE_URL` must point at the Local Bot API Server, for example `http://127.0.0.1:8081`.
 
 More detail:
 

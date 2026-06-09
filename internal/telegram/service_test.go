@@ -198,11 +198,60 @@ func TestRegisterCommandsSetsPublicAndAdminScopes(t *testing.T) {
 	}
 }
 
+func TestUploadUsesLocalBotAPIFilePath(t *testing.T) {
+	bot := &fakeBotAPI{
+		file: tgbotapi.File{
+			FilePath: "/tmp/video.mp4",
+			FileSize: 42,
+		},
+	}
+	svc := newTestService(t, bot)
+	var got Upload
+	svc.hooks.EnqueueUpload = func(_ context.Context, upload Upload) (string, error) {
+		got = upload
+		return "queued", nil
+	}
+
+	response, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 0))
+	if err != nil {
+		t.Fatalf("handle upload: %v", err)
+	}
+	if response.text != "queued" {
+		t.Fatalf("response = %q, want queued", response.text)
+	}
+	if got.LocalPath != "/tmp/video.mp4" {
+		t.Fatalf("local path = %q, want /tmp/video.mp4", got.LocalPath)
+	}
+	if got.SizeBytes != 42 {
+		t.Fatalf("size = %d, want 42", got.SizeBytes)
+	}
+}
+
+func TestUploadRejectsRelativeLocalBotAPIFilePath(t *testing.T) {
+	bot := &fakeBotAPI{
+		file: tgbotapi.File{FilePath: "relative/video.mp4"},
+	}
+	svc := newTestService(t, bot)
+	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("enqueue hook should not be called")
+		return "", nil
+	}
+
+	_, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 1))
+	if err == nil {
+		t.Fatal("expected relative path error")
+	}
+	if got := err.Error(); got != "Local Bot API Server must run with --local and return an absolute file path" {
+		t.Fatalf("err = %q", got)
+	}
+}
+
 func newTestService(t *testing.T, bot *fakeBotAPI) *Service {
 	t.Helper()
 
 	svc, err := New(Config{
 		Token:         "token",
+		APIBaseURL:    "http://127.0.0.1:8081",
 		AllowedChatID: testChatID,
 	}, Hooks{
 		Skip: func(context.Context) (string, error) {
@@ -242,6 +291,20 @@ func callbackQuery(userID int64, data string) *tgbotapi.CallbackQuery {
 	}
 }
 
+func videoMessage(fileID string, uniqueID string, size int) *tgbotapi.Message {
+	return &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: testChatID},
+		From: &tgbotapi.User{ID: 42},
+		Video: &tgbotapi.Video{
+			FileID:       fileID,
+			FileUniqueID: uniqueID,
+			FileName:     "video.mp4",
+			MimeType:     "video/mp4",
+			FileSize:     size,
+		},
+	}
+}
+
 func chatMember(userID int64, status string) tgbotapi.ChatMember {
 	return tgbotapi.ChatMember{
 		User:   &tgbotapi.User{ID: userID},
@@ -267,6 +330,8 @@ type fakeBotAPI struct {
 	sendCount        int
 	editTextCount    int
 	setCommandsCount int
+	file             tgbotapi.File
+	fileErr          error
 }
 
 func (f *fakeBotAPI) GetUpdatesChan(tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel {
@@ -291,7 +356,7 @@ func (f *fakeBotAPI) Request(req tgbotapi.Chattable) (*tgbotapi.APIResponse, err
 }
 
 func (f *fakeBotAPI) GetFile(tgbotapi.FileConfig) (tgbotapi.File, error) {
-	return tgbotapi.File{}, nil
+	return f.file, f.fileErr
 }
 
 func (f *fakeBotAPI) GetChatAdministrators(tgbotapi.ChatAdministratorsConfig) ([]tgbotapi.ChatMember, error) {

@@ -8,27 +8,38 @@
    brew install go ffmpeg
    ```
 
-2. Configure OBS:
+2. Configure Telegram Local Bot API Server:
+
+   - create a bot with BotFather;
+   - obtain `api_id` and `api_hash` from Telegram;
+   - run the server with `--local`;
+   - use a fixed data directory;
+   - set `TELEGRAM_API_BASE_URL` in `.env`, for example `http://127.0.0.1:8081`.
+
+   The public Telegram Bot API is not supported. The Local Bot API Server must return absolute local file paths from `getFile`.
+
+3. Configure OBS:
 
    - enable OBS WebSocket;
    - use port `4455` unless changed in `.env`;
    - create a Media Source named `tg_queue_player`;
    - disable looping on that source.
 
-3. Configure Telegram:
+4. Configure Telegram group access:
 
-   - create a bot with BotFather;
    - add it to the target group;
    - collect the group chat ID;
    - make sure queue managers are Telegram group admins.
 
-4. Create local config:
+5. Create local config:
 
    ```sh
    cp .env.example .env
    ```
 
-5. Fill `.env`.
+6. Fill `.env`.
+
+The Go backend, Telegram Local Bot API Server, and OBS should run on the same machine. If they do not, their media paths must be on shared storage and readable at the same absolute paths by the backend and OBS.
 
 ## Local Runbook
 
@@ -78,9 +89,9 @@ The bot registers Telegram's command menu on startup. Most responses also includ
 
 ## Storage And Retention
 
-`RETENTION_DAYS` and `RETENTION_MAX_FILES` are both active. A played item can be deleted when it is older than the age limit or when the played history exceeds the file count limit.
+`RETENTION_DAYS` and `RETENTION_MAX_FILES` are both active. A played queue row can be removed from SQLite when it is older than the age limit or when the played history exceeds the file count limit.
 
-When `FALLBACK_MODE=random_played`, the currently playing random fallback file is protected from retention cleanup. This prevents the active OBS file from being deleted during 24h fallback playback.
+When `FALLBACK_MODE=random_played`, the currently playing random fallback row is protected from retention cleanup. Uploaded video files remain owned by Telegram Local Bot API Server and are not deleted by this project.
 
 Set conservative values on the MacBook first, for example:
 
@@ -88,7 +99,7 @@ Set conservative values on the MacBook first, for example:
 FALLBACK_MODE=random_played
 RETENTION_DAYS=7
 RETENTION_MAX_FILES=100
-MAX_VIDEO_SIZE_MB=500
+MAX_VIDEO_SIZE_MB=2000
 MAX_QUEUE_LENGTH=50
 ```
 
@@ -104,10 +115,13 @@ If `/status` says OBS is disconnected:
 
 If uploads fail after acceptance:
 
+- confirm the Local Bot API Server is running and `TELEGRAM_API_BASE_URL` points to it;
+- confirm it was started with `--local`;
+- confirm `getFile` returns an absolute path readable by the Go backend;
 - check `ffprobe` is installed;
 - check free disk space in `/status`;
 - check `MAX_VIDEO_SIZE_MB` and `MAX_VIDEO_DURATION_SECONDS`;
-- inspect service logs for download/probe errors.
+- inspect service logs for local path/probe errors.
 
 If videos do not visually change in OBS:
 
@@ -117,4 +131,6 @@ If videos do not visually change in OBS:
 
 ## Suggested LaunchAgent
 
-For unattended use, build once and create a macOS LaunchAgent that runs `dist/tg-obs-bot` from this project directory. Keep `.env`, `data/`, and logs on local disk.
+For unattended use, build once and create macOS LaunchAgents for both the Telegram Local Bot API Server and `dist/tg-obs-bot`. Keep fixed Local Bot API data, `.env`, `data/`, and logs on local disk.
+
+The `deploy/telegram-bot-api/` folder is reserved for future LaunchAgent plists and helper scripts.

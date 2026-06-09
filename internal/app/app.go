@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -62,7 +61,7 @@ const (
 )
 
 type UploadRequest struct {
-	FileURL          string
+	LocalPath        string
 	TelegramFileID   string
 	TelegramUniqueID string
 	SubmitterID      int64
@@ -111,6 +110,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 
 	bot, err := telegram.New(telegram.Config{
 		Token:              cfg.TelegramBotToken,
+		APIBaseURL:         cfg.TelegramAPIBaseURL,
 		AllowedChatID:      cfg.AllowedChatID,
 		MaxUploadSizeBytes: cfg.MaxVideoSizeBytes,
 	}, service.telegramHooks(), logger.With("component", "telegram"))
@@ -166,6 +166,16 @@ func (s *Service) EnqueueUpload(ctx context.Context, req UploadRequest) (queue.V
 		s.setLastErr(err)
 		return queue.Video{}, err
 	}
+	if strings.TrimSpace(req.LocalPath) == "" {
+		err := errors.New("local video path is required")
+		s.setLastErr(err)
+		return queue.Video{}, err
+	}
+	if !filepath.IsAbs(req.LocalPath) {
+		err := fmt.Errorf("local video path must be absolute: %s", req.LocalPath)
+		s.setLastErr(err)
+		return queue.Video{}, err
+	}
 
 	length, err := s.store.QueueLength(ctx)
 	if err != nil {
@@ -195,22 +205,20 @@ func (s *Service) EnqueueUpload(ctx context.Context, req UploadRequest) (queue.V
 		return queue.Video{}, err
 	}
 
-	localPath, meta, err := s.media.Download(ctx, req.FileURL, fileName, s.cfg.MaxVideoSizeBytes)
+	meta, err := s.media.Probe(ctx, req.LocalPath)
 	if err != nil {
 		_ = s.store.MarkFailed(ctx, video.ID, err.Error())
 		s.setLastErr(err)
 		return queue.Video{}, err
 	}
 	if err := s.media.Validate(meta, s.cfg.MaxVideoSizeBytes, s.cfg.MaxVideoDurationSeconds); err != nil {
-		_ = media.RemoveFile(localPath)
 		_ = s.store.MarkFailed(ctx, video.ID, err.Error())
 		s.setLastErr(err)
 		return queue.Video{}, err
 	}
 
-	ready, err := s.store.MarkReady(ctx, video.ID, localPath, meta.SizeBytes, meta.DurationSeconds)
+	ready, err := s.store.MarkReady(ctx, video.ID, req.LocalPath, meta.SizeBytes, meta.DurationSeconds)
 	if err != nil {
-		_ = media.RemoveFile(localPath)
 		s.setLastErr(err)
 		return queue.Video{}, err
 	}
@@ -362,17 +370,9 @@ func (s *Service) playRandomFallbackLocked(ctx context.Context) (*queue.Video, e
 }
 
 func (s *Service) RemoveQueued(ctx context.Context, id int64) error {
-	video, err := s.store.Get(ctx, id)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		s.setLastErr(err)
-		return err
-	}
 	if err := s.store.Cancel(ctx, id); err != nil {
 		s.setLastErr(err)
 		return err
-	}
-	if video.LocalPath != "" {
-		_ = media.RemoveFile(video.LocalPath)
 	}
 	return nil
 }
@@ -464,7 +464,7 @@ func (s *Service) telegramHooks() telegram.Hooks {
 	return telegram.Hooks{
 		EnqueueUpload: func(ctx context.Context, upload telegram.Upload) (string, error) {
 			video, err := s.EnqueueUpload(ctx, UploadRequest{
-				FileURL:          upload.DownloadURL,
+				LocalPath:        upload.LocalPath,
 				TelegramFileID:   upload.FileID,
 				TelegramUniqueID: upload.FileUniqueID,
 				SubmitterID:      upload.SubmitterID,
@@ -573,9 +573,6 @@ func (s *Service) CleanupRetention(ctx context.Context) error {
 	for _, video := range deleteIDs {
 		if video.ID == fallbackID || (fallbackPath != "" && video.LocalPath == fallbackPath) {
 			continue
-		}
-		if err := media.RemoveFile(video.LocalPath); err != nil {
-			return err
 		}
 		if err := s.store.Delete(ctx, video.ID); err != nil {
 			return err

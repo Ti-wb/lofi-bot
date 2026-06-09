@@ -12,8 +12,9 @@ import (
 )
 
 type Config struct {
-	TelegramBotToken string
-	AllowedChatID    int64
+	TelegramBotToken   string
+	TelegramAPIBaseURL string
+	AllowedChatID      int64
 
 	OBSHost            string
 	OBSPort            int
@@ -40,6 +41,7 @@ func Load() (Config, error) {
 
 	cfg := Config{
 		TelegramBotToken:        getenv("TELEGRAM_BOT_TOKEN", ""),
+		TelegramAPIBaseURL:      strings.TrimRight(getenv("TELEGRAM_API_BASE_URL", ""), "/"),
 		AllowedChatID:           getenvInt64("ALLOWED_CHAT_ID", 0),
 		OBSHost:                 getenv("OBS_HOST", "127.0.0.1"),
 		OBSPort:                 getenvInt("OBS_PORT", 4455),
@@ -61,6 +63,9 @@ func Load() (Config, error) {
 
 	if cfg.TelegramBotToken == "" {
 		return cfg, errors.New("TELEGRAM_BOT_TOKEN is required")
+	}
+	if cfg.TelegramAPIBaseURL == "" {
+		return cfg, errors.New("TELEGRAM_API_BASE_URL is required")
 	}
 	if cfg.AllowedChatID == 0 {
 		return cfg, errors.New("ALLOWED_CHAT_ID is required")

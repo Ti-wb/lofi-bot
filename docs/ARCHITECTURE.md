@@ -1,6 +1,6 @@
 # Architecture
 
-`tg-obs-bot` is a single-process Go service for running a Telegram-submitted video queue through OBS.
+`tg-obs-bot` is a single-process Go service for running a Telegram-submitted video queue through OBS. It requires Telegram Local Bot API Server; the public Telegram Bot API is intentionally unsupported for uploads.
 
 ## Components
 
@@ -10,18 +10,20 @@
 - `internal/telegram`: Telegram update loop, uploads, commands, and live group admin checks.
 - `internal/obs`: OBS WebSocket v5 client, auth handshake, media source control, playback-ended events.
 - `internal/queue`: SQLite-backed queue state and ordering.
-- `internal/media`: Telegram file download, file naming, `ffprobe` metadata, disk usage.
+- `internal/media`: local Telegram file probing, `ffprobe` metadata, disk usage.
+- Telegram Local Bot API Server: local Bot API endpoint configured by `TELEGRAM_API_BASE_URL`.
 
 ## Runtime Flow
 
 1. A user sends a video in the configured Telegram group.
 2. Telegram service validates group membership and upload type.
-3. App service checks queue length and file size, records a `downloading` row, then downloads the file.
-4. Media service probes duration and validates configured limits.
-5. Queue store marks the item `ready` and assigns a queue position.
-6. If OBS is connected and idle, app service starts playback immediately.
-7. OBS client updates the configured Media Source and triggers restart.
-8. OBS playback-ended events cause app service to mark the current item played and advance to the next ready item.
+3. Telegram service resolves the file through Local Bot API `getFile`; the server must be running with `--local` so the response includes an absolute local file path.
+4. App service checks queue length and file size, records a `downloading` row, then probes the local file path.
+5. Media service probes duration and validates configured limits.
+6. Queue store marks the item `ready` and assigns a queue position.
+7. If OBS is connected and idle, app service starts playback immediately.
+8. OBS client updates the configured Media Source and triggers restart.
+9. OBS playback-ended events cause app service to mark the current item played and advance to the next ready item.
 
 ## Management Authorization
 
@@ -33,16 +35,18 @@ Text commands remain supported, but the bot also registers Telegram command menu
 
 ## Queue States
 
-- `downloading`: accepted by Telegram and being downloaded.
-- `ready`: downloaded, validated, and waiting for OBS.
+- `downloading`: accepted by Telegram and being probed from the Local Bot API file path.
+- `ready`: local file path validated and waiting for OBS.
 - `playing`: current OBS item.
 - `played`: completed or skipped with no replacement.
 - `canceled`: removed before playback.
-- `failed`: rejected after initial acceptance due to download/probe/storage error.
+- `failed`: rejected after initial acceptance due to local path/probe/storage error.
 
 ## Data Persistence
 
-SQLite persists all queue metadata under `DATABASE_PATH`. Video files live under `MEDIA_DIR`.
+SQLite persists all queue metadata under `DATABASE_PATH`, including the absolute local file path returned by Telegram Local Bot API Server. New uploads are not copied into `MEDIA_DIR`; their file lifecycle is owned by Telegram Local Bot API Server.
+
+The Go backend, Local Bot API Server, and OBS are expected to run on the same host. A multi-host setup must provide shared storage where the Local Bot API absolute file paths and OBS media paths are readable by the relevant processes.
 
 On restart:
 
@@ -54,9 +58,9 @@ On restart:
 
 - OBS connection loss does not delete queue state.
 - OBS playback failure leaves the next `ready` item in the queue instead of marking it played.
-- A canceled item that finishes downloading cannot become `ready`; the downloaded file is removed by app logic.
-- Retention cleanup removes old played files by age and maximum file count.
-- Random fallback playback locks the active history file so retention cleanup cannot delete it mid-playback.
+- A canceled item cannot become `ready` after cancellation.
+- Retention cleanup removes old played queue rows by age and maximum file count.
+- Random fallback playback locks the active history row so retention cleanup cannot remove it mid-playback.
 
 ## Fallback Playback
 
@@ -66,4 +70,4 @@ When the normal queue is empty, `FALLBACK_MODE=random_played` randomly selects a
 
 - No transcoding by default, to keep CPU use low on the MacBook.
 - No web dashboard; Telegram commands are the management UI.
-- Backend and OBS are expected to run on the same Mac.
+- Backend, Telegram Local Bot API Server, and OBS are expected to run on the same Mac.
