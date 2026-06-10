@@ -40,7 +40,7 @@ TELEGRAM_BOT_API_DIR=./data/telegram-bot-api
 1. Copy and fill the shared config:
 
    ```sh
-   cp .env.example .env
+   cp ../../.env.example ../../.env
    ```
 
 2. Install or build the official `telegram-bot-api` binary and make sure `TELEGRAM_BOT_API_BIN` points to it.
@@ -48,19 +48,19 @@ TELEGRAM_BOT_API_DIR=./data/telegram-bot-api
 3. Log the bot out from the public Telegram Bot API. This is a manual operator step and is not run automatically:
 
    ```sh
-   ./run.sh logout-public
+   ../../run.sh logout-public
    ```
 
 4. Start the local server:
 
    ```sh
-   ./run.sh bot-api
+   ../../run.sh bot-api
    ```
 
 5. In another terminal, verify the local endpoint:
 
    ```sh
-   ./run.sh health
+   ../../run.sh health
    ```
 
 ## Runtime Contract

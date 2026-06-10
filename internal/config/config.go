@@ -44,22 +44,51 @@ func Load() (Config, error) {
 	}
 	_ = loadDotEnv(".env")
 
+	allowedChatID, err := getenvInt64("ALLOWED_CHAT_ID", 0)
+	if err != nil {
+		return Config{}, err
+	}
+	obsPort, err := getenvInt("OBS_PORT", 4455)
+	if err != nil {
+		return Config{}, err
+	}
+	maxVideoSizeMB, err := getenvInt("MAX_VIDEO_SIZE_MB", 2000)
+	if err != nil {
+		return Config{}, err
+	}
+	maxVideoDurationSeconds, err := getenvInt("MAX_VIDEO_DURATION_SECONDS", 7200)
+	if err != nil {
+		return Config{}, err
+	}
+	maxQueueLength, err := getenvInt("MAX_QUEUE_LENGTH", 50)
+	if err != nil {
+		return Config{}, err
+	}
+	retentionDays, err := getenvInt("RETENTION_DAYS", 7)
+	if err != nil {
+		return Config{}, err
+	}
+	retentionMaxFiles, err := getenvInt("RETENTION_MAX_FILES", 100)
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
 		TelegramBotToken:        getenv("TELEGRAM_BOT_TOKEN", ""),
 		TelegramAPIBaseURL:      strings.TrimRight(getenv("TELEGRAM_API_BASE_URL", ""), "/"),
-		AllowedChatID:           getenvInt64("ALLOWED_CHAT_ID", 0),
+		AllowedChatID:           allowedChatID,
 		OBSHost:                 getenv("OBS_HOST", "127.0.0.1"),
-		OBSPort:                 getenvInt("OBS_PORT", 4455),
+		OBSPort:                 obsPort,
 		OBSPassword:             getenv("OBS_PASSWORD", ""),
-		OBSMediaSourceName:      getenv("OBS_MEDIA_SOURCE_NAME", "tg_queue_player"),
+		OBSMediaSourceName:      strings.TrimSpace(getenv("OBS_MEDIA_SOURCE_NAME", "tg_queue_player")),
 		OBSFallbackFile:         getenv("OBS_FALLBACK_FILE", ""),
 		FallbackMode:            getenv("FALLBACK_MODE", "random_played"),
 		DataDir:                 getenv("DATA_DIR", "./data"),
-		MaxVideoSizeBytes:       int64(getenvInt("MAX_VIDEO_SIZE_MB", 2000)) * 1024 * 1024,
-		MaxVideoDurationSeconds: getenvInt("MAX_VIDEO_DURATION_SECONDS", 7200),
-		MaxQueueLength:          getenvInt("MAX_QUEUE_LENGTH", 50),
-		RetentionDays:           getenvInt("RETENTION_DAYS", 7),
-		RetentionMaxFiles:       getenvInt("RETENTION_MAX_FILES", 100),
+		MaxVideoSizeBytes:       int64(maxVideoSizeMB) * 1024 * 1024,
+		MaxVideoDurationSeconds: maxVideoDurationSeconds,
+		MaxQueueLength:          maxQueueLength,
+		RetentionDays:           retentionDays,
+		RetentionMaxFiles:       retentionMaxFiles,
 		FFProbePath:             getenv("FFPROBE_PATH", "ffprobe"),
 		LogLevel:                parseLogLevel(getenv("LOG_LEVEL", "info")),
 	}
@@ -75,6 +104,9 @@ func Load() (Config, error) {
 	if cfg.AllowedChatID == 0 {
 		return cfg, errors.New("ALLOWED_CHAT_ID is required")
 	}
+	if cfg.OBSPort < 1 || cfg.OBSPort > 65535 {
+		return cfg, errors.New("OBS_PORT must be between 1 and 65535")
+	}
 	if cfg.OBSMediaSourceName == "" {
 		return cfg, errors.New("OBS_MEDIA_SOURCE_NAME is required")
 	}
@@ -84,8 +116,17 @@ func Load() (Config, error) {
 	if cfg.MaxVideoSizeBytes <= 0 {
 		return cfg, errors.New("MAX_VIDEO_SIZE_MB must be positive")
 	}
+	if cfg.MaxVideoDurationSeconds < 0 {
+		return cfg, errors.New("MAX_VIDEO_DURATION_SECONDS must be non-negative")
+	}
 	if cfg.MaxQueueLength <= 0 {
 		return cfg, errors.New("MAX_QUEUE_LENGTH must be positive")
+	}
+	if cfg.RetentionDays < 0 {
+		return cfg, errors.New("RETENTION_DAYS must be non-negative")
+	}
+	if cfg.RetentionMaxFiles < 0 {
+		return cfg, errors.New("RETENTION_MAX_FILES must be non-negative")
 	}
 
 	return cfg, nil
@@ -260,28 +301,28 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-func getenvInt(key string, fallback int) int {
+func getenvInt(key string, fallback int) (int, error) {
 	value := os.Getenv(key)
 	if value == "" {
-		return fallback
+		return fallback, nil
 	}
-	parsed, err := strconv.Atoi(value)
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil {
-		return fallback
+		return 0, fmt.Errorf("%s must be an integer", key)
 	}
-	return parsed
+	return parsed, nil
 }
 
-func getenvInt64(key string, fallback int64) int64 {
+func getenvInt64(key string, fallback int64) (int64, error) {
 	value := os.Getenv(key)
 	if value == "" {
-		return fallback
+		return fallback, nil
 	}
-	parsed, err := strconv.ParseInt(value, 10, 64)
+	parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 	if err != nil {
-		return fallback
+		return 0, fmt.Errorf("%s must be an integer", key)
 	}
-	return parsed
+	return parsed, nil
 }
 
 func parseLogLevel(raw string) slog.Level {

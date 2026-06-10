@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"testing"
 	"time"
 
@@ -198,6 +199,231 @@ func TestRegisterCommandsSetsPublicAndAdminScopes(t *testing.T) {
 	}
 }
 
+func TestNewDefaultsRequestTimeoutExceedsUpdateTimeout(t *testing.T) {
+	svc := newTestService(t, &fakeBotAPI{})
+
+	updateTimeout := time.Duration(svc.cfg.UpdateTimeout) * time.Second
+	if svc.cfg.RequestTimeout <= updateTimeout {
+		t.Fatalf("request timeout = %s, want greater than update timeout %s", svc.cfg.RequestTimeout, updateTimeout)
+	}
+}
+
+func TestContextHTTPClientAttachesCallerContext(t *testing.T) {
+	base := &blockingHTTPClient{seen: make(chan context.Context, 1)}
+	client := &contextHTTPClient{base: base}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client.ctx = ctx
+	req, err := http.NewRequest(http.MethodPost, "http://telegram.local/bot/test", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	errCh := make(chan error, 1)
+
+	go func() {
+		_, err := client.Do(req)
+		errCh <- err
+	}()
+
+	select {
+	case got := <-base.seen:
+		if got != ctx {
+			t.Fatalf("request context was not caller context")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("http client did not receive request")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("http client did not return after context cancellation")
+	}
+}
+
+func TestSendCanceledContextReturnsQuickly(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	bot := &fakeBotAPI{sendBlock: block}
+	svc := newTestService(t, bot)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	err := svc.send(ctx, tgbotapi.NewMessage(testChatID, "hello"))
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want %v", err, context.Canceled)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("send took %s, want quick cancellation", elapsed)
+	}
+	if bot.sendCount != 0 {
+		t.Fatalf("send calls = %d, want 0", bot.sendCount)
+	}
+}
+
+func TestRequestCanceledContextReturnsQuickly(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	bot := &fakeBotAPI{requestBlock: block}
+	svc := newTestService(t, bot)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	err := svc.request(ctx, tgbotapi.NewMessage(testChatID, "hello"))
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want %v", err, context.Canceled)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("request took %s, want quick cancellation", elapsed)
+	}
+	if bot.requestCount != 0 {
+		t.Fatalf("request calls = %d, want 0", bot.requestCount)
+	}
+}
+
+func TestGetFileCanceledContextDoesNotCallBot(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	bot := &fakeBotAPI{fileBlock: block}
+	svc := newTestService(t, bot)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("enqueue hook should not be called")
+		return "", nil
+	}
+
+	start := time.Now()
+	_, err := svc.handleUpload(ctx, videoMessage("file-id", "unique-id", 1))
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want %v", err, context.Canceled)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("handle upload took %s, want quick cancellation", elapsed)
+	}
+	if bot.fileCallCount != 0 {
+		t.Fatalf("getFile calls = %d, want 0", bot.fileCallCount)
+	}
+}
+
+func TestGetFileInFlightCanceledContextReturnsQuickly(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	started := make(chan struct{})
+	bot := &fakeBotAPI{fileBlock: block, fileStarted: started}
+	svc := newTestService(t, bot)
+	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("enqueue hook should not be called")
+		return "", nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+
+	go func() {
+		_, err := svc.handleUpload(ctx, videoMessage("file-id", "unique-id", 1))
+		errCh <- err
+	}()
+	<-started
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("handle upload did not return after context cancellation")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("handle upload took %s after cancel, want quick cancellation", elapsed)
+	}
+	if bot.fileCallCount != 1 {
+		t.Fatalf("getFile calls = %d, want 1", bot.fileCallCount)
+	}
+}
+
+func TestAdminCanceledContextDoesNotCallBotAndDeniesCommand(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	bot := &fakeBotAPI{adminBlock: block}
+	svc := newTestService(t, bot)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	_, err := svc.handleCommand(ctx, commandMessage(42, "/skip"))
+
+	if !errors.Is(err, errAdminOnly) {
+		t.Fatalf("err = %v, want %v", err, errAdminOnly)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("admin command took %s, want quick cancellation", elapsed)
+	}
+	if bot.adminCallCount != 0 {
+		t.Fatalf("admin API calls = %d, want 0", bot.adminCallCount)
+	}
+}
+
+func TestAdminInFlightCanceledContextReturnsQuicklyAndDeniesCommand(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	started := make(chan struct{})
+	bot := &fakeBotAPI{adminBlock: block, adminStarted: started}
+	svc := newTestService(t, bot)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+
+	go func() {
+		_, err := svc.handleCommand(ctx, commandMessage(42, "/skip"))
+		errCh <- err
+	}()
+	<-started
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, errAdminOnly) {
+			t.Fatalf("err = %v, want %v", err, errAdminOnly)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("admin command did not return after context cancellation")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("admin command took %s after cancel, want quick cancellation", elapsed)
+	}
+	if bot.adminCallCount != 1 {
+		t.Fatalf("admin API calls = %d, want 1", bot.adminCallCount)
+	}
+}
+
+func TestRunCancelStopsReceivingUpdates(t *testing.T) {
+	bot := &fakeBotAPI{updates: make(tgbotapi.UpdatesChannel)}
+	svc := newTestService(t, bot)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := svc.Run(ctx)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want %v", err, context.Canceled)
+	}
+	if bot.stopReceivingCount != 1 {
+		t.Fatalf("stop receiving calls = %d, want 1", bot.stopReceivingCount)
+	}
+}
+
 func TestUploadUsesLocalBotAPIFilePath(t *testing.T) {
 	bot := &fakeBotAPI{
 		file: tgbotapi.File{
@@ -224,6 +450,88 @@ func TestUploadUsesLocalBotAPIFilePath(t *testing.T) {
 	}
 	if got.SizeBytes != 42 {
 		t.Fatalf("size = %d, want 42", got.SizeBytes)
+	}
+}
+
+func TestUploadReturnsGetFileError(t *testing.T) {
+	getFileErr := errors.New("telegram getFile failed")
+	bot := &fakeBotAPI{fileErr: getFileErr}
+	svc := newTestService(t, bot)
+	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("enqueue hook should not be called")
+		return "", nil
+	}
+
+	_, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 1))
+
+	if !errors.Is(err, getFileErr) {
+		t.Fatalf("err = %v, want wrapped %v", err, getFileErr)
+	}
+	if bot.fileCallCount != 1 {
+		t.Fatalf("getFile calls = %d, want 1", bot.fileCallCount)
+	}
+}
+
+func TestUploadRejectsDeclaredSizeOverLimit(t *testing.T) {
+	bot := &fakeBotAPI{}
+	svc := newTestService(t, bot)
+	svc.cfg.MaxUploadSizeBytes = 10
+	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("enqueue hook should not be called")
+		return "", nil
+	}
+
+	_, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 11))
+
+	if !errors.Is(err, errUploadTooLarge) {
+		t.Fatalf("err = %v, want %v", err, errUploadTooLarge)
+	}
+	if bot.fileCallCount != 0 {
+		t.Fatalf("getFile calls = %d, want 0", bot.fileCallCount)
+	}
+}
+
+func TestUploadRejectsGetFileSizeOverLimit(t *testing.T) {
+	bot := &fakeBotAPI{
+		file: tgbotapi.File{
+			FilePath: "/tmp/video.mp4",
+			FileSize: 11,
+		},
+	}
+	svc := newTestService(t, bot)
+	svc.cfg.MaxUploadSizeBytes = 10
+	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("enqueue hook should not be called")
+		return "", nil
+	}
+
+	_, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 0))
+
+	if !errors.Is(err, errUploadTooLarge) {
+		t.Fatalf("err = %v, want %v", err, errUploadTooLarge)
+	}
+}
+
+func TestUploadAcceptsSizeAtLimit(t *testing.T) {
+	bot := &fakeBotAPI{
+		file: tgbotapi.File{
+			FilePath: "/tmp/video.mp4",
+			FileSize: 10,
+		},
+	}
+	svc := newTestService(t, bot)
+	svc.cfg.MaxUploadSizeBytes = 10
+	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
+		return "queued", nil
+	}
+
+	response, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 10))
+
+	if err != nil {
+		t.Fatalf("handle upload: %v", err)
+	}
+	if response.text != "queued" {
+		t.Fatalf("response = %q, want queued", response.text)
 	}
 }
 
@@ -324,28 +632,68 @@ type adminResponse struct {
 	err    error
 }
 
+type blockingHTTPClient struct {
+	seen chan context.Context
+}
+
+func (b *blockingHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	b.seen <- req.Context()
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
 type fakeBotAPI struct {
-	adminResponses   []adminResponse
-	adminCallCount   int
-	sendCount        int
-	editTextCount    int
-	setCommandsCount int
-	file             tgbotapi.File
-	fileErr          error
+	adminResponses     []adminResponse
+	adminCallCount     int
+	sendCount          int
+	requestCount       int
+	editTextCount      int
+	setCommandsCount   int
+	stopReceivingCount int
+	fileCallCount      int
+	updates            tgbotapi.UpdatesChannel
+	file               tgbotapi.File
+	fileErr            error
+	sendBlock          <-chan struct{}
+	requestBlock       <-chan struct{}
+	fileBlock          <-chan struct{}
+	adminBlock         <-chan struct{}
+	fileStarted        chan struct{}
+	adminStarted       chan struct{}
 }
 
 func (f *fakeBotAPI) GetUpdatesChan(tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel {
+	if f.updates != nil {
+		return f.updates
+	}
 	return make(tgbotapi.UpdatesChannel)
 }
 
-func (f *fakeBotAPI) StopReceivingUpdates() {}
+func (f *fakeBotAPI) StopReceivingUpdates() {
+	f.stopReceivingCount++
+}
 
-func (f *fakeBotAPI) Send(tgbotapi.Chattable) (tgbotapi.Message, error) {
+func (f *fakeBotAPI) Send(ctx context.Context, _ tgbotapi.Chattable) (tgbotapi.Message, error) {
 	f.sendCount++
+	if f.sendBlock != nil {
+		select {
+		case <-f.sendBlock:
+		case <-ctx.Done():
+			return tgbotapi.Message{}, ctx.Err()
+		}
+	}
 	return tgbotapi.Message{}, nil
 }
 
-func (f *fakeBotAPI) Request(req tgbotapi.Chattable) (*tgbotapi.APIResponse, error) {
+func (f *fakeBotAPI) Request(ctx context.Context, req tgbotapi.Chattable) (*tgbotapi.APIResponse, error) {
+	f.requestCount++
+	if f.requestBlock != nil {
+		select {
+		case <-f.requestBlock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	switch req.(type) {
 	case tgbotapi.EditMessageTextConfig:
 		f.editTextCount++
@@ -355,12 +703,33 @@ func (f *fakeBotAPI) Request(req tgbotapi.Chattable) (*tgbotapi.APIResponse, err
 	return &tgbotapi.APIResponse{}, nil
 }
 
-func (f *fakeBotAPI) GetFile(tgbotapi.FileConfig) (tgbotapi.File, error) {
+func (f *fakeBotAPI) GetFile(ctx context.Context, _ tgbotapi.FileConfig) (tgbotapi.File, error) {
+	f.fileCallCount++
+	if f.fileStarted != nil {
+		close(f.fileStarted)
+	}
+	if f.fileBlock != nil {
+		select {
+		case <-f.fileBlock:
+		case <-ctx.Done():
+			return tgbotapi.File{}, ctx.Err()
+		}
+	}
 	return f.file, f.fileErr
 }
 
-func (f *fakeBotAPI) GetChatAdministrators(tgbotapi.ChatAdministratorsConfig) ([]tgbotapi.ChatMember, error) {
+func (f *fakeBotAPI) GetChatAdministrators(ctx context.Context, _ tgbotapi.ChatAdministratorsConfig) ([]tgbotapi.ChatMember, error) {
 	f.adminCallCount++
+	if f.adminStarted != nil {
+		close(f.adminStarted)
+	}
+	if f.adminBlock != nil {
+		select {
+		case <-f.adminBlock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if len(f.adminResponses) == 0 {
 		return nil, nil
 	}

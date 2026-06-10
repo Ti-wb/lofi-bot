@@ -24,6 +24,8 @@ const (
 	opRequest         = 6
 	opRequestResponse = 7
 
+	defaultRequestTimeout = 10 * time.Second
+
 	mediaActionRestart = "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART"
 	mediaActionStop    = "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_STOP"
 )
@@ -48,6 +50,7 @@ type Options struct {
 	Password        string
 	MediaSourceName string
 	EventBuffer     int
+	RequestTimeout  time.Duration
 	Logger          *slog.Logger
 	Dialer          *websocket.Dialer
 }
@@ -96,6 +99,9 @@ func NewClient(opts Options) (*Client, error) {
 	}
 	if opts.EventBuffer <= 0 {
 		opts.EventBuffer = 8
+	}
+	if opts.RequestTimeout <= 0 {
+		opts.RequestTimeout = defaultRequestTimeout
 	}
 	if opts.Dialer == nil {
 		opts.Dialer = websocket.DefaultDialer
@@ -271,6 +277,8 @@ func (c *Client) request(ctx context.Context, requestType string, requestData ma
 	if err != nil {
 		return err
 	}
+	timeoutCtx, cancelTimeout := context.WithTimeout(context.Background(), c.opts.RequestTimeout)
+	defer cancelTimeout()
 
 	id := fmt.Sprintf("%d", c.nextID.Add(1))
 	responseCh := make(chan requestResponseData, 1)
@@ -292,7 +300,13 @@ func (c *Client) request(ctx context.Context, requestType string, requestData ma
 		}
 	}()
 
-	err = c.write(ctx, conn, envelope{Op: opRequest, D: mustMarshal(requestDataPayload{
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	err = c.write(timeoutCtx, conn, envelope{Op: opRequest, D: mustMarshal(requestDataPayload{
 		RequestType: requestType,
 		RequestID:   id,
 		RequestData: requestData,
@@ -304,7 +318,20 @@ func (c *Client) request(ctx context.Context, requestType string, requestData ma
 
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		err := ctx.Err()
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		cleanup = false
+		return err
+	case <-timeoutCtx.Done():
+		err := timeoutCtx.Err()
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		cleanup = false
+		c.disconnectIfCurrent(conn, err)
+		return err
 	case response := <-responseCh:
 		cleanup = false
 		if !response.RequestStatus.Result {
