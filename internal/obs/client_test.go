@@ -64,7 +64,11 @@ func TestClientConnectHandshakeSuccess(t *testing.T) {
 	if err := client.Connect(ctx); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
-	defer client.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
 
 	select {
 	case <-identified:
@@ -111,7 +115,11 @@ func TestClientPlayFileSendsMediaRequests(t *testing.T) {
 	if err := client.Connect(ctx); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
-	defer client.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
 
 	if err := client.PlayFile(context.Background(), "/tmp/media.mp4"); err != nil {
 		t.Fatalf("PlayFile: %v", err)
@@ -169,7 +177,11 @@ func TestClientRequestTimeoutClearsPendingAndDisconnects(t *testing.T) {
 	if err := client.Connect(ctx); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
-	defer client.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
 
 	err := client.request(context.Background(), "GetVersion", nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -227,7 +239,11 @@ func TestClientRequestCallerCancelClearsPendingWithoutDisconnect(t *testing.T) {
 	if err := client.Connect(connectCtx); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
-	defer client.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
 
 	requestCtx, cancelRequest := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -288,7 +304,11 @@ func TestClientRequestCallerDeadlineClearsPendingWithoutDisconnect(t *testing.T)
 	if err := client.Connect(connectCtx); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
-	defer client.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
 
 	requestCtx := newControlledDeadlineContext(time.Now().Add(time.Hour))
 	errCh := make(chan error, 1)
