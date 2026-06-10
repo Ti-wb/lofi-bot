@@ -44,9 +44,13 @@ The Go backend, Telegram Local Bot API Server, and OBS should run on the same ma
 
 Before deploying a new build, manually back up the production `.env`.
 
-On startup, the app checks `.env` against the supported schema version. If the file uses an older schema, it backs up the current file to `.env.backup.<unix_timestamp>` and appends the fields required by the migration.
+Before starting services, run `./run.sh migrate-env` to apply the stack helper's lightweight `.env` repair without starting the Go app. The helper checks `.env` against the supported schema version, backs up the current file to `.env.backup.<unix_timestamp>`, updates older schema markers, and appends missing fields needed by the Local Bot API helper.
 
 After migration, confirm the appended Telegram Local Bot API Server defaults are correct for production. If they are wrong, edit `.env` and restart the relevant process.
+
+Numeric config values are strict in production: malformed integers fail startup instead of falling back to defaults. Keep `OBS_PORT` in `1..65535`, set `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` above `0`, and use non-negative values for `MAX_VIDEO_DURATION_SECONDS`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES`. A value of `0` remains valid for duration and retention limits where it means disabled.
+
+The stack helpers also run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing the v2 Local Bot API defaults.
 
 ## Local Runbook
 
@@ -65,6 +69,7 @@ Common commands:
 ./run.sh app             # start only tg-obs-bot
 ./run.sh health          # check Local Bot API /getMe
 ./run.sh env             # print sanitized runtime config
+./run.sh migrate-env     # back up .env and append missing schema defaults
 ./run.sh logout-public   # manually log out from public Bot API
 ```
 
@@ -116,7 +121,9 @@ The bot registers Telegram's command menu on startup. Most responses also includ
 
 `RETENTION_DAYS` and `RETENTION_MAX_FILES` are both active. A played queue row can be removed from SQLite when it is older than the age limit or when the played history exceeds the file count limit.
 
-When `FALLBACK_MODE=random_played`, the currently playing random fallback row is protected from retention cleanup. Uploaded video files remain owned by Telegram Local Bot API Server and are not deleted by this project.
+When `FALLBACK_MODE=random_played`, the currently playing random fallback row is protected from retention cleanup. Uploaded video files remain owned by Telegram Local Bot API Server and are not deleted by this project. App retention removes SQLite rows only; it does not remove media files under `TELEGRAM_BOT_API_DIR`.
+
+Monitor disk usage for `TELEGRAM_BOT_API_DIR` alongside `/status`. If `TELEGRAM_BOT_API_DIR` is relative, run `du -sh "$TELEGRAM_BOT_API_DIR"` from the repository root, or use the absolute resolved path. If manual cleanup is needed, first stop the stack or confirm the files are not referenced by queued, currently playing, or fallback history rows. Never delete paths that may still be queued, current, or used as random fallback candidates.
 
 Set conservative values on the MacBook first, for example:
 
@@ -156,4 +163,6 @@ If videos do not visually change in OBS:
 
 ## Suggested LaunchAgent
 
-For unattended use, build once and create macOS LaunchAgents for the underlying long-running services: `deploy/telegram-bot-api/run.sh` and `dist/tg-obs-bot`. Keep fixed Local Bot API data, `.env`, `data/`, and logs on local disk. The root `run.sh` is the local operator entrypoint, not a replacement for future LaunchAgent plists.
+For unattended use, build once and create macOS LaunchAgents for the underlying long-running services: `deploy/telegram-bot-api/run.sh` and `dist/tg-obs-bot`. The root and `deploy/telegram-bot-api` helper scripts load `.env` from the repository root and resolve a relative `TELEGRAM_BOT_API_DIR` against the repository root. When running binaries directly or writing custom plists, set `WorkingDirectory` to the repository root, or convert all relative paths in `.env` and plist arguments to absolute paths. Relative values such as `.env`, `DATA_DIR`, `TELEGRAM_BOT_API_DIR`, and log paths then resolve from the process working directory, not from the script or binary file location.
+
+Keep fixed Local Bot API data, `.env`, `data/`, and logs on local disk. The root `run.sh` is the local operator entrypoint, not a replacement for future LaunchAgent plists.

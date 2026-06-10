@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -16,8 +17,9 @@ import (
 )
 
 const (
-	defaultUpdateTimeout = 30
-	adminCacheTTL        = 60 * time.Second
+	defaultUpdateTimeout  = 30
+	defaultRequestTimeout = time.Duration(defaultUpdateTimeout)*time.Second + 5*time.Second
+	adminCacheTTL         = 60 * time.Second
 )
 
 var queueItemPattern = regexp.MustCompile(`#([0-9]+).*第 ([0-9]+) 位`)
@@ -28,6 +30,7 @@ type Config struct {
 	AllowedChatID      int64
 	MaxUploadSizeBytes int64
 	UpdateTimeout      int
+	RequestTimeout     time.Duration
 	Debug              bool
 }
 
@@ -106,6 +109,13 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 	if cfg.UpdateTimeout <= 0 {
 		cfg.UpdateTimeout = defaultUpdateTimeout
 	}
+	if cfg.RequestTimeout <= 0 {
+		cfg.RequestTimeout = defaultRequestTimeout
+	}
+	minRequestTimeout := time.Duration(cfg.UpdateTimeout)*time.Second + 5*time.Second
+	if cfg.RequestTimeout < minRequestTimeout {
+		cfg.RequestTimeout = minRequestTimeout
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -121,11 +131,10 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 		opt(s)
 	}
 	if s.bot == nil {
-		bot, err := tgbotapi.NewBotAPIWithAPIEndpoint(cfg.Token, cfg.APIBaseURL+"/bot%s/%s")
+		bot, err := newProductionBotAPI(cfg)
 		if err != nil {
 			return nil, fmt.Errorf("create telegram bot: %w", err)
 		}
-		bot.Debug = cfg.Debug
 		s.bot = bot
 	}
 	return s, nil
@@ -349,8 +358,11 @@ func (s *Service) handleUpload(ctx context.Context, msg *tgbotapi.Message) (botR
 		return botResponse{}, fmt.Errorf("%w: %s is larger than the limit of %s", errUploadTooLarge, formatBytes(upload.SizeBytes), formatBytes(s.cfg.MaxUploadSizeBytes))
 	}
 
-	file, err := s.bot.GetFile(tgbotapi.FileConfig{FileID: upload.FileID})
+	file, err := s.getFile(ctx, tgbotapi.FileConfig{FileID: upload.FileID})
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return botResponse{}, err
+		}
 		return botResponse{}, fmt.Errorf("inspect Telegram file: %w", err)
 	}
 	if s.cfg.MaxUploadSizeBytes > 0 && file.FileSize > 0 && int64(file.FileSize) > s.cfg.MaxUploadSizeBytes {
@@ -482,39 +494,33 @@ func (s *Service) reply(ctx context.Context, chatID int64, response botResponse,
 }
 
 func (s *Service) send(ctx context.Context, msg tgbotapi.Chattable) error {
-	type result struct {
-		err error
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	done := make(chan result, 1)
-	go func() {
-		_, err := s.bot.Send(msg)
-		done <- result{err: err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case res := <-done:
-		return res.err
-	}
+	_, err := s.bot.Send(ctx, msg)
+	return err
 }
 
 func (s *Service) request(ctx context.Context, req tgbotapi.Chattable) error {
-	type result struct {
-		err error
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	done := make(chan result, 1)
-	go func() {
-		_, err := s.bot.Request(req)
-		done <- result{err: err}
-	}()
+	_, err := s.bot.Request(ctx, req)
+	return err
+}
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case res := <-done:
-		return res.err
+func (s *Service) getFile(ctx context.Context, config tgbotapi.FileConfig) (tgbotapi.File, error) {
+	if err := ctx.Err(); err != nil {
+		return tgbotapi.File{}, err
 	}
+	return s.bot.GetFile(ctx, config)
+}
+
+func (s *Service) getChatAdministrators(ctx context.Context, config tgbotapi.ChatAdministratorsConfig) ([]tgbotapi.ChatMember, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.bot.GetChatAdministrators(ctx, config)
 }
 
 func (s *Service) answerCallback(ctx context.Context, callbackID string, text string) {
@@ -575,7 +581,7 @@ func (s *Service) getAdminIDs(ctx context.Context, chatID int64, force bool) (ma
 		s.adminCacheMutex.Unlock()
 	}
 
-	admins, err := s.bot.GetChatAdministrators(tgbotapi.ChatAdministratorsConfig{
+	admins, err := s.getChatAdministrators(ctx, tgbotapi.ChatAdministratorsConfig{
 		ChatConfig: tgbotapi.ChatConfig{ChatID: chatID},
 	})
 	if err != nil {
@@ -889,8 +895,113 @@ func (e errHookNotConfigured) Error() string {
 type botAPI interface {
 	GetUpdatesChan(tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel
 	StopReceivingUpdates()
-	Send(tgbotapi.Chattable) (tgbotapi.Message, error)
-	Request(tgbotapi.Chattable) (*tgbotapi.APIResponse, error)
-	GetFile(tgbotapi.FileConfig) (tgbotapi.File, error)
-	GetChatAdministrators(tgbotapi.ChatAdministratorsConfig) ([]tgbotapi.ChatMember, error)
+	Send(context.Context, tgbotapi.Chattable) (tgbotapi.Message, error)
+	Request(context.Context, tgbotapi.Chattable) (*tgbotapi.APIResponse, error)
+	GetFile(context.Context, tgbotapi.FileConfig) (tgbotapi.File, error)
+	GetChatAdministrators(context.Context, tgbotapi.ChatAdministratorsConfig) ([]tgbotapi.ChatMember, error)
+}
+
+type productionBotAPI struct {
+	updates       *tgbotapi.BotAPI
+	requests      *tgbotapi.BotAPI
+	requestClient *contextHTTPClient
+	requestMu     sync.Mutex
+}
+
+type contextHTTPClient struct {
+	base tgbotapi.HTTPClient
+	ctx  context.Context
+}
+
+func newProductionBotAPI(cfg Config) (*productionBotAPI, error) {
+	endpoint := cfg.APIBaseURL + "/bot%s/%s"
+	updates, err := tgbotapi.NewBotAPIWithClient(cfg.Token, endpoint, &http.Client{
+		Timeout: cfg.RequestTimeout,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	requestClient := &contextHTTPClient{
+		base: &http.Client{Timeout: cfg.RequestTimeout},
+	}
+	requests := *updates
+	requests.Client = requestClient
+
+	updates.Debug = cfg.Debug
+	requests.Debug = cfg.Debug
+	return &productionBotAPI{
+		updates:       updates,
+		requests:      &requests,
+		requestClient: requestClient,
+	}, nil
+}
+
+func (b *productionBotAPI) GetUpdatesChan(config tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel {
+	return b.updates.GetUpdatesChan(config)
+}
+
+func (b *productionBotAPI) StopReceivingUpdates() {
+	b.updates.StopReceivingUpdates()
+}
+
+func (b *productionBotAPI) Send(ctx context.Context, msg tgbotapi.Chattable) (tgbotapi.Message, error) {
+	var message tgbotapi.Message
+	err := b.withRequestContext(ctx, func() error {
+		var err error
+		message, err = b.requests.Send(msg)
+		return err
+	})
+	return message, err
+}
+
+func (b *productionBotAPI) Request(ctx context.Context, req tgbotapi.Chattable) (*tgbotapi.APIResponse, error) {
+	var response *tgbotapi.APIResponse
+	err := b.withRequestContext(ctx, func() error {
+		var err error
+		response, err = b.requests.Request(req)
+		return err
+	})
+	return response, err
+}
+
+func (b *productionBotAPI) GetFile(ctx context.Context, config tgbotapi.FileConfig) (tgbotapi.File, error) {
+	var file tgbotapi.File
+	err := b.withRequestContext(ctx, func() error {
+		var err error
+		file, err = b.requests.GetFile(config)
+		return err
+	})
+	return file, err
+}
+
+func (b *productionBotAPI) GetChatAdministrators(ctx context.Context, config tgbotapi.ChatAdministratorsConfig) ([]tgbotapi.ChatMember, error) {
+	var admins []tgbotapi.ChatMember
+	err := b.withRequestContext(ctx, func() error {
+		var err error
+		admins, err = b.requests.GetChatAdministrators(config)
+		return err
+	})
+	return admins, err
+}
+
+func (b *productionBotAPI) withRequestContext(ctx context.Context, call func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	b.requestMu.Lock()
+	defer b.requestMu.Unlock()
+	b.requestClient.ctx = ctx
+	defer func() {
+		b.requestClient.ctx = nil
+	}()
+	return call()
+}
+
+func (c *contextHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	if c.ctx != nil {
+		req = req.WithContext(c.ctx)
+	}
+	return c.base.Do(req)
 }
