@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"testing"
 	"time"
 
@@ -204,6 +205,42 @@ func TestNewDefaultsRequestTimeoutExceedsUpdateTimeout(t *testing.T) {
 	updateTimeout := time.Duration(svc.cfg.UpdateTimeout) * time.Second
 	if svc.cfg.RequestTimeout <= updateTimeout {
 		t.Fatalf("request timeout = %s, want greater than update timeout %s", svc.cfg.RequestTimeout, updateTimeout)
+	}
+}
+
+func TestContextHTTPClientAttachesCallerContext(t *testing.T) {
+	base := &blockingHTTPClient{seen: make(chan context.Context, 1)}
+	client := &contextHTTPClient{base: base}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client.ctx = ctx
+	req, err := http.NewRequest(http.MethodPost, "http://telegram.local/bot/test", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	errCh := make(chan error, 1)
+
+	go func() {
+		_, err := client.Do(req)
+		errCh <- err
+	}()
+
+	select {
+	case got := <-base.seen:
+		if got != ctx {
+			t.Fatalf("request context was not caller context")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("http client did not receive request")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("http client did not return after context cancellation")
 	}
 }
 
@@ -595,6 +632,16 @@ type adminResponse struct {
 	err    error
 }
 
+type blockingHTTPClient struct {
+	seen chan context.Context
+}
+
+func (b *blockingHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	b.seen <- req.Context()
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
 type fakeBotAPI struct {
 	adminResponses     []adminResponse
 	adminCallCount     int
@@ -626,18 +673,26 @@ func (f *fakeBotAPI) StopReceivingUpdates() {
 	f.stopReceivingCount++
 }
 
-func (f *fakeBotAPI) Send(tgbotapi.Chattable) (tgbotapi.Message, error) {
+func (f *fakeBotAPI) Send(ctx context.Context, _ tgbotapi.Chattable) (tgbotapi.Message, error) {
 	f.sendCount++
 	if f.sendBlock != nil {
-		<-f.sendBlock
+		select {
+		case <-f.sendBlock:
+		case <-ctx.Done():
+			return tgbotapi.Message{}, ctx.Err()
+		}
 	}
 	return tgbotapi.Message{}, nil
 }
 
-func (f *fakeBotAPI) Request(req tgbotapi.Chattable) (*tgbotapi.APIResponse, error) {
+func (f *fakeBotAPI) Request(ctx context.Context, req tgbotapi.Chattable) (*tgbotapi.APIResponse, error) {
 	f.requestCount++
 	if f.requestBlock != nil {
-		<-f.requestBlock
+		select {
+		case <-f.requestBlock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	switch req.(type) {
 	case tgbotapi.EditMessageTextConfig:
@@ -648,24 +703,32 @@ func (f *fakeBotAPI) Request(req tgbotapi.Chattable) (*tgbotapi.APIResponse, err
 	return &tgbotapi.APIResponse{}, nil
 }
 
-func (f *fakeBotAPI) GetFile(tgbotapi.FileConfig) (tgbotapi.File, error) {
+func (f *fakeBotAPI) GetFile(ctx context.Context, _ tgbotapi.FileConfig) (tgbotapi.File, error) {
 	f.fileCallCount++
 	if f.fileStarted != nil {
 		close(f.fileStarted)
 	}
 	if f.fileBlock != nil {
-		<-f.fileBlock
+		select {
+		case <-f.fileBlock:
+		case <-ctx.Done():
+			return tgbotapi.File{}, ctx.Err()
+		}
 	}
 	return f.file, f.fileErr
 }
 
-func (f *fakeBotAPI) GetChatAdministrators(tgbotapi.ChatAdministratorsConfig) ([]tgbotapi.ChatMember, error) {
+func (f *fakeBotAPI) GetChatAdministrators(ctx context.Context, _ tgbotapi.ChatAdministratorsConfig) ([]tgbotapi.ChatMember, error) {
 	f.adminCallCount++
 	if f.adminStarted != nil {
 		close(f.adminStarted)
 	}
 	if f.adminBlock != nil {
-		<-f.adminBlock
+		select {
+		case <-f.adminBlock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	if len(f.adminResponses) == 0 {
 		return nil, nil
