@@ -22,7 +22,10 @@
    - enable OBS WebSocket;
    - use port `4455` unless changed in `.env`;
    - create a Media Source named `tg_queue_player`;
+   - add that source to the Program scene used for playback;
    - disable looping on that source.
+
+   The app attempts to center this source in the current Program scene before each playback restart. It does not change scale, bounds, or crop, so oversized videos may extend beyond the canvas while staying centered.
 
 4. Configure Telegram group access:
 
