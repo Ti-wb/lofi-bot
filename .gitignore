@@ -17,6 +17,7 @@ id_rsa*
 id_ed25519*
 secrets.*
 credentials.*
+.DS_Store
 .cache/
 data/
 dist/
