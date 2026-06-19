@@ -212,6 +212,9 @@ func (c *Client) PlayFile(ctx context.Context, path string) error {
 	}); err != nil {
 		return err
 	}
+	if err := c.centerCurrentProgramSceneItem(ctx); err != nil {
+		c.opts.Logger.Warn("center OBS media source failed", "source", c.opts.MediaSourceName, "error", err)
+	}
 	if err := c.request(ctx, "TriggerMediaInputAction", map[string]any{
 		"inputName":   c.opts.MediaSourceName,
 		"mediaAction": mediaActionRestart,
@@ -223,6 +226,46 @@ func (c *Client) PlayFile(ctx context.Context, path string) error {
 	c.currentFile = path
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *Client) centerCurrentProgramSceneItem(ctx context.Context) error {
+	var scene currentProgramSceneResponse
+	if err := c.requestInto(ctx, "GetCurrentProgramScene", nil, &scene); err != nil {
+		return err
+	}
+	sceneName := scene.SceneName
+	if sceneName == "" {
+		sceneName = scene.CurrentProgramSceneName
+	}
+	if sceneName == "" {
+		return errors.New("OBS current program scene name is empty")
+	}
+
+	var video videoSettingsResponse
+	if err := c.requestInto(ctx, "GetVideoSettings", nil, &video); err != nil {
+		return err
+	}
+	if video.BaseWidth <= 0 || video.BaseHeight <= 0 {
+		return fmt.Errorf("OBS base canvas size is invalid: %.0fx%.0f", video.BaseWidth, video.BaseHeight)
+	}
+
+	var item sceneItemIDResponse
+	if err := c.requestInto(ctx, "GetSceneItemId", map[string]any{
+		"sceneName":  sceneName,
+		"sourceName": c.opts.MediaSourceName,
+	}, &item); err != nil {
+		return err
+	}
+
+	return c.request(ctx, "SetSceneItemTransform", map[string]any{
+		"sceneName":   sceneName,
+		"sceneItemId": item.SceneItemID,
+		"sceneItemTransform": map[string]any{
+			"alignment": 0,
+			"positionX": video.BaseWidth / 2,
+			"positionY": video.BaseHeight / 2,
+		},
+	})
 }
 
 func (c *Client) StopCurrent(ctx context.Context) error {
@@ -273,9 +316,31 @@ func (c *Client) handshake(ctx context.Context, conn *websocket.Conn) error {
 }
 
 func (c *Client) request(ctx context.Context, requestType string, requestData map[string]any) error {
-	conn, err := c.connectedConn()
+	_, err := c.requestResponse(ctx, requestType, requestData)
+	return err
+}
+
+func (c *Client) requestInto(ctx context.Context, requestType string, requestData map[string]any, out any) error {
+	response, err := c.requestResponse(ctx, requestType, requestData)
 	if err != nil {
 		return err
+	}
+	if out == nil {
+		return nil
+	}
+	if len(response.ResponseData) == 0 {
+		return fmt.Errorf("OBS %s response data is empty", requestType)
+	}
+	if err := json.Unmarshal(response.ResponseData, out); err != nil {
+		return fmt.Errorf("decode OBS %s response data: %w", requestType, err)
+	}
+	return nil
+}
+
+func (c *Client) requestResponse(ctx context.Context, requestType string, requestData map[string]any) (requestResponseData, error) {
+	conn, err := c.connectedConn()
+	if err != nil {
+		return requestResponseData{}, err
 	}
 	timeoutCtx, cancelTimeout := context.WithTimeout(context.Background(), c.opts.RequestTimeout)
 	defer cancelTimeout()
@@ -286,7 +351,7 @@ func (c *Client) request(ctx context.Context, requestType string, requestData ma
 	c.mu.Lock()
 	if c.conn != conn || c.state != StateConnected {
 		c.mu.Unlock()
-		return ErrNotConnected
+		return requestResponseData{}, ErrNotConnected
 	}
 	c.pending[id] = responseCh
 	c.mu.Unlock()
@@ -302,7 +367,7 @@ func (c *Client) request(ctx context.Context, requestType string, requestData ma
 
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return requestResponseData{}, ctx.Err()
 	default:
 	}
 
@@ -313,7 +378,7 @@ func (c *Client) request(ctx context.Context, requestType string, requestData ma
 	})})
 	if err != nil {
 		c.disconnectIfCurrent(conn, err)
-		return err
+		return requestResponseData{}, err
 	}
 
 	select {
@@ -323,7 +388,7 @@ func (c *Client) request(ctx context.Context, requestType string, requestData ma
 		delete(c.pending, id)
 		c.mu.Unlock()
 		cleanup = false
-		return err
+		return requestResponseData{}, err
 	case <-timeoutCtx.Done():
 		err := timeoutCtx.Err()
 		c.mu.Lock()
@@ -331,13 +396,13 @@ func (c *Client) request(ctx context.Context, requestType string, requestData ma
 		c.mu.Unlock()
 		cleanup = false
 		c.disconnectIfCurrent(conn, err)
-		return err
+		return requestResponseData{}, err
 	case response := <-responseCh:
 		cleanup = false
 		if !response.RequestStatus.Result {
-			return fmt.Errorf("OBS %s failed: %s (%d)", requestType, response.RequestStatus.Comment, response.RequestStatus.Code)
+			return requestResponseData{}, fmt.Errorf("OBS %s failed: %s (%d)", requestType, response.RequestStatus.Comment, response.RequestStatus.Code)
 		}
-		return nil
+		return response, nil
 	}
 }
 
@@ -556,13 +621,28 @@ type eventData struct {
 }
 
 type requestResponseData struct {
-	RequestType   string        `json:"requestType"`
-	RequestID     string        `json:"requestId"`
-	RequestStatus requestStatus `json:"requestStatus"`
+	RequestType   string          `json:"requestType"`
+	RequestID     string          `json:"requestId"`
+	RequestStatus requestStatus   `json:"requestStatus"`
+	ResponseData  json.RawMessage `json:"responseData,omitempty"`
 }
 
 type requestStatus struct {
 	Result  bool   `json:"result"`
 	Code    int    `json:"code"`
 	Comment string `json:"comment"`
+}
+
+type currentProgramSceneResponse struct {
+	SceneName               string `json:"sceneName"`
+	CurrentProgramSceneName string `json:"currentProgramSceneName"`
+}
+
+type videoSettingsResponse struct {
+	BaseWidth  float64 `json:"baseWidth"`
+	BaseHeight float64 `json:"baseHeight"`
+}
+
+type sceneItemIDResponse struct {
+	SceneItemID int `json:"sceneItemId"`
 }

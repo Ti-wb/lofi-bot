@@ -80,8 +80,8 @@ func TestClientConnectHandshakeSuccess(t *testing.T) {
 	}
 }
 
-func TestClientPlayFileSendsMediaRequests(t *testing.T) {
-	requests := make(chan requestDataPayload, 2)
+func TestClientPlayFileSendsMediaRequestsAndCentersSource(t *testing.T) {
+	requests := make(chan requestDataPayload, 6)
 	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
 		if err := readIdentify(conn); err != nil {
 			return err
@@ -89,19 +89,13 @@ func TestClientPlayFileSendsMediaRequests(t *testing.T) {
 		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
 			return err
 		}
-		for i := 0; i < 2; i++ {
+		for i := 0; i < 6; i++ {
 			req, err := readRequest(conn)
 			if err != nil {
 				return err
 			}
 			requests <- req
-			if err := writeEnvelope(conn, envelope{Op: opRequestResponse, D: mustMarshal(requestResponseData{
-				RequestType: req.RequestType,
-				RequestID:   req.RequestID,
-				RequestStatus: requestStatus{
-					Result: true,
-				},
-			})}); err != nil {
+			if err := writeEnvelope(conn, successfulRequestResponse(req)); err != nil {
 				return err
 			}
 		}
@@ -141,13 +135,123 @@ func TestClientPlayFileSendsMediaRequests(t *testing.T) {
 	}
 
 	second := receiveRequest(t, requests)
-	if second.RequestType != "TriggerMediaInputAction" {
-		t.Fatalf("second request type = %q, want TriggerMediaInputAction", second.RequestType)
+	if second.RequestType != "GetCurrentProgramScene" {
+		t.Fatalf("second request type = %q, want GetCurrentProgramScene", second.RequestType)
 	}
-	if got := second.RequestData["inputName"]; got != "media" {
+
+	third := receiveRequest(t, requests)
+	if third.RequestType != "GetVideoSettings" {
+		t.Fatalf("third request type = %q, want GetVideoSettings", third.RequestType)
+	}
+
+	fourth := receiveRequest(t, requests)
+	if fourth.RequestType != "GetSceneItemId" {
+		t.Fatalf("fourth request type = %q, want GetSceneItemId", fourth.RequestType)
+	}
+	if got := fourth.RequestData["sceneName"]; got != "Main" {
+		t.Fatalf("GetSceneItemId sceneName = %v, want Main", got)
+	}
+	if got := fourth.RequestData["sourceName"]; got != "media" {
+		t.Fatalf("GetSceneItemId sourceName = %v, want media", got)
+	}
+
+	fifth := receiveRequest(t, requests)
+	if fifth.RequestType != "SetSceneItemTransform" {
+		t.Fatalf("fifth request type = %q, want SetSceneItemTransform", fifth.RequestType)
+	}
+	if got := fifth.RequestData["sceneName"]; got != "Main" {
+		t.Fatalf("SetSceneItemTransform sceneName = %v, want Main", got)
+	}
+	if got := fifth.RequestData["sceneItemId"]; got != float64(42) {
+		t.Fatalf("SetSceneItemTransform sceneItemId = %v, want 42", got)
+	}
+	transform, ok := fifth.RequestData["sceneItemTransform"].(map[string]any)
+	if !ok {
+		t.Fatalf("sceneItemTransform = %T, want map[string]any", fifth.RequestData["sceneItemTransform"])
+	}
+	if got := transform["alignment"]; got != float64(0) {
+		t.Fatalf("alignment = %v, want 0", got)
+	}
+	if got := transform["positionX"]; got != float64(960) {
+		t.Fatalf("positionX = %v, want 960", got)
+	}
+	if got := transform["positionY"]; got != float64(540) {
+		t.Fatalf("positionY = %v, want 540", got)
+	}
+	for _, forbidden := range []string{"scaleX", "scaleY", "boundsType", "boundsWidth", "boundsHeight"} {
+		if _, ok := transform[forbidden]; ok {
+			t.Fatalf("sceneItemTransform should not set %s: %#v", forbidden, transform)
+		}
+	}
+
+	sixth := receiveRequest(t, requests)
+	if sixth.RequestType != "TriggerMediaInputAction" {
+		t.Fatalf("sixth request type = %q, want TriggerMediaInputAction", sixth.RequestType)
+	}
+	if got := sixth.RequestData["inputName"]; got != "media" {
 		t.Fatalf("TriggerMediaInputAction inputName = %v, want media", got)
 	}
-	if got := second.RequestData["mediaAction"]; got != mediaActionRestart {
+	if got := sixth.RequestData["mediaAction"]; got != mediaActionRestart {
+		t.Fatalf("mediaAction = %v, want %s", got, mediaActionRestart)
+	}
+}
+
+func TestClientPlayFileRestartsWhenCenteringFails(t *testing.T) {
+	requests := make(chan requestDataPayload, 3)
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		for i := 0; i < 3; i++ {
+			req, err := readRequest(conn)
+			if err != nil {
+				return err
+			}
+			requests <- req
+			if req.RequestType == "GetCurrentProgramScene" {
+				if err := writeEnvelope(conn, failedRequestResponse(req, "no scene", 608)); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := writeEnvelope(conn, successfulRequestResponse(req)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
+
+	if err := client.PlayFile(context.Background(), "/tmp/media.mp4"); err != nil {
+		t.Fatalf("PlayFile should ignore centering failure: %v", err)
+	}
+
+	if first := receiveRequest(t, requests); first.RequestType != "SetInputSettings" {
+		t.Fatalf("first request type = %q, want SetInputSettings", first.RequestType)
+	}
+	if second := receiveRequest(t, requests); second.RequestType != "GetCurrentProgramScene" {
+		t.Fatalf("second request type = %q, want GetCurrentProgramScene", second.RequestType)
+	}
+	third := receiveRequest(t, requests)
+	if third.RequestType != "TriggerMediaInputAction" {
+		t.Fatalf("third request type = %q, want TriggerMediaInputAction", third.RequestType)
+	}
+	if got := third.RequestData["mediaAction"]; got != mediaActionRestart {
 		t.Fatalf("mediaAction = %v, want %s", got, mediaActionRestart)
 	}
 }
@@ -433,6 +537,37 @@ func readRequest(conn *websocket.Conn) (requestDataPayload, error) {
 		return requestDataPayload{}, fmt.Errorf("decode request: %w", err)
 	}
 	return req, nil
+}
+
+func successfulRequestResponse(req requestDataPayload) envelope {
+	response := requestResponseData{
+		RequestType: req.RequestType,
+		RequestID:   req.RequestID,
+		RequestStatus: requestStatus{
+			Result: true,
+		},
+	}
+	switch req.RequestType {
+	case "GetCurrentProgramScene":
+		response.ResponseData = mustMarshal(map[string]any{"sceneName": "Main"})
+	case "GetVideoSettings":
+		response.ResponseData = mustMarshal(map[string]any{"baseWidth": 1920, "baseHeight": 1080})
+	case "GetSceneItemId":
+		response.ResponseData = mustMarshal(map[string]any{"sceneItemId": 42})
+	}
+	return envelope{Op: opRequestResponse, D: mustMarshal(response)}
+}
+
+func failedRequestResponse(req requestDataPayload, comment string, code int) envelope {
+	return envelope{Op: opRequestResponse, D: mustMarshal(requestResponseData{
+		RequestType: req.RequestType,
+		RequestID:   req.RequestID,
+		RequestStatus: requestStatus{
+			Result:  false,
+			Code:    code,
+			Comment: comment,
+		},
+	})}
 }
 
 func receiveRequest(t *testing.T, requests <-chan requestDataPayload) requestDataPayload {

@@ -26,8 +26,11 @@ brew install go ffmpeg
 1. Open OBS.
 2. Enable WebSocket server in OBS settings.
 3. Create a Media Source named `tg_queue_player`.
-4. Disable looping on that source.
-5. Keep the backend running on the same Mac.
+4. Add that source to the Program scene used for playback.
+5. Disable looping on that source.
+6. Keep the backend running on the same Mac.
+
+Before each playback restart, the bot tries to center the media source in the current Program scene without changing its scale, bounds, or crop.
 
 ## Telegram Setup
 
