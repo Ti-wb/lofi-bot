@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestOpenConfiguresSQLitePragmasAndSequentialWritesPreservePositions(t *testing.T) {
@@ -165,6 +166,38 @@ func TestQueueMoveCancelAndStartNext(t *testing.T) {
 	}
 }
 
+func TestRestartPlayingRefreshesStartedAt(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	ready := addReady(t, ctx, store, "restart.mp4")
+	playing, err := store.MarkPlaying(ctx, ready.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	oldStarted := playing.StartedAt.Add(-2 * time.Hour)
+	if _, err := store.db.ExecContext(ctx, `
+UPDATE videos SET started_at = ?, updated_at = ? WHERE id = ?
+`, formatTime(oldStarted), formatTime(oldStarted), playing.ID); err != nil {
+		t.Fatalf("age playing row: %v", err)
+	}
+
+	restarted, err := store.RestartPlaying(ctx, playing.ID)
+	if err != nil {
+		t.Fatalf("restart playing: %v", err)
+	}
+	if restarted.StartedAt == nil || !restarted.StartedAt.After(oldStarted) {
+		t.Fatalf("started_at = %v, want after %s", restarted.StartedAt, oldStarted)
+	}
+	if restarted.Status != StatusPlaying {
+		t.Fatalf("status = %s, want %s", restarted.Status, StatusPlaying)
+	}
+}
+
 func TestQueueLengthIncludesDownloadingAndReady(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, filepath.Join(t.TempDir(), "queue.db"))
@@ -217,6 +250,68 @@ func TestMarkReadyFailsAfterCancel(t *testing.T) {
 	}
 	if len(items) != 0 {
 		t.Fatalf("expected empty queue, got %#v", items)
+	}
+}
+
+func TestFailStaleDownloadingOnlyMarksOldRows(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	oldDownloading, err := store.AddDownloading(ctx, Video{
+		TelegramFileID:   "old",
+		TelegramUniqueID: "old",
+		FileName:         "old.mp4",
+	})
+	if err != nil {
+		t.Fatalf("add old downloading: %v", err)
+	}
+	newDownloading, err := store.AddDownloading(ctx, Video{
+		TelegramFileID:   "new",
+		TelegramUniqueID: "new",
+		FileName:         "new.mp4",
+	})
+	if err != nil {
+		t.Fatalf("add new downloading: %v", err)
+	}
+	ready := addReady(t, ctx, store, "ready.mp4")
+	oldCreated := time.Now().UTC().Add(-8 * time.Hour)
+	if _, err := store.db.ExecContext(ctx, `
+UPDATE videos SET created_at = ?, updated_at = ? WHERE id = ?
+`, formatTime(oldCreated), formatTime(oldCreated), oldDownloading.ID); err != nil {
+		t.Fatalf("age old downloading: %v", err)
+	}
+
+	count, err := store.FailStaleDownloading(ctx, 6*time.Hour, "stale download")
+	if err != nil {
+		t.Fatalf("fail stale downloading: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+	oldStored, err := store.Get(ctx, oldDownloading.ID)
+	if err != nil {
+		t.Fatalf("get old downloading: %v", err)
+	}
+	if oldStored.Status != StatusFailed || oldStored.Error != "stale download" {
+		t.Fatalf("old status/error = %s/%q, want failed/stale download", oldStored.Status, oldStored.Error)
+	}
+	newStored, err := store.Get(ctx, newDownloading.ID)
+	if err != nil {
+		t.Fatalf("get new downloading: %v", err)
+	}
+	if newStored.Status != StatusDownloading {
+		t.Fatalf("new status = %s, want %s", newStored.Status, StatusDownloading)
+	}
+	readyStored, err := store.Get(ctx, ready.ID)
+	if err != nil {
+		t.Fatalf("get ready: %v", err)
+	}
+	if readyStored.Status != StatusReady {
+		t.Fatalf("ready status = %s, want %s", readyStored.Status, StatusReady)
 	}
 }
 

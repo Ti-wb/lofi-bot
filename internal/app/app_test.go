@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -38,6 +39,35 @@ func TestRandomFallbackStartsAndNotifiesOnce(t *testing.T) {
 	}
 	if len(fakeBot.messages) != 1 {
 		t.Fatalf("messages after rotation = %d, want 1", len(fakeBot.messages))
+	}
+}
+
+func TestFallbackEndedEventAdvancesFallbackPlayback(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newFallbackTestService(t, config.Config{FallbackMode: "file"})
+	firstPath := filepath.Join(t.TempDir(), "fallback-one.mp4")
+	secondPath := filepath.Join(t.TempDir(), "fallback-two.mp4")
+	writeTestFile(t, firstPath)
+	writeTestFile(t, secondPath)
+	svc.cfg.OBSFallbackFile = firstPath
+	if _, err := svc.advancePlayback(ctx); err != nil {
+		t.Fatalf("start fallback: %v", err)
+	}
+	svc.cfg.OBSFallbackFile = secondPath
+
+	video, err := svc.advancePlaybackForEndedEvent(ctx, obs.Event{
+		Type: obs.EventMediaEnded,
+		Path: firstPath,
+		At:   time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("fallback ended event: %v", err)
+	}
+	if video != nil {
+		t.Fatalf("fallback event video = %#v, want nil", video)
+	}
+	if fakeOBS.lastPlayed != secondPath {
+		t.Fatalf("played path = %q, want second fallback %q", fakeOBS.lastPlayed, secondPath)
 	}
 }
 
@@ -280,6 +310,254 @@ func TestAdvancePlaybackDoesNotMarkReadyPlayedWhenOBSPlayFails(t *testing.T) {
 	}
 }
 
+func TestRecoverPlaybackAfterOBSConnectReplaysCurrent(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	ready := addReadyVideo(t, ctx, svc.store, "current.mp4")
+	playing, err := svc.store.MarkPlaying(ctx, ready.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+
+	if err := svc.recoverPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover playback: %v", err)
+	}
+	if fakeOBS.lastPlayed != playing.LocalPath {
+		t.Fatalf("played path = %q, want current path %q", fakeOBS.lastPlayed, playing.LocalPath)
+	}
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if current == nil || current.ID != playing.ID {
+		t.Fatalf("current = %#v, want playing id %d", current, playing.ID)
+	}
+}
+
+func TestRecoverPlaybackAfterOBSConnectRefreshesWatchdogDeadline(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	svc, _, _ := newFallbackTestServiceAtDBPath(t, config.Config{FallbackMode: "off"}, dbPath)
+	ready := addReadyVideoWithDuration(t, ctx, svc.store, "current.mp4", 30)
+	playing, err := svc.store.MarkPlaying(ctx, ready.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	oldStarted := playing.StartedAt.Add(-2 * time.Hour)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `
+UPDATE videos SET started_at = ?, updated_at = ? WHERE id = ?
+`, formatQueueTime(oldStarted), formatQueueTime(oldStarted), playing.ID); err != nil {
+		t.Fatalf("age current started_at: %v", err)
+	}
+	_ = addReadyVideo(t, ctx, svc.store, "next.mp4")
+
+	if err := svc.recoverPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover playback: %v", err)
+	}
+	restarted, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current after recover: %v", err)
+	}
+	if restarted == nil || restarted.StartedAt == nil {
+		t.Fatalf("current after recover = %#v", restarted)
+	}
+	if !restarted.StartedAt.After(oldStarted) {
+		t.Fatalf("started_at = %s, want after old %s", restarted.StartedAt, oldStarted)
+	}
+	svc.now = func() time.Time {
+		return restarted.StartedAt.Add(5 * time.Second)
+	}
+
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("watchdog: %v", err)
+	}
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if current == nil || current.ID != playing.ID {
+		t.Fatalf("current = %#v, want recovered id %d", current, playing.ID)
+	}
+}
+
+func TestRecoverPlaybackAfterOBSConnectRestartsFallbackWhenNoCurrent(t *testing.T) {
+	ctx := context.Background()
+	staticPath := filepath.Join(t.TempDir(), "fallback.mp4")
+	writeTestFile(t, staticPath)
+	svc, fakeOBS, _ := newFallbackTestService(t, config.Config{
+		FallbackMode:    "file",
+		OBSFallbackFile: staticPath,
+	})
+	svc.setPlaybackState(playbackFile, 0, staticPath)
+
+	if err := svc.recoverPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover playback: %v", err)
+	}
+	if fakeOBS.lastPlayed != staticPath {
+		t.Fatalf("played path = %q, want fallback path %q", fakeOBS.lastPlayed, staticPath)
+	}
+	if svc.playbackState() != playbackFile {
+		t.Fatalf("playback state = %s, want %s", svc.playbackState(), playbackFile)
+	}
+}
+
+func TestRecoverPlaybackAfterOBSConnectSkipsMissingCurrent(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	missing := addReadyVideo(t, ctx, svc.store, "missing-current.mp4")
+	playing, err := svc.store.MarkPlaying(ctx, missing.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	if err := osRemove(playing.LocalPath); err != nil {
+		t.Fatalf("remove current file: %v", err)
+	}
+	next := addReadyVideo(t, ctx, svc.store, "next.mp4")
+
+	if err := svc.recoverPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover playback: %v", err)
+	}
+	storedMissing, err := svc.store.Get(ctx, playing.ID)
+	if err != nil {
+		t.Fatalf("get missing current: %v", err)
+	}
+	if storedMissing.Status != queue.StatusFailed {
+		t.Fatalf("missing current status = %s, want %s", storedMissing.Status, queue.StatusFailed)
+	}
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if current == nil || current.ID != next.ID {
+		t.Fatalf("current = %#v, want next id %d", current, next.ID)
+	}
+	if fakeOBS.lastPlayed != next.LocalPath {
+		t.Fatalf("played path = %q, want next path %q", fakeOBS.lastPlayed, next.LocalPath)
+	}
+}
+
+func TestPlaybackWatchdogAdvancesExpiredCurrent(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, fakeBot := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	currentReady := addReadyVideoWithDuration(t, ctx, svc.store, "current.mp4", 30)
+	playing, err := svc.store.MarkPlaying(ctx, currentReady.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	next := addReadyVideo(t, ctx, svc.store, "next.mp4")
+	svc.now = func() time.Time {
+		return playing.StartedAt.Add(30*time.Second + playbackWatchdogGrace + time.Second)
+	}
+
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("watchdog: %v", err)
+	}
+	storedCurrent, err := svc.store.Get(ctx, playing.ID)
+	if err != nil {
+		t.Fatalf("get expired current: %v", err)
+	}
+	if storedCurrent.Status != queue.StatusPlayed {
+		t.Fatalf("expired status = %s, want %s", storedCurrent.Status, queue.StatusPlayed)
+	}
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if current == nil || current.ID != next.ID {
+		t.Fatalf("current = %#v, want next id %d", current, next.ID)
+	}
+	if fakeOBS.lastPlayed != next.LocalPath {
+		t.Fatalf("played path = %q, want next path %q", fakeOBS.lastPlayed, next.LocalPath)
+	}
+	if len(fakeBot.messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(fakeBot.messages))
+	}
+}
+
+func TestEarlyStaleOBSEndedEventDoesNotSkipCurrentAfterWatchdogAdvance(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	firstReady := addReadyVideoWithDuration(t, ctx, svc.store, "first.mp4", 30)
+	firstPlaying, err := svc.store.MarkPlaying(ctx, firstReady.ID)
+	if err != nil {
+		t.Fatalf("mark first playing: %v", err)
+	}
+	second := addReadyVideo(t, ctx, svc.store, "second.mp4")
+	third := addReadyVideo(t, ctx, svc.store, "third.mp4")
+	svc.now = func() time.Time {
+		return firstPlaying.StartedAt.Add(30*time.Second + playbackWatchdogGrace + time.Second)
+	}
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("watchdog: %v", err)
+	}
+	currentAfterWatchdog, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current after watchdog: %v", err)
+	}
+	if currentAfterWatchdog == nil || currentAfterWatchdog.StartedAt == nil {
+		t.Fatalf("current after watchdog = %#v", currentAfterWatchdog)
+	}
+
+	video, err := svc.advancePlaybackForEndedEvent(ctx, obs.Event{
+		Type: obs.EventMediaEnded,
+		Path: second.LocalPath,
+		At:   currentAfterWatchdog.StartedAt.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatalf("stale OBS event: %v", err)
+	}
+	if video != nil {
+		t.Fatalf("stale OBS event advanced to %#v, want nil", video)
+	}
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if current == nil || current.ID != second.ID {
+		t.Fatalf("current = %#v, want second id %d", current, second.ID)
+	}
+	storedThird, err := svc.store.Get(ctx, third.ID)
+	if err != nil {
+		t.Fatalf("get third: %v", err)
+	}
+	if storedThird.Status != queue.StatusReady {
+		t.Fatalf("third status = %s, want %s", storedThird.Status, queue.StatusReady)
+	}
+}
+
+func TestPlaybackWatchdogIgnoresUnknownDuration(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	currentReady := addReadyVideoWithDuration(t, ctx, svc.store, "current.mp4", 0)
+	playing, err := svc.store.MarkPlaying(ctx, currentReady.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	_ = addReadyVideo(t, ctx, svc.store, "next.mp4")
+	svc.now = func() time.Time {
+		return playing.StartedAt.Add(24 * time.Hour)
+	}
+
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("watchdog: %v", err)
+	}
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if current == nil || current.ID != playing.ID {
+		t.Fatalf("current = %#v, want original id %d", current, playing.ID)
+	}
+	if fakeOBS.lastPlayed != "" {
+		t.Fatalf("watchdog should not advance unknown duration, played %q", fakeOBS.lastPlayed)
+	}
+}
+
 func TestRemoveQueuedDoesNotDeleteLocalBotAPIFile(t *testing.T) {
 	ctx := context.Background()
 	svc, _, _ := newLocalUploadTestService(t, config.Config{
@@ -355,8 +633,13 @@ func assertFailedUploadVisible(t *testing.T, ctx context.Context, svc *Service, 
 
 func newFallbackTestService(t *testing.T, cfg config.Config) (*Service, *fakeOBS, *fakeBot) {
 	t.Helper()
+	return newFallbackTestServiceAtDBPath(t, cfg, filepath.Join(t.TempDir(), "queue.db"))
+}
+
+func newFallbackTestServiceAtDBPath(t *testing.T, cfg config.Config, dbPath string) (*Service, *fakeOBS, *fakeBot) {
+	t.Helper()
 	ctx := context.Background()
-	store, err := queue.Open(ctx, filepath.Join(t.TempDir(), "queue.db"))
+	store, err := queue.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -378,6 +661,7 @@ func newFallbackTestService(t *testing.T, cfg config.Config) (*Service, *fakeOBS
 		store:    store,
 		obs:      fakeOBS,
 		bot:      fakeBot,
+		now:      time.Now,
 		playback: playbackIdle,
 	}, fakeOBS, fakeBot
 }
@@ -401,6 +685,11 @@ func newLocalUploadTestService(t *testing.T, cfg config.Config) (*Service, *fake
 
 func addReadyVideo(t *testing.T, ctx context.Context, store *queue.Store, name string) queue.Video {
 	t.Helper()
+	return addReadyVideoWithDuration(t, ctx, store, name, 60)
+}
+
+func addReadyVideoWithDuration(t *testing.T, ctx context.Context, store *queue.Store, name string, durationSeconds int) queue.Video {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), name)
 	writeTestFile(t, path)
 	video, err := store.AddDownloading(ctx, queue.Video{
@@ -412,7 +701,7 @@ func addReadyVideo(t *testing.T, ctx context.Context, store *queue.Store, name s
 	if err != nil {
 		t.Fatalf("add downloading: %v", err)
 	}
-	ready, err := store.MarkReady(ctx, video.ID, path, 100, 60)
+	ready, err := store.MarkReady(ctx, video.ID, path, 100, durationSeconds)
 	if err != nil {
 		t.Fatalf("mark ready: %v", err)
 	}
@@ -470,6 +759,10 @@ func fakeFailingFFProbe(t *testing.T) string {
 
 func formatTestInt(value int) string {
 	return fmt.Sprintf("%d", value)
+}
+
+func formatQueueTime(t time.Time) string {
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 func fileExists(path string) bool {

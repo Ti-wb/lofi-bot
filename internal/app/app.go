@@ -26,6 +26,7 @@ type Service struct {
 	media  *media.Manager
 	obs    obsController
 	bot    telegramMessenger
+	now    func() time.Time
 
 	mu                   sync.Mutex
 	playbackMu           sync.Mutex
@@ -58,6 +59,11 @@ const (
 	playbackNormal playbackKind = "normal_queue"
 	playbackRandom playbackKind = "random_played"
 	playbackFile   playbackKind = "fallback_file"
+
+	playbackWatchdogInterval = 30 * time.Second
+	playbackWatchdogGrace    = 60 * time.Second
+	obsEndedEarlyTolerance   = 2 * time.Second
+	staleDownloadingAge      = 6 * time.Hour
 )
 
 type UploadRequest struct {
@@ -104,6 +110,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 		store:    store,
 		media:    manager,
 		obs:      obsClient,
+		now:      time.Now,
 		playback: playbackIdle,
 		shutdown: []func() error{obsClient.Close, store.Close},
 	}
@@ -135,10 +142,15 @@ func (s *Service) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	if err := s.recoverStartupState(ctx); err != nil {
+		return err
+	}
+
 	errCh := make(chan error, 4)
 	go func() { errCh <- s.bot.Run(ctx) }()
 	go s.obsReconnectLoop(ctx)
 	go s.obsEventLoop(ctx)
+	go s.playbackWatchdogLoop(ctx)
 
 	cleanupTicker := time.NewTicker(10 * time.Minute)
 	defer cleanupTicker.Stop()
@@ -232,6 +244,37 @@ func (s *Service) advancePlayback(ctx context.Context) (*queue.Video, error) {
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
 
+	return s.advancePlaybackLocked(ctx)
+}
+
+func (s *Service) advancePlaybackLocked(ctx context.Context) (*queue.Video, error) {
+	return s.advancePlaybackLockedAfter(ctx, 0, "")
+}
+
+func (s *Service) advancePlaybackLockedAfter(ctx context.Context, expectedCurrentID int64, expectedCurrentPath string) (*queue.Video, error) {
+	if expectedCurrentID > 0 {
+		current, err := s.store.Current(ctx)
+		if err != nil {
+			s.setLastErr(err)
+			return nil, err
+		}
+		if current == nil || current.ID != expectedCurrentID {
+			return nil, nil
+		}
+	}
+	if expectedCurrentPath != "" {
+		current, err := s.store.Current(ctx)
+		if err != nil {
+			s.setLastErr(err)
+			return nil, err
+		}
+		if current != nil && current.LocalPath != expectedCurrentPath {
+			return nil, nil
+		}
+		if current == nil && s.currentPlaybackPath() != expectedCurrentPath {
+			return nil, nil
+		}
+	}
 	if err := s.store.FinishCurrent(ctx); err != nil {
 		s.setLastErr(err)
 		return nil, err
@@ -260,6 +303,12 @@ func (s *Service) advancePlayback(ctx context.Context) (*queue.Video, error) {
 }
 
 func (s *Service) playIfIdle(ctx context.Context) error {
+	s.playbackMu.Lock()
+	defer s.playbackMu.Unlock()
+	return s.playIfIdleLocked(ctx)
+}
+
+func (s *Service) playIfIdleLocked(ctx context.Context) error {
 	current, err := s.store.Current(ctx)
 	if err != nil {
 		return err
@@ -273,11 +322,58 @@ func (s *Service) playIfIdle(ctx context.Context) error {
 	if s.playbackState() != playbackIdle {
 		return nil
 	}
-	_, err = s.advancePlayback(ctx)
+	_, err = s.advancePlaybackLocked(ctx)
 	return err
 }
 
+func (s *Service) recoverPlaybackAfterOBSConnect(ctx context.Context) error {
+	s.playbackMu.Lock()
+	defer s.playbackMu.Unlock()
+
+	current, err := s.store.Current(ctx)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		s.setPlaybackState(playbackIdle, 0, "")
+		return s.playIfIdleLocked(ctx)
+	}
+	if strings.TrimSpace(current.LocalPath) == "" {
+		err := fmt.Errorf("current video #%d has no local media path", current.ID)
+		if markErr := s.store.MarkFailed(ctx, current.ID, err.Error()); markErr != nil {
+			return markErr
+		}
+		s.setLastErr(err)
+		s.setPlaybackState(playbackIdle, 0, "")
+		return s.playIfIdleLocked(ctx)
+	}
+	if _, err := os.Stat(current.LocalPath); err != nil {
+		recoveryErr := fmt.Errorf("current video #%d media file is unavailable: %w", current.ID, err)
+		if markErr := s.store.MarkFailed(ctx, current.ID, recoveryErr.Error()); markErr != nil {
+			return markErr
+		}
+		s.setLastErr(recoveryErr)
+		s.logger.Warn("mark missing current video failed", "video_id", current.ID, "path", current.LocalPath, "error", err)
+		s.setPlaybackState(playbackIdle, 0, "")
+		return s.playIfIdleLocked(ctx)
+	}
+	if err := s.obs.PlayFile(ctx, current.LocalPath); err != nil {
+		s.setLastErr(err)
+		return err
+	}
+	if _, err := s.store.RestartPlaying(ctx, current.ID); err != nil {
+		s.setLastErr(err)
+		return err
+	}
+	s.setPlaybackState(playbackNormal, 0, "")
+	s.logger.Info("recovered OBS playback", "video_id", current.ID, "path", current.LocalPath)
+	return nil
+}
+
 func (s *Service) skipCurrent(ctx context.Context) (string, error) {
+	s.playbackMu.Lock()
+	defer s.playbackMu.Unlock()
+
 	next, err := s.store.NextReady(ctx)
 	if err != nil {
 		return "", err
@@ -296,7 +392,7 @@ func (s *Service) skipCurrent(ctx context.Context) (string, error) {
 		s.setPlaybackState(playbackIdle, 0, "")
 		return "已跳過，目前沒有下一支影片。", nil
 	}
-	video, err := s.advancePlayback(ctx)
+	video, err := s.advancePlaybackLocked(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -512,7 +608,7 @@ func (s *Service) obsReconnectLoop(ctx context.Context) {
 				s.logger.Warn("connect OBS failed", "error", err)
 			} else {
 				s.logger.Info("connected to OBS")
-				if err := s.playIfIdle(ctx); err != nil {
+				if err := s.recoverPlaybackAfterOBSConnect(ctx); err != nil {
 					s.logger.Warn("resume playback failed", "error", err)
 				}
 			}
@@ -524,6 +620,62 @@ func (s *Service) obsReconnectLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 	}
+}
+
+func (s *Service) playbackWatchdogLoop(ctx context.Context) {
+	ticker := time.NewTicker(playbackWatchdogInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.checkPlaybackWatchdog(ctx); err != nil {
+				s.setLastErr(err)
+				s.logger.Warn("playback watchdog failed", "error", err)
+			}
+		}
+	}
+}
+
+func (s *Service) checkPlaybackWatchdog(ctx context.Context) error {
+	if s.obs.Status().State != obs.StateConnected {
+		return nil
+	}
+
+	var video *queue.Video
+	if err := func() error {
+		s.playbackMu.Lock()
+		defer s.playbackMu.Unlock()
+
+		current, err := s.store.Current(ctx)
+		if err != nil {
+			return err
+		}
+		if current == nil || current.StartedAt == nil || current.DurationSeconds <= 0 {
+			return nil
+		}
+		deadline := current.StartedAt.Add(time.Duration(current.DurationSeconds)*time.Second + playbackWatchdogGrace)
+		if s.nowUTC().Before(deadline) {
+			return nil
+		}
+
+		s.logger.Warn("playback exceeded expected duration; advancing without OBS ended event",
+			"video_id", current.ID,
+			"started_at", current.StartedAt,
+			"duration_seconds", current.DurationSeconds,
+			"deadline", deadline,
+		)
+		var advanceErr error
+		video, advanceErr = s.advancePlaybackLockedAfter(ctx, current.ID, current.LocalPath)
+		return advanceErr
+	}(); err != nil {
+		return err
+	}
+	if video != nil {
+		_ = s.bot.SendMessage(ctx, s.cfg.AllowedChatID, fmt.Sprintf("開始播放：#%d %s", video.ID, video.FileName))
+	}
+	return nil
 }
 
 func (s *Service) obsEventLoop(ctx context.Context) {
@@ -538,7 +690,7 @@ func (s *Service) obsEventLoop(ctx context.Context) {
 			if event.Type != obs.EventMediaEnded {
 				continue
 			}
-			video, err := s.advancePlayback(ctx)
+			video, err := s.advancePlaybackForEndedEvent(ctx, event)
 			if err != nil {
 				s.logger.Warn("advance playback after OBS event failed", "error", err)
 				continue
@@ -548,6 +700,61 @@ func (s *Service) obsEventLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (s *Service) advancePlaybackForEndedEvent(ctx context.Context, event obs.Event) (*queue.Video, error) {
+	s.playbackMu.Lock()
+	defer s.playbackMu.Unlock()
+
+	current, err := s.store.Current(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if current != nil {
+		if event.Path != "" && current.LocalPath != event.Path {
+			return nil, nil
+		}
+		if s.obsEventTooEarlyForCurrent(event, *current) {
+			s.logger.Warn("ignore early OBS ended event",
+				"video_id", current.ID,
+				"event_path", event.Path,
+				"event_at", event.At,
+				"started_at", current.StartedAt,
+				"duration_seconds", current.DurationSeconds,
+			)
+			return nil, nil
+		}
+		return s.advancePlaybackLockedAfter(ctx, current.ID, current.LocalPath)
+	}
+	return s.advancePlaybackLockedAfter(ctx, 0, event.Path)
+}
+
+func (s *Service) obsEventTooEarlyForCurrent(event obs.Event, current queue.Video) bool {
+	if current.StartedAt == nil || current.DurationSeconds <= 0 {
+		return false
+	}
+	tolerance := obsEndedEarlyTolerance
+	duration := time.Duration(current.DurationSeconds) * time.Second
+	if duration <= tolerance {
+		tolerance = duration / 2
+	}
+	trustedAfter := current.StartedAt.Add(duration - tolerance)
+	eventAt := event.At
+	if eventAt.IsZero() {
+		eventAt = s.nowUTC()
+	}
+	return eventAt.Before(trustedAfter)
+}
+
+func (s *Service) recoverStartupState(ctx context.Context) error {
+	count, err := s.store.FailStaleDownloading(ctx, staleDownloadingAge, "startup recovery: stale downloading item")
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		s.logger.Warn("marked stale downloading queue items failed", "count", count)
+	}
+	return nil
 }
 
 func (s *Service) CleanupRetention(ctx context.Context) error {
@@ -602,6 +809,10 @@ func (s *Service) setPlaybackState(kind playbackKind, randomID int64, path strin
 		s.randomFallbackID = randomID
 		s.randomFallbackPath = path
 		s.randomFallbackNotice = true
+	} else if kind == playbackFile {
+		s.randomFallbackID = 0
+		s.randomFallbackPath = path
+		s.randomFallbackNotice = false
 	} else {
 		s.randomFallbackID = 0
 		s.randomFallbackPath = ""
@@ -616,6 +827,17 @@ func (s *Service) playbackState() playbackKind {
 	return s.playback
 }
 
+func (s *Service) currentPlaybackPath() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch s.playback {
+	case playbackRandom, playbackFile:
+		return s.randomFallbackPath
+	default:
+		return ""
+	}
+}
+
 func (s *Service) randomFallbackLock() (int64, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -623,6 +845,13 @@ func (s *Service) randomFallbackLock() (int64, string) {
 		return 0, ""
 	}
 	return s.randomFallbackID, s.randomFallbackPath
+}
+
+func (s *Service) nowUTC() time.Time {
+	if s.now == nil {
+		return time.Now().UTC()
+	}
+	return s.now().UTC()
 }
 
 func formatDuration(seconds int) string {

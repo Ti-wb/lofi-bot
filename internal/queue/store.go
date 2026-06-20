@@ -199,6 +199,23 @@ UPDATE videos SET status = ?, error = ?, updated_at = ? WHERE id = ?
 	return err
 }
 
+func (s *Store) FailStaleDownloading(ctx context.Context, olderThan time.Duration, cause string) (int64, error) {
+	if olderThan <= 0 {
+		return 0, nil
+	}
+	now := time.Now().UTC()
+	cutoff := now.Add(-olderThan)
+	res, err := s.db.ExecContext(ctx, `
+UPDATE videos
+SET status = ?, error = ?, updated_at = ?, finished_at = ?
+WHERE status = ? AND created_at < ?
+`, string(StatusFailed), cause, formatTime(now), formatTime(now), string(StatusDownloading), formatTime(cutoff))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (s *Store) QueueLength(ctx context.Context) (int, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx, `
@@ -242,6 +259,25 @@ WHERE id = ? AND status = ?
 	}
 	if err := tx.Commit(); err != nil {
 		return Video{}, err
+	}
+	return s.Get(ctx, id)
+}
+
+func (s *Store) RestartPlaying(ctx context.Context, id int64) (Video, error) {
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `
+UPDATE videos SET started_at = ?, updated_at = ?
+WHERE id = ? AND status = ?
+`, formatTime(now), formatTime(now), id, string(StatusPlaying))
+	if err != nil {
+		return Video{}, err
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return Video{}, err
+	}
+	if changed == 0 {
+		return Video{}, fmt.Errorf("video %d is not playing", id)
 	}
 	return s.Get(ctx, id)
 }
