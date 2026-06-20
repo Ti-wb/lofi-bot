@@ -49,7 +49,7 @@ Before deploying a new build, manually back up the production `.env`.
 
 Before starting services, run `./run.sh migrate-env` to apply the stack helper's lightweight `.env` repair without starting the Go app. The helper checks `.env` against the supported schema version, backs up the current file to `.env.backup.<unix_timestamp>`, updates older schema markers, and appends missing fields needed by the Local Bot API helper.
 
-After migration, confirm the appended Telegram Local Bot API Server defaults are correct for production. If they are wrong, edit `.env` and restart the relevant process.
+After migration, confirm the appended Telegram Local Bot API Server defaults are correct for production. If they are wrong, edit `.env` and restart the root `./run.sh up` supervisor so both child services inherit the same configuration.
 
 Numeric config values are strict in production: malformed integers fail startup instead of falling back to defaults. Keep `OBS_PORT` in `1..65535`, set `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` above `0`, and use non-negative values for `MAX_VIDEO_DURATION_SECONDS`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES`. A value of `0` remains valid for duration and retention limits where it means disabled.
 
@@ -100,7 +100,18 @@ Run:
 ./run.sh up
 ```
 
-The built binary is written to `dist/tg-obs-bot`.
+For unattended shell-based production use, build once before starting the supervisor:
+
+```sh
+./run.sh build
+./run.sh up
+```
+
+The built binary is written to `dist/tg-obs-bot`. `./run.sh up` uses that binary when it exists; otherwise it falls back to `go run` and prints a warning. Set `APP_BIN` to run a different binary path.
+
+`./run.sh up` supervises the Telegram Local Bot API Server and `tg-obs-bot` as separate child services. If one exits, only that child restarts with exponential backoff. `Ctrl-C` or `TERM` stops both children. Tune restart delays with `RESTART_MIN_DELAY_SECONDS` and `RESTART_MAX_DELAY_SECONDS`; both must be positive integers no larger than 86400 seconds.
+
+The supervisor loads `.env` once at startup. After changing `.env`, stop and restart the root `./run.sh up` process instead of killing only one child service.
 
 ## Telegram Admin Commands
 
@@ -164,8 +175,14 @@ If videos do not visually change in OBS:
 - confirm the source supports local files;
 - confirm the source is visible in the active scene.
 
-## Suggested LaunchAgent
+## Portable Shell Supervisor
 
-For unattended use, build once and create macOS LaunchAgents for the underlying long-running services: `deploy/telegram-bot-api/run.sh` and `dist/tg-obs-bot`. The root and `deploy/telegram-bot-api` helper scripts load `.env` from the repository root and resolve a relative `TELEGRAM_BOT_API_DIR` against the repository root. When running binaries directly or writing custom plists, set `WorkingDirectory` to the repository root, or convert all relative paths in `.env` and plist arguments to absolute paths. Relative values such as `.env`, `DATA_DIR`, `TELEGRAM_BOT_API_DIR`, and log paths then resolve from the process working directory, not from the script or binary file location.
+Use the root `run.sh` as the portable production entrypoint when you want to keep the current shell or `start.sh` environment:
 
-Keep fixed Local Bot API data, `.env`, `data/`, and logs on local disk. The root `run.sh` is the local operator entrypoint, not a replacement for future LaunchAgent plists.
+```sh
+cd /path/to/tg-obs-bot
+./run.sh build
+./run.sh up
+```
+
+Keep fixed Local Bot API data, `.env`, `data/`, and logs on local disk. The root and `deploy/telegram-bot-api` helper scripts load `.env` from the repository root and resolve a relative `TELEGRAM_BOT_API_DIR` against the repository root. If an external `start.sh` calls this project, call `./run.sh up` from the repository root so relative values such as `DATA_DIR`, `TELEGRAM_BOT_API_DIR`, and `DATABASE_PATH` resolve consistently.

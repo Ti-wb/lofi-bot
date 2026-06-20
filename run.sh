@@ -9,6 +9,8 @@ BOT_API_LOGOUT="$REPO_ROOT/deploy/telegram-bot-api/logout-public.sh"
 GO_CACHE_DIR="$REPO_ROOT/.cache/go-build"
 GO_MOD_CACHE_DIR="$REPO_ROOT/.cache/go-mod"
 CURRENT_ENV_SCHEMA_VERSION=2
+DEFAULT_APP_BIN="$REPO_ROOT/dist/tg-obs-bot"
+MAX_RESTART_DELAY_SECONDS=86400
 
 die() {
   printf '%s\n' "error: $1" >&2
@@ -24,7 +26,7 @@ usage() {
 Usage: ./run.sh <command>
 
 Commands:
-  up              Start Telegram Local Bot API Server, wait for health, then start tg-obs-bot
+  up              Supervise Telegram Local Bot API Server and tg-obs-bot
   bot-api         Start only Telegram Local Bot API Server
   app             Start only tg-obs-bot
   health          Check Local Bot API /getMe
@@ -244,6 +246,15 @@ has_value() {
   ! is_placeholder "$value"
 }
 
+is_positive_integer() {
+  value=$1
+  case "$value" in
+    ""|*[!0-9]*|0|0*) return 1 ;;
+    ??????*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 require_stack_env() {
   require_value TELEGRAM_BOT_TOKEN
   require_value TELEGRAM_API_BASE_URL
@@ -264,14 +275,25 @@ ensure_go_cache() {
   mkdir -p "$GO_CACHE_DIR" "$GO_MOD_CACHE_DIR"
 }
 
+run_app_process() {
+  cd "$REPO_ROOT"
+  if [ -n "${APP_BIN:-}" ]; then
+    exec "$APP_BIN"
+  fi
+  if [ -x "$DEFAULT_APP_BIN" ]; then
+    exec "$DEFAULT_APP_BIN"
+  fi
+  info "Built binary not found at $DEFAULT_APP_BIN; falling back to go run. Run ./run.sh build for production."
+  exec env GOCACHE="$GO_CACHE_DIR" GOMODCACHE="$GO_MOD_CACHE_DIR" "${GO:-go}" run ./cmd/tg-obs-bot
+}
+
 run_app() {
   load_env
   require_value TELEGRAM_BOT_TOKEN
   require_value TELEGRAM_API_BASE_URL
   require_value ALLOWED_CHAT_ID
   ensure_go_cache
-  cd "$REPO_ROOT"
-  GOCACHE="$GO_CACHE_DIR" GOMODCACHE="$GO_MOD_CACHE_DIR" "${GO:-go}" run ./cmd/tg-obs-bot
+  run_app_process
 }
 
 run_bot_api() {
@@ -309,38 +331,92 @@ run_up() {
   require_stack_env
   ensure_go_cache
 
-  bot_api_pid=""
-  app_pid=""
+  : "${RESTART_MIN_DELAY_SECONDS:=2}"
+  : "${RESTART_MAX_DELAY_SECONDS:=60}"
+  if ! is_positive_integer "$RESTART_MIN_DELAY_SECONDS"; then
+    die "RESTART_MIN_DELAY_SECONDS must be a positive integer"
+  fi
+  if ! is_positive_integer "$RESTART_MAX_DELAY_SECONDS"; then
+    die "RESTART_MAX_DELAY_SECONDS must be a positive integer"
+  fi
+  if [ "$RESTART_MIN_DELAY_SECONDS" -gt "$MAX_RESTART_DELAY_SECONDS" ]; then
+    die "RESTART_MIN_DELAY_SECONDS must be no greater than $MAX_RESTART_DELAY_SECONDS"
+  fi
+  if [ "$RESTART_MAX_DELAY_SECONDS" -gt "$MAX_RESTART_DELAY_SECONDS" ]; then
+    die "RESTART_MAX_DELAY_SECONDS must be no greater than $MAX_RESTART_DELAY_SECONDS"
+  fi
+  if [ "$RESTART_MAX_DELAY_SECONDS" -lt "$RESTART_MIN_DELAY_SECONDS" ]; then
+    die "RESTART_MAX_DELAY_SECONDS must be greater than or equal to RESTART_MIN_DELAY_SECONDS"
+  fi
+
+  bot_api_supervisor_pid=""
+  app_supervisor_pid=""
 
   cleanup() {
     status=$?
     trap - INT TERM EXIT
-    if [ -n "$app_pid" ] && kill -0 "$app_pid" 2>/dev/null; then
-      kill "$app_pid" 2>/dev/null || true
-      wait "$app_pid" 2>/dev/null || true
+    if [ -n "$app_supervisor_pid" ] && kill -0 "$app_supervisor_pid" 2>/dev/null; then
+      kill "$app_supervisor_pid" 2>/dev/null || true
+      wait "$app_supervisor_pid" 2>/dev/null || true
     fi
-    if [ -n "$bot_api_pid" ] && kill -0 "$bot_api_pid" 2>/dev/null; then
-      kill "$bot_api_pid" 2>/dev/null || true
-      wait "$bot_api_pid" 2>/dev/null || true
+    if [ -n "$bot_api_supervisor_pid" ] && kill -0 "$bot_api_supervisor_pid" 2>/dev/null; then
+      kill "$bot_api_supervisor_pid" 2>/dev/null || true
+      wait "$bot_api_supervisor_pid" 2>/dev/null || true
     fi
     exit "$status"
   }
 
+  delay_next() {
+    current=$1
+    if [ "$current" -lt "$RESTART_MIN_DELAY_SECONDS" ]; then
+      current=$RESTART_MIN_DELAY_SECONDS
+    fi
+    next=$((current * 2))
+    if [ "$next" -gt "$RESTART_MAX_DELAY_SECONDS" ]; then
+      next=$RESTART_MAX_DELAY_SECONDS
+    fi
+    printf '%s' "$next"
+  }
+
   trap cleanup INT TERM EXIT
 
-  info "Starting Telegram Local Bot API Server..."
-  "$BOT_API_RUN" &
-  bot_api_pid=$!
+  (
+    trap 'if [ -n "${child_pid:-}" ] && kill -0 "$child_pid" 2>/dev/null; then kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; fi; exit 0' INT TERM
+    delay=$RESTART_MIN_DELAY_SECONDS
+    while :; do
+      info "Starting Telegram Local Bot API Server..."
+      "$BOT_API_RUN" &
+      child_pid=$!
+      status=0
+      wait "$child_pid" || status=$?
+      info "Telegram Local Bot API Server exited with status $status; restarting in ${delay}s..."
+      sleep "$delay"
+      delay=$(delay_next "$delay")
+    done
+  ) &
+  bot_api_supervisor_pid=$!
 
   if ! wait_for_health 30; then
-    die "Telegram Local Bot API Server did not become healthy"
+    info "Telegram Local Bot API Server is not healthy yet; tg-obs-bot will still start and retry Telegram polling."
   fi
 
-  info "Starting tg-obs-bot..."
-  cd "$REPO_ROOT"
-  GOCACHE="$GO_CACHE_DIR" GOMODCACHE="$GO_MOD_CACHE_DIR" "${GO:-go}" run ./cmd/tg-obs-bot &
-  app_pid=$!
-  wait "$app_pid"
+  (
+    trap 'if [ -n "${child_pid:-}" ] && kill -0 "$child_pid" 2>/dev/null; then kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; fi; exit 0' INT TERM
+    delay=$RESTART_MIN_DELAY_SECONDS
+    while :; do
+      info "Starting tg-obs-bot..."
+      run_app_process &
+      child_pid=$!
+      status=0
+      wait "$child_pid" || status=$?
+      info "tg-obs-bot exited with status $status; restarting in ${delay}s..."
+      sleep "$delay"
+      delay=$(delay_next "$delay")
+    done
+  ) &
+  app_supervisor_pid=$!
+
+  wait "$bot_api_supervisor_pid" "$app_supervisor_pid" || true
 }
 
 check_cmd() {

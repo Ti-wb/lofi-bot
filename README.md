@@ -53,6 +53,17 @@ make tidy
 ./run.sh up
 ```
 
+For unattended use with the portable shell environment, build first and keep `./run.sh up` running from your existing `start.sh`, terminal multiplexer, or process wrapper:
+
+```sh
+./run.sh build
+./run.sh up
+```
+
+`./run.sh up` supervises the Telegram Local Bot API Server and `tg-obs-bot` separately. If either child exits, only that child is restarted with exponential backoff. You can set `RESTART_MIN_DELAY_SECONDS`, `RESTART_MAX_DELAY_SECONDS`, or `APP_BIN` to customize restart delays or the app binary path. Restart delays must be positive integers no larger than 86400 seconds.
+
+After changing `.env`, restart the root `./run.sh up` process so both child services inherit the same configuration.
+
 ## Config Upgrades
 
 `.env` is local runtime config and is ignored by git. `.env.example` is the versioned schema shared by the Go backend and Telegram Local Bot API Server helpers; keep `ENV_SCHEMA_VERSION` at the top when creating or reviewing config.
@@ -78,7 +89,7 @@ make test
 Common runtime commands:
 
 ```sh
-./run.sh up              # start Telegram Local Bot API Server and tg-obs-bot
+./run.sh up              # supervise Telegram Local Bot API Server and tg-obs-bot
 ./run.sh app             # start only tg-obs-bot
 ./run.sh bot-api         # start only Telegram Local Bot API Server
 ./run.sh health          # check local Telegram Bot API /getMe
