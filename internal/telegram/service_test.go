@@ -1,10 +1,12 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -196,6 +198,27 @@ func TestRegisterCommandsSetsPublicAndAdminScopes(t *testing.T) {
 	}
 	if bot.setCommandsCount != 2 {
 		t.Fatalf("set command calls = %d, want 2", bot.setCommandsCount)
+	}
+}
+
+func TestSendErrorLogRedactsTelegramToken(t *testing.T) {
+	const token = "123456:ABCdefghi_jklmnop"
+	var logs bytes.Buffer
+	bot := &fakeBotAPI{
+		sendErr: errors.New(`Post "http://127.0.0.1:8081/bot123456:ABCdefghi_jklmnop/sendMessage": EOF`),
+	}
+	svc := newTestService(t, bot)
+	svc.cfg.Token = token
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	svc.reply(context.Background(), testChatID, botResponse{text: "hello"}, nil)
+
+	got := logs.String()
+	if strings.Contains(got, token) {
+		t.Fatalf("log leaked token: %q", got)
+	}
+	if !strings.Contains(got, "/bot<redacted>/sendMessage") {
+		t.Fatalf("log = %q, want redacted bot URL", got)
 	}
 }
 
@@ -780,6 +803,8 @@ type fakeBotAPI struct {
 	fileCallCount    int
 	file             tgbotapi.File
 	fileErr          error
+	sendErr          error
+	requestErr       error
 	updateCalls      chan struct{}
 	sendBlock        <-chan struct{}
 	requestBlock     <-chan struct{}
@@ -816,7 +841,7 @@ func (f *fakeBotAPI) Send(ctx context.Context, _ tgbotapi.Chattable) (tgbotapi.M
 			return tgbotapi.Message{}, ctx.Err()
 		}
 	}
-	return tgbotapi.Message{}, nil
+	return tgbotapi.Message{}, f.sendErr
 }
 
 func (f *fakeBotAPI) Request(ctx context.Context, req tgbotapi.Chattable) (*tgbotapi.APIResponse, error) {
@@ -834,7 +859,7 @@ func (f *fakeBotAPI) Request(ctx context.Context, req tgbotapi.Chattable) (*tgbo
 	case tgbotapi.SetMyCommandsConfig:
 		f.setCommandsCount++
 	}
-	return &tgbotapi.APIResponse{}, nil
+	return &tgbotapi.APIResponse{}, f.requestErr
 }
 
 func (f *fakeBotAPI) GetFile(ctx context.Context, _ tgbotapi.FileConfig) (tgbotapi.File, error) {

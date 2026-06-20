@@ -310,6 +310,37 @@ func TestAdvancePlaybackDoesNotMarkReadyPlayedWhenOBSPlayFails(t *testing.T) {
 	}
 }
 
+func TestStatusTextRedactsLastErrorSecrets(t *testing.T) {
+	const (
+		token    = "123456:ABCdefghi_jklmnop"
+		password = "obs-secret-password"
+		apiHash  = "telegram-api-hash"
+	)
+	t.Setenv("TELEGRAM_API_HASH", apiHash)
+	ctx := context.Background()
+	svc, _, _ := newLocalUploadTestService(t, config.Config{
+		FallbackMode:      "off",
+		TelegramBotToken:  token,
+		OBSPassword:       password,
+		RetentionMaxFiles: 100,
+	})
+
+	svc.setLastErr(errors.New(`Post "http://127.0.0.1:8081/bot123456:ABCdefghi_jklmnop/getMe": obs-secret-password telegram-api-hash`))
+
+	statusText, err := svc.StatusText(ctx, true)
+	if err != nil {
+		t.Fatalf("status text: %v", err)
+	}
+	for _, leaked := range []string{token, password, apiHash} {
+		if strings.Contains(statusText, leaked) {
+			t.Fatalf("status text leaked %q: %q", leaked, statusText)
+		}
+	}
+	if !strings.Contains(statusText, "<redacted>") {
+		t.Fatalf("status text = %q, want redacted marker", statusText)
+	}
+}
+
 func TestRecoverPlaybackAfterOBSConnectReplaysCurrent(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})

@@ -16,6 +16,7 @@ import (
 	"github.com/tiwb/tg-obs-bot/internal/media"
 	"github.com/tiwb/tg-obs-bot/internal/obs"
 	"github.com/tiwb/tg-obs-bot/internal/queue"
+	"github.com/tiwb/tg-obs-bot/internal/secret"
 	"github.com/tiwb/tg-obs-bot/internal/telegram"
 )
 
@@ -132,7 +133,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 func (s *Service) Close() {
 	for i := len(s.shutdown) - 1; i >= 0; i-- {
 		if err := s.shutdown[i](); err != nil {
-			s.logger.Warn("shutdown error", "error", err)
+			s.logger.Warn("shutdown error", "error", s.redactError(err))
 		}
 	}
 }
@@ -166,7 +167,7 @@ func (s *Service) Run(ctx context.Context) error {
 		case <-cleanupTicker.C:
 			if err := s.CleanupRetention(ctx); err != nil {
 				s.setLastErr(err)
-				s.logger.Warn("retention cleanup failed", "error", err)
+				s.logger.Warn("retention cleanup failed", "error", s.redactError(err))
 			}
 		}
 	}
@@ -235,7 +236,7 @@ func (s *Service) EnqueueUpload(ctx context.Context, req UploadRequest) (queue.V
 		return queue.Video{}, err
 	}
 	if err := s.playIfIdle(ctx); err != nil {
-		s.logger.Warn("play after enqueue failed", "error", err)
+		s.logger.Warn("play after enqueue failed", "error", s.redactError(err))
 	}
 	return ready, nil
 }
@@ -353,7 +354,7 @@ func (s *Service) recoverPlaybackAfterOBSConnect(ctx context.Context) error {
 			return markErr
 		}
 		s.setLastErr(recoveryErr)
-		s.logger.Warn("mark missing current video failed", "video_id", current.ID, "path", current.LocalPath, "error", err)
+		s.logger.Warn("mark missing current video failed", "video_id", current.ID, "path", current.LocalPath, "error", s.redactError(err))
 		s.setPlaybackState(playbackIdle, 0, "")
 		return s.playIfIdleLocked(ctx)
 	}
@@ -449,7 +450,7 @@ func (s *Service) playRandomFallbackLocked(ctx context.Context) (*queue.Video, e
 			continue
 		}
 		if _, err := os.Stat(video.LocalPath); err != nil {
-			s.logger.Warn("skip missing random fallback file", "video_id", video.ID, "path", video.LocalPath, "error", err)
+			s.logger.Warn("skip missing random fallback file", "video_id", video.ID, "path", video.LocalPath, "error", s.redactError(err))
 			continue
 		}
 		if err := s.obs.PlayFile(ctx, video.LocalPath); err != nil {
@@ -605,11 +606,11 @@ func (s *Service) obsReconnectLoop(ctx context.Context) {
 		if s.obs.Status().State == obs.StateDisconnected {
 			if err := s.obs.Connect(ctx); err != nil {
 				s.setLastErr(err)
-				s.logger.Warn("connect OBS failed", "error", err)
+				s.logger.Warn("connect OBS failed", "error", s.redactError(err))
 			} else {
 				s.logger.Info("connected to OBS")
 				if err := s.recoverPlaybackAfterOBSConnect(ctx); err != nil {
-					s.logger.Warn("resume playback failed", "error", err)
+					s.logger.Warn("resume playback failed", "error", s.redactError(err))
 				}
 			}
 		}
@@ -632,7 +633,7 @@ func (s *Service) playbackWatchdogLoop(ctx context.Context) {
 		case <-ticker.C:
 			if err := s.checkPlaybackWatchdog(ctx); err != nil {
 				s.setLastErr(err)
-				s.logger.Warn("playback watchdog failed", "error", err)
+				s.logger.Warn("playback watchdog failed", "error", s.redactError(err))
 			}
 		}
 	}
@@ -692,7 +693,7 @@ func (s *Service) obsEventLoop(ctx context.Context) {
 			}
 			video, err := s.advancePlaybackForEndedEvent(ctx, event)
 			if err != nil {
-				s.logger.Warn("advance playback after OBS event failed", "error", err)
+				s.logger.Warn("advance playback after OBS event failed", "error", s.redactError(err))
 				continue
 			}
 			if video != nil {
@@ -791,7 +792,7 @@ func (s *Service) CleanupRetention(ctx context.Context) error {
 func (s *Service) setLastErr(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.lastErr = err.Error()
+	s.lastErr = secret.RedactString(err.Error(), s.cfg.SensitiveValues()...)
 }
 
 func (s *Service) lastError() string {
@@ -845,6 +846,10 @@ func (s *Service) randomFallbackLock() (int64, string) {
 		return 0, ""
 	}
 	return s.randomFallbackID, s.randomFallbackPath
+}
+
+func (s *Service) redactError(err error) error {
+	return secret.RedactError(err, s.cfg.SensitiveValues()...)
 }
 
 func (s *Service) nowUTC() time.Time {

@@ -29,5 +29,9 @@ if is_placeholder "${TELEGRAM_BOT_TOKEN:-}"; then
 fi
 
 printf '%s\n' "Logging the bot out from the public Telegram Bot API. Run this manually before switching to the local server."
-printf 'url = "https://api.telegram.org/bot%s/logOut"\n' "$TELEGRAM_BOT_TOKEN" | curl -fsS --config -
+curl_status=0
+printf 'url = "https://api.telegram.org/bot%s/logOut"\n' "$TELEGRAM_BOT_TOKEN" | curl -fsS --config - || curl_status=$?
+if [ "$curl_status" -ne 0 ]; then
+  die "public Telegram Bot API logOut failed (curl exit $curl_status)"
+fi
 printf '\n'

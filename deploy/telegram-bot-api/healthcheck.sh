@@ -32,5 +32,9 @@ if is_placeholder "${TELEGRAM_API_BASE_URL:-}"; then
 fi
 
 BASE_URL=${TELEGRAM_API_BASE_URL%/}
-printf 'url = "%s/bot%s/getMe"\n' "$BASE_URL" "$TELEGRAM_BOT_TOKEN" | curl -fsS --config -
+curl_status=0
+printf 'url = "%s/bot%s/getMe"\n' "$BASE_URL" "$TELEGRAM_BOT_TOKEN" | curl -fsS --config - || curl_status=$?
+if [ "$curl_status" -ne 0 ]; then
+  die "Local Bot API getMe failed (curl exit $curl_status)"
+fi
 printf '\n'

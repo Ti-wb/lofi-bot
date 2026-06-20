@@ -10,12 +10,13 @@ import (
 
 	"github.com/tiwb/tg-obs-bot/internal/app"
 	"github.com/tiwb/tg-obs-bot/internal/config"
+	"github.com/tiwb/tg-obs-bot/internal/secret"
 )
 
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("load config", "error", err)
+		slog.Error("load config", "error", secret.RedactError(err))
 		os.Exit(1)
 	}
 
@@ -29,13 +30,13 @@ func main() {
 
 	service, err := app.New(cfg, logger)
 	if err != nil {
-		logger.Error("initialize service", "error", err)
+		logger.Error("initialize service", "error", secret.RedactError(err, cfg.SensitiveValues()...))
 		os.Exit(1)
 	}
 	defer service.Close()
 
 	if err := service.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		logger.Error("service stopped", "error", err)
+		logger.Error("service stopped", "error", secret.RedactError(err, cfg.SensitiveValues()...))
 		os.Exit(1)
 	}
 }

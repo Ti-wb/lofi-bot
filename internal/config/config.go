@@ -342,6 +342,10 @@ func (c Config) OBSURL() string {
 	return fmt.Sprintf("ws://%s:%d", c.OBSHost, c.OBSPort)
 }
 
+func (c Config) SensitiveValues() []string {
+	return []string{c.TelegramBotToken, c.OBSPassword}
+}
+
 func (c Config) RetentionMaxAge() time.Duration {
 	if c.RetentionDays <= 0 {
 		return 0

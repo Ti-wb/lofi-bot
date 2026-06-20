@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tiwb/tg-obs-bot/internal/secret"
+
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
@@ -136,7 +138,7 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 	if s.bot == nil {
 		bot, err := newProductionBotAPI(cfg)
 		if err != nil {
-			return nil, fmt.Errorf("create telegram bot: %w", err)
+			return nil, fmt.Errorf("create telegram bot: %w", secret.RedactError(err, cfg.Token))
 		}
 		s.bot = bot
 	}
@@ -174,7 +176,7 @@ func (s *Service) registerCommands(ctx context.Context) error {
 
 func (s *Service) Run(ctx context.Context) error {
 	if err := s.registerCommands(ctx); err != nil {
-		s.logger.Warn("register telegram commands", "error", err)
+		s.logger.Warn("register telegram commands", "error", s.redactError(err))
 	}
 
 	updateConfig := tgbotapi.NewUpdate(0)
@@ -190,7 +192,7 @@ func (s *Service) Run(ctx context.Context) error {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			s.logger.Warn("get telegram updates", "error", err)
+			s.logger.Warn("get telegram updates", "error", s.redactError(err))
 			if err := sleepContext(ctx, s.pollRetryDelay); err != nil {
 				return err
 			}
@@ -255,13 +257,13 @@ func (s *Service) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery
 
 	response, err := s.routeAction(ctx, cb.Message.Chat.ID, cb.From, cb.Data)
 	if err != nil {
-		response = botResponse{text: friendlyError(err)}
+		response = botResponse{text: friendlyError(s.redactError(err))}
 	}
 	s.answerCallback(ctx, cb.ID, truncateCallbackText(response.text))
 	if response.text != "" {
 		if isRefreshAction(cb.Data) {
 			if err := s.editCallbackMessage(ctx, cb.Message.Chat.ID, cb.Message.MessageID, response); err != nil {
-				s.logger.Warn("edit telegram callback message", "error", err)
+				s.logger.Warn("edit telegram callback message", "error", s.redactError(err))
 				_ = s.SendMessageWithMarkup(ctx, cb.Message.Chat.ID, response.text, response.markup)
 			}
 			return
@@ -496,13 +498,13 @@ func (s *Service) responseFromMove(ctx context.Context, hook MoveFunc, id int64,
 
 func (s *Service) reply(ctx context.Context, chatID int64, response botResponse, err error) {
 	if err != nil {
-		response = botResponse{text: friendlyError(err)}
+		response = botResponse{text: friendlyError(s.redactError(err))}
 	}
 	if response.text == "" {
 		return
 	}
 	if sendErr := s.SendMessageWithMarkup(ctx, chatID, response.text, response.markup); sendErr != nil {
-		s.logger.Warn("send telegram message", "error", sendErr)
+		s.logger.Warn("send telegram message", "error", s.redactError(sendErr))
 	}
 }
 
@@ -511,7 +513,7 @@ func (s *Service) send(ctx context.Context, msg tgbotapi.Chattable) error {
 		return err
 	}
 	_, err := s.bot.Send(ctx, msg)
-	return err
+	return s.redactError(err)
 }
 
 func (s *Service) request(ctx context.Context, req tgbotapi.Chattable) error {
@@ -519,21 +521,23 @@ func (s *Service) request(ctx context.Context, req tgbotapi.Chattable) error {
 		return err
 	}
 	_, err := s.bot.Request(ctx, req)
-	return err
+	return s.redactError(err)
 }
 
 func (s *Service) getFile(ctx context.Context, config tgbotapi.FileConfig) (tgbotapi.File, error) {
 	if err := ctx.Err(); err != nil {
 		return tgbotapi.File{}, err
 	}
-	return s.bot.GetFile(ctx, config)
+	file, err := s.bot.GetFile(ctx, config)
+	return file, s.redactError(err)
 }
 
 func (s *Service) getChatAdministrators(ctx context.Context, config tgbotapi.ChatAdministratorsConfig) ([]tgbotapi.ChatMember, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return s.bot.GetChatAdministrators(ctx, config)
+	admins, err := s.bot.GetChatAdministrators(ctx, config)
+	return admins, s.redactError(err)
 }
 
 func (s *Service) answerCallback(ctx context.Context, callbackID string, text string) {
@@ -542,7 +546,7 @@ func (s *Service) answerCallback(ctx context.Context, callbackID string, text st
 	}
 	callback := tgbotapi.NewCallback(callbackID, text)
 	if err := s.request(ctx, callback); err != nil && !errors.Is(ctx.Err(), context.Canceled) {
-		s.logger.Warn("answer telegram callback", "error", err)
+		s.logger.Warn("answer telegram callback", "error", s.redactError(err))
 	}
 }
 
@@ -567,7 +571,7 @@ func (s *Service) isAdmin(ctx context.Context, chatID int64, user *tgbotapi.User
 	userID := int64(user.ID)
 	adminIDs, _, err := s.getAdminIDs(ctx, chatID, false)
 	if err != nil {
-		s.logger.Warn("get telegram chat administrators", "chat_id", chatID, "error", err)
+		s.logger.Warn("get telegram chat administrators", "chat_id", chatID, "error", s.redactError(err))
 		return false
 	}
 	if _, ok := adminIDs[userID]; ok {
@@ -576,7 +580,7 @@ func (s *Service) isAdmin(ctx context.Context, chatID int64, user *tgbotapi.User
 
 	adminIDs, _, err = s.getAdminIDs(ctx, chatID, true)
 	if err != nil {
-		s.logger.Warn("refresh telegram chat administrators", "chat_id", chatID, "error", err)
+		s.logger.Warn("refresh telegram chat administrators", "chat_id", chatID, "error", s.redactError(err))
 		return false
 	}
 	_, ok := adminIDs[userID]
@@ -923,22 +927,25 @@ type productionBotAPI struct {
 }
 
 type contextHTTPClient struct {
-	base tgbotapi.HTTPClient
-	ctx  context.Context
+	base    tgbotapi.HTTPClient
+	ctx     context.Context
+	secrets []string
 }
 
 func newProductionBotAPI(cfg Config) (*productionBotAPI, error) {
 	endpoint := cfg.APIBaseURL + "/bot%s/%s"
 	updateClient := &contextHTTPClient{
-		base: &http.Client{Timeout: cfg.RequestTimeout},
+		base:    &http.Client{Timeout: cfg.RequestTimeout},
+		secrets: []string{cfg.Token},
 	}
 	updates, err := tgbotapi.NewBotAPIWithClient(cfg.Token, endpoint, updateClient)
 	if err != nil {
-		return nil, err
+		return nil, secret.RedactError(err, cfg.Token)
 	}
 
 	requestClient := &contextHTTPClient{
-		base: &http.Client{Timeout: cfg.RequestTimeout},
+		base:    &http.Client{Timeout: cfg.RequestTimeout},
+		secrets: []string{cfg.Token},
 	}
 	requests := *updates
 	requests.Client = requestClient
@@ -1035,7 +1042,8 @@ func (c *contextHTTPClient) Do(req *http.Request) (*http.Response, error) {
 	if c.ctx != nil {
 		req = req.WithContext(c.ctx)
 	}
-	return c.base.Do(req)
+	resp, err := c.base.Do(req)
+	return resp, secret.RedactError(err, c.secrets...)
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) error {
@@ -1050,4 +1058,8 @@ func sleepContext(ctx context.Context, delay time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func (s *Service) redactError(err error) error {
+	return secret.RedactError(err, s.cfg.Token)
 }
