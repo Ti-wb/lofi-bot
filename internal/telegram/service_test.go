@@ -208,6 +208,43 @@ func TestNewDefaultsRequestTimeoutExceedsUpdateTimeout(t *testing.T) {
 	}
 }
 
+func TestProductionBotAPIUpdateAndRequestLocksAreIndependent(t *testing.T) {
+	api := &productionBotAPI{
+		updateClient:  &contextHTTPClient{},
+		requestClient: &contextHTTPClient{},
+	}
+
+	api.updateMu.Lock()
+	requestDone := make(chan struct{})
+	go func() {
+		_ = api.withRequestContext(context.Background(), func() error {
+			close(requestDone)
+			return nil
+		})
+	}()
+	select {
+	case <-requestDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("request context blocked behind update lock")
+	}
+	api.updateMu.Unlock()
+
+	api.requestMu.Lock()
+	updateDone := make(chan struct{})
+	go func() {
+		_ = api.withUpdateContext(context.Background(), func() error {
+			close(updateDone)
+			return nil
+		})
+	}()
+	select {
+	case <-updateDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("update context blocked behind request lock")
+	}
+	api.requestMu.Unlock()
+}
+
 func TestContextHTTPClientAttachesCallerContext(t *testing.T) {
 	base := &blockingHTTPClient{seen: make(chan context.Context, 1)}
 	client := &contextHTTPClient{base: base}
@@ -408,8 +445,8 @@ func TestAdminInFlightCanceledContextReturnsQuicklyAndDeniesCommand(t *testing.T
 	}
 }
 
-func TestRunCancelStopsReceivingUpdates(t *testing.T) {
-	bot := &fakeBotAPI{updates: make(tgbotapi.UpdatesChannel)}
+func TestRunCanceledContextReturnsQuickly(t *testing.T) {
+	bot := &fakeBotAPI{}
 	svc := newTestService(t, bot)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -419,8 +456,91 @@ func TestRunCancelStopsReceivingUpdates(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want %v", err, context.Canceled)
 	}
-	if bot.stopReceivingCount != 1 {
-		t.Fatalf("stop receiving calls = %d, want 1", bot.stopReceivingCount)
+	if bot.updateCallCount != 0 {
+		t.Fatalf("get updates calls = %d, want 0", bot.updateCallCount)
+	}
+}
+
+func TestRunRetriesGetUpdatesError(t *testing.T) {
+	getUpdatesErr := errors.New("local bot api unavailable")
+	bot := &fakeBotAPI{
+		updateResponses: []updateResponse{
+			{err: getUpdatesErr},
+		},
+		updateCalls: make(chan struct{}, 2),
+	}
+	svc := newTestService(t, bot)
+	svc.pollRetryDelay = time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-bot.updateCalls:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timed out waiting for get updates call %d", i+1)
+		}
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not stop after cancellation")
+	}
+}
+
+func TestRunAdvancesUpdateOffset(t *testing.T) {
+	bot := &fakeBotAPI{
+		updateResponses: []updateResponse{
+			{updates: []tgbotapi.Update{
+				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: 11, Message: commandMessage(42, "/now")},
+			}},
+		},
+		updateCalls: make(chan struct{}, 2),
+	}
+	svc := newTestService(t, bot)
+	svc.hooks.ListQueue = func(context.Context) (string, error) { return "queue", nil }
+	svc.hooks.Now = func(context.Context) (string, error) { return "now", nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-bot.updateCalls:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timed out waiting for get updates call %d", i+1)
+		}
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not stop after cancellation")
+	}
+	if len(bot.updateConfigs) < 2 {
+		t.Fatalf("update configs = %d, want at least 2", len(bot.updateConfigs))
+	}
+	if got := bot.updateConfigs[1].Offset; got != 12 {
+		t.Fatalf("second poll offset = %d, want 12", got)
 	}
 }
 
@@ -632,6 +752,11 @@ type adminResponse struct {
 	err    error
 }
 
+type updateResponse struct {
+	updates []tgbotapi.Update
+	err     error
+}
+
 type blockingHTTPClient struct {
 	seen chan context.Context
 }
@@ -643,34 +768,43 @@ func (b *blockingHTTPClient) Do(req *http.Request) (*http.Response, error) {
 }
 
 type fakeBotAPI struct {
-	adminResponses     []adminResponse
-	adminCallCount     int
-	sendCount          int
-	requestCount       int
-	editTextCount      int
-	setCommandsCount   int
-	stopReceivingCount int
-	fileCallCount      int
-	updates            tgbotapi.UpdatesChannel
-	file               tgbotapi.File
-	fileErr            error
-	sendBlock          <-chan struct{}
-	requestBlock       <-chan struct{}
-	fileBlock          <-chan struct{}
-	adminBlock         <-chan struct{}
-	fileStarted        chan struct{}
-	adminStarted       chan struct{}
+	adminResponses   []adminResponse
+	updateResponses  []updateResponse
+	adminCallCount   int
+	updateCallCount  int
+	updateConfigs    []tgbotapi.UpdateConfig
+	sendCount        int
+	requestCount     int
+	editTextCount    int
+	setCommandsCount int
+	fileCallCount    int
+	file             tgbotapi.File
+	fileErr          error
+	updateCalls      chan struct{}
+	sendBlock        <-chan struct{}
+	requestBlock     <-chan struct{}
+	fileBlock        <-chan struct{}
+	adminBlock       <-chan struct{}
+	fileStarted      chan struct{}
+	adminStarted     chan struct{}
 }
 
-func (f *fakeBotAPI) GetUpdatesChan(tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel {
-	if f.updates != nil {
-		return f.updates
+func (f *fakeBotAPI) GetUpdates(ctx context.Context, config tgbotapi.UpdateConfig) ([]tgbotapi.Update, error) {
+	f.updateCallCount++
+	f.updateConfigs = append(f.updateConfigs, config)
+	if f.updateCalls != nil {
+		select {
+		case f.updateCalls <- struct{}{}:
+		default:
+		}
 	}
-	return make(tgbotapi.UpdatesChannel)
-}
-
-func (f *fakeBotAPI) StopReceivingUpdates() {
-	f.stopReceivingCount++
+	if len(f.updateResponses) == 0 {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	response := f.updateResponses[0]
+	f.updateResponses = f.updateResponses[1:]
+	return response.updates, response.err
 }
 
 func (f *fakeBotAPI) Send(ctx context.Context, _ tgbotapi.Chattable) (tgbotapi.Message, error) {

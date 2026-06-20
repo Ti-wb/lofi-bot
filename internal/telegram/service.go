@@ -19,6 +19,7 @@ import (
 const (
 	defaultUpdateTimeout  = 30
 	defaultRequestTimeout = time.Duration(defaultUpdateTimeout)*time.Second + 5*time.Second
+	defaultPollRetryDelay = 3 * time.Second
 	adminCacheTTL         = 60 * time.Second
 )
 
@@ -40,6 +41,7 @@ type Service struct {
 	hooks           Hooks
 	logger          *slog.Logger
 	now             func() time.Time
+	pollRetryDelay  time.Duration
 	adminCacheMutex sync.Mutex
 	adminCache      map[int64]adminCacheEntry
 }
@@ -121,11 +123,12 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 	}
 
 	s := &Service{
-		cfg:        cfg,
-		hooks:      hooks,
-		logger:     logger,
-		now:        time.Now,
-		adminCache: make(map[int64]adminCacheEntry),
+		cfg:            cfg,
+		hooks:          hooks,
+		logger:         logger,
+		now:            time.Now,
+		pollRetryDelay: defaultPollRetryDelay,
+		adminCache:     make(map[int64]adminCacheEntry),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -177,16 +180,26 @@ func (s *Service) Run(ctx context.Context) error {
 	updateConfig := tgbotapi.NewUpdate(0)
 	updateConfig.Timeout = s.cfg.UpdateTimeout
 
-	updates := s.bot.GetUpdatesChan(updateConfig)
-	defer s.bot.StopReceivingUpdates()
-
 	for {
-		select {
-		case <-ctx.Done():
+		if err := ctx.Err(); err != nil {
 			return ctx.Err()
-		case update, ok := <-updates:
-			if !ok {
-				return nil
+		}
+
+		updates, err := s.bot.GetUpdates(ctx, updateConfig)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			s.logger.Warn("get telegram updates", "error", err)
+			if err := sleepContext(ctx, s.pollRetryDelay); err != nil {
+				return err
+			}
+			continue
+		}
+
+		for _, update := range updates {
+			if update.UpdateID >= updateConfig.Offset {
+				updateConfig.Offset = update.UpdateID + 1
 			}
 			s.handleUpdate(ctx, update)
 		}
@@ -893,8 +906,7 @@ func (e errHookNotConfigured) Error() string {
 }
 
 type botAPI interface {
-	GetUpdatesChan(tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel
-	StopReceivingUpdates()
+	GetUpdates(context.Context, tgbotapi.UpdateConfig) ([]tgbotapi.Update, error)
 	Send(context.Context, tgbotapi.Chattable) (tgbotapi.Message, error)
 	Request(context.Context, tgbotapi.Chattable) (*tgbotapi.APIResponse, error)
 	GetFile(context.Context, tgbotapi.FileConfig) (tgbotapi.File, error)
@@ -904,6 +916,8 @@ type botAPI interface {
 type productionBotAPI struct {
 	updates       *tgbotapi.BotAPI
 	requests      *tgbotapi.BotAPI
+	updateClient  *contextHTTPClient
+	updateMu      sync.Mutex
 	requestClient *contextHTTPClient
 	requestMu     sync.Mutex
 }
@@ -915,9 +929,10 @@ type contextHTTPClient struct {
 
 func newProductionBotAPI(cfg Config) (*productionBotAPI, error) {
 	endpoint := cfg.APIBaseURL + "/bot%s/%s"
-	updates, err := tgbotapi.NewBotAPIWithClient(cfg.Token, endpoint, &http.Client{
-		Timeout: cfg.RequestTimeout,
-	})
+	updateClient := &contextHTTPClient{
+		base: &http.Client{Timeout: cfg.RequestTimeout},
+	}
+	updates, err := tgbotapi.NewBotAPIWithClient(cfg.Token, endpoint, updateClient)
 	if err != nil {
 		return nil, err
 	}
@@ -933,16 +948,19 @@ func newProductionBotAPI(cfg Config) (*productionBotAPI, error) {
 	return &productionBotAPI{
 		updates:       updates,
 		requests:      &requests,
+		updateClient:  updateClient,
 		requestClient: requestClient,
 	}, nil
 }
 
-func (b *productionBotAPI) GetUpdatesChan(config tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel {
-	return b.updates.GetUpdatesChan(config)
-}
-
-func (b *productionBotAPI) StopReceivingUpdates() {
-	b.updates.StopReceivingUpdates()
+func (b *productionBotAPI) GetUpdates(ctx context.Context, config tgbotapi.UpdateConfig) ([]tgbotapi.Update, error) {
+	var updates []tgbotapi.Update
+	err := b.withUpdateContext(ctx, func() error {
+		var err error
+		updates, err = b.updates.GetUpdates(config)
+		return err
+	})
+	return updates, err
 }
 
 func (b *productionBotAPI) Send(ctx context.Context, msg tgbotapi.Chattable) (tgbotapi.Message, error) {
@@ -985,6 +1003,20 @@ func (b *productionBotAPI) GetChatAdministrators(ctx context.Context, config tgb
 	return admins, err
 }
 
+func (b *productionBotAPI) withUpdateContext(ctx context.Context, call func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	b.updateMu.Lock()
+	defer b.updateMu.Unlock()
+	b.updateClient.ctx = ctx
+	defer func() {
+		b.updateClient.ctx = nil
+	}()
+	return call()
+}
+
 func (b *productionBotAPI) withRequestContext(ctx context.Context, call func() error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1004,4 +1036,18 @@ func (c *contextHTTPClient) Do(req *http.Request) (*http.Response, error) {
 		req = req.WithContext(c.ctx)
 	}
 	return c.base.Do(req)
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		delay = defaultPollRetryDelay
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
