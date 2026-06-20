@@ -161,9 +161,13 @@ func (s *Service) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case err := <-errCh:
-			if err != nil && ctx.Err() == nil {
-				return err
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
+			if err == nil {
+				return errors.New("telegram service stopped unexpectedly")
+			}
+			return err
 		case <-cleanupTicker.C:
 			if err := s.CleanupRetention(ctx); err != nil {
 				s.setLastErr(err)
@@ -359,6 +363,7 @@ func (s *Service) recoverPlaybackAfterOBSConnect(ctx context.Context) error {
 		return s.playIfIdleLocked(ctx)
 	}
 	if err := s.obs.PlayFile(ctx, current.LocalPath); err != nil {
+		s.setPlaybackState(playbackIdle, 0, "")
 		s.setLastErr(err)
 		return err
 	}
@@ -603,12 +608,19 @@ func (s *Service) obsReconnectLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
-		if s.obs.Status().State == obs.StateDisconnected {
+		switch s.obs.Status().State {
+		case obs.StateDisconnected:
 			if err := s.obs.Connect(ctx); err != nil {
 				s.setLastErr(err)
 				s.logger.Warn("connect OBS failed", "error", s.redactError(err))
 			} else {
 				s.logger.Info("connected to OBS")
+				if err := s.recoverPlaybackAfterOBSConnect(ctx); err != nil {
+					s.logger.Warn("resume playback failed", "error", s.redactError(err))
+				}
+			}
+		case obs.StateConnected:
+			if s.playbackState() == playbackIdle {
 				if err := s.recoverPlaybackAfterOBSConnect(ctx); err != nil {
 					s.logger.Warn("resume playback failed", "error", s.redactError(err))
 				}

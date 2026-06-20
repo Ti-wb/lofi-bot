@@ -365,6 +365,37 @@ func TestRecoverPlaybackAfterOBSConnectReplaysCurrent(t *testing.T) {
 	}
 }
 
+func TestRecoverPlaybackAfterOBSConnectFailureLeavesPlaybackIdleForRetry(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	ready := addReadyVideo(t, ctx, svc.store, "current.mp4")
+	playing, err := svc.store.MarkPlaying(ctx, ready.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	fakeOBS.playErr = errors.New("obs replay failed")
+	svc.setPlaybackState(playbackNormal, 0, "")
+
+	err = svc.recoverPlaybackAfterOBSConnect(ctx)
+
+	if err == nil {
+		t.Fatal("expected recover playback to fail")
+	}
+	if svc.playbackState() != playbackIdle {
+		t.Fatalf("playback state = %s, want %s", svc.playbackState(), playbackIdle)
+	}
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if current == nil || current.ID != playing.ID {
+		t.Fatalf("current = %#v, want playing id %d", current, playing.ID)
+	}
+	if got := svc.lastError(); !strings.Contains(got, "obs replay failed") {
+		t.Fatalf("last error = %q, want replay failure", got)
+	}
+}
+
 func TestRecoverPlaybackAfterOBSConnectRefreshesWatchdogDeadline(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "queue.db")
@@ -586,6 +617,17 @@ func TestPlaybackWatchdogIgnoresUnknownDuration(t *testing.T) {
 	}
 	if fakeOBS.lastPlayed != "" {
 		t.Fatalf("watchdog should not advance unknown duration, played %q", fakeOBS.lastPlayed)
+	}
+}
+
+func TestRunReturnsWhenBotStopsUnexpectedly(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+
+	err := svc.Run(ctx)
+
+	if err == nil || !strings.Contains(err.Error(), "telegram service stopped unexpectedly") {
+		t.Fatalf("err = %v, want unexpected telegram stop", err)
 	}
 }
 

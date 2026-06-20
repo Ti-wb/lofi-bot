@@ -52,11 +52,13 @@ On restart:
 
 - queued `ready` rows remain ordered by `queue_position`;
 - the reconnect loop tries OBS every 5 seconds;
+- if a row is still `playing`, OBS reconnect replays that file from its saved local path;
 - if OBS is connected and no row is `playing`, the next `ready` row starts.
 
 ## Failure Handling
 
 - OBS connection loss does not delete queue state.
+- OBS reconnect replays the current `playing` row instead of waiting for a playback-ended event that may never arrive after a process or OBS restart.
 - OBS playback failure leaves the next `ready` item in the queue instead of marking it played.
 - A canceled item cannot become `ready` after cancellation.
 - Retention cleanup removes old played queue rows by age and maximum file count.

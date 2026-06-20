@@ -567,6 +567,54 @@ func TestRunAdvancesUpdateOffset(t *testing.T) {
 	}
 }
 
+func TestRunSkipsStaleUpdates(t *testing.T) {
+	bot := &fakeBotAPI{
+		updateResponses: []updateResponse{
+			{updates: []tgbotapi.Update{
+				{UpdateID: 5, Message: commandMessage(42, "/queue")},
+			}},
+			{updates: []tgbotapi.Update{
+				{UpdateID: 5, Message: commandMessage(42, "/queue")},
+				{UpdateID: 6, Message: commandMessage(42, "/queue")},
+			}},
+		},
+		updateCalls: make(chan struct{}, 3),
+	}
+	svc := newTestService(t, bot)
+	svc.hooks.ListQueue = func(context.Context) (string, error) { return "queue", nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+
+	for i := 0; i < 3; i++ {
+		select {
+		case <-bot.updateCalls:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timed out waiting for get updates call %d", i+1)
+		}
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not stop after cancellation")
+	}
+	if bot.sendCount != 2 {
+		t.Fatalf("send calls = %d, want 2", bot.sendCount)
+	}
+	if got := bot.updateConfigs[2].Offset; got != 7 {
+		t.Fatalf("third poll offset = %d, want 7", got)
+	}
+}
+
 func TestUploadUsesLocalBotAPIFilePath(t *testing.T) {
 	bot := &fakeBotAPI{
 		file: tgbotapi.File{

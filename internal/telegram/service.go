@@ -200,9 +200,13 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 
 		for _, update := range updates {
-			if update.UpdateID >= updateConfig.Offset {
-				updateConfig.Offset = update.UpdateID + 1
+			if err := ctx.Err(); err != nil {
+				return err
 			}
+			if update.UpdateID < updateConfig.Offset {
+				continue
+			}
+			updateConfig.Offset = update.UpdateID + 1
 			s.handleUpdate(ctx, update)
 		}
 	}
