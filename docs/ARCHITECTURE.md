@@ -44,15 +44,17 @@ Text commands remain supported, but the bot also registers Telegram command menu
 
 ## Data Persistence
 
-SQLite persists all queue metadata under `DATABASE_PATH`, including the absolute local file path returned by Telegram Local Bot API Server. New uploads are not copied into `MEDIA_DIR`; their file lifecycle is owned by Telegram Local Bot API Server.
+SQLite persists all queue metadata under `DATABASE_PATH`, including the absolute local file path returned by Telegram Local Bot API Server. New uploads are not copied into `MEDIA_DIR`; their file lifecycle is owned by Telegram Local Bot API Server. The app resolves upload paths and requires them to be regular files under `TELEGRAM_BOT_API_DIR` before probing or handing them to OBS.
 
 The Go backend, Local Bot API Server, and OBS are expected to run on the same host. A multi-host setup must provide shared storage where the Local Bot API absolute file paths and OBS media paths are readable by the relevant processes.
 
 On restart:
 
 - queued `ready` rows remain ordered by `queue_position`;
-- the reconnect loop tries OBS every 5 seconds;
-- if a row is still `playing`, OBS reconnect replays that file from its saved local path;
+- stale `downloading` rows older than 6 hours are marked `failed`;
+- an existing `playing` row is restarted from its local file path after OBS reconnects, so a planned restart may replay the current video from the beginning;
+- if the current file is missing, that row is marked `failed` and playback advances;
+- the reconnect loop tries OBS every 5 seconds, with a per-attempt timeout;
 - if OBS is connected and no row is `playing`, the next `ready` row starts.
 
 ## Failure Handling

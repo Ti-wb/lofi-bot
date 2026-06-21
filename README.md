@@ -50,6 +50,7 @@ See [deploy/telegram-bot-api](deploy/telegram-bot-api/README.md) for Local Bot A
 cp .env.example .env
 make tidy
 ./run.sh doctor
+./run.sh build
 ./run.sh up
 ```
 
@@ -60,7 +61,7 @@ For unattended use with the portable shell environment, build first and keep `./
 ./run.sh up
 ```
 
-`./run.sh up` supervises the Telegram Local Bot API Server and `tg-obs-bot` separately. If either child exits, only that child is restarted with exponential backoff. You can set `RESTART_MIN_DELAY_SECONDS`, `RESTART_MAX_DELAY_SECONDS`, or `APP_BIN` to customize restart delays or the app binary path. Restart delays must be positive integers no larger than 86400 seconds.
+`./run.sh up` supervises the Telegram Local Bot API Server and `tg-obs-bot` separately. If either child exits, only that child is restarted with exponential backoff. The supervisor uses `dist/tg-obs-bot` when it is current; if the binary is missing or older than Go source files, it falls back to `go run` and prints a warning. You can set `RESTART_MIN_DELAY_SECONDS`, `RESTART_MAX_DELAY_SECONDS`, or `APP_BIN` to customize restart delays or the app binary path. Restart delays must be positive integers no larger than 86400 seconds.
 
 After changing `.env`, restart the root `./run.sh up` process so both child services inherit the same configuration.
 
@@ -72,7 +73,7 @@ Before deploying a new build, back up the production `.env`. You can run `./run.
 
 Numeric config values must be valid integers; malformed values fail startup instead of silently falling back to defaults. `OBS_PORT` must be `1..65535`; `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` must be positive; `MAX_VIDEO_DURATION_SECONDS`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES` may be `0` to disable that limit where supported.
 
-The stack helpers run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing the v2 Local Bot API defaults.
+The stack helpers run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing the v2 Local Bot API defaults. The Go app itself only reads config at startup; it does not rewrite `.env`.
 
 Build a local binary:
 
@@ -92,7 +93,7 @@ Common runtime commands:
 ./run.sh up              # supervise Telegram Local Bot API Server and tg-obs-bot
 ./run.sh app             # start only tg-obs-bot
 ./run.sh bot-api         # start only Telegram Local Bot API Server
-./run.sh health          # check local Telegram Bot API /getMe
+./run.sh health          # check local Telegram Bot API /getMe, not app or OBS readiness
 ./run.sh doctor          # check config, tools, data dir, and common ports
 ./run.sh env             # print sanitized runtime config
 ./run.sh migrate-env     # back up .env and append missing schema defaults

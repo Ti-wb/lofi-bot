@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,6 +17,7 @@ const currentEnvSchemaVersion = 2
 type Config struct {
 	TelegramBotToken   string
 	TelegramAPIBaseURL string
+	TelegramBotAPIDir  string
 	AllowedChatID      int64
 
 	OBSHost            string
@@ -39,9 +41,6 @@ type Config struct {
 }
 
 func Load() (Config, error) {
-	if err := migrateDotEnv(".env"); err != nil {
-		return Config{}, err
-	}
 	_ = loadDotEnv(".env")
 
 	allowedChatID, err := getenvInt64("ALLOWED_CHAT_ID", 0)
@@ -74,32 +73,39 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		TelegramBotToken:        getenv("TELEGRAM_BOT_TOKEN", ""),
-		TelegramAPIBaseURL:      strings.TrimRight(getenv("TELEGRAM_API_BASE_URL", ""), "/"),
+		TelegramBotToken:        strings.TrimSpace(getenv("TELEGRAM_BOT_TOKEN", "")),
+		TelegramAPIBaseURL:      strings.TrimRight(strings.TrimSpace(getenv("TELEGRAM_API_BASE_URL", "")), "/"),
+		TelegramBotAPIDir:       strings.TrimSpace(getenv("TELEGRAM_BOT_API_DIR", "./data/telegram-bot-api")),
 		AllowedChatID:           allowedChatID,
-		OBSHost:                 getenv("OBS_HOST", "127.0.0.1"),
+		OBSHost:                 strings.TrimSpace(getenv("OBS_HOST", "127.0.0.1")),
 		OBSPort:                 obsPort,
 		OBSPassword:             getenv("OBS_PASSWORD", ""),
 		OBSMediaSourceName:      strings.TrimSpace(getenv("OBS_MEDIA_SOURCE_NAME", "tg_queue_player")),
-		OBSFallbackFile:         getenv("OBS_FALLBACK_FILE", ""),
-		FallbackMode:            getenv("FALLBACK_MODE", "random_played"),
-		DataDir:                 getenv("DATA_DIR", "./data"),
+		OBSFallbackFile:         strings.TrimSpace(getenv("OBS_FALLBACK_FILE", "")),
+		FallbackMode:            strings.TrimSpace(getenv("FALLBACK_MODE", "random_played")),
+		DataDir:                 strings.TrimSpace(getenv("DATA_DIR", "./data")),
 		MaxVideoSizeBytes:       int64(maxVideoSizeMB) * 1024 * 1024,
 		MaxVideoDurationSeconds: maxVideoDurationSeconds,
 		MaxQueueLength:          maxQueueLength,
 		RetentionDays:           retentionDays,
 		RetentionMaxFiles:       retentionMaxFiles,
-		FFProbePath:             getenv("FFPROBE_PATH", "ffprobe"),
-		LogLevel:                parseLogLevel(getenv("LOG_LEVEL", "info")),
+		FFProbePath:             strings.TrimSpace(getenv("FFPROBE_PATH", "ffprobe")),
+		LogLevel:                parseLogLevel(strings.TrimSpace(getenv("LOG_LEVEL", "info"))),
 	}
-	cfg.MediaDir = getenv("MEDIA_DIR", filepath.Join(cfg.DataDir, "media"))
-	cfg.DatabasePath = getenv("DATABASE_PATH", filepath.Join(cfg.DataDir, "queue.db"))
+	cfg.MediaDir = strings.TrimSpace(getenv("MEDIA_DIR", filepath.Join(cfg.DataDir, "media")))
+	cfg.DatabasePath = strings.TrimSpace(getenv("DATABASE_PATH", filepath.Join(cfg.DataDir, "queue.db")))
 
 	if cfg.TelegramBotToken == "" {
 		return cfg, errors.New("TELEGRAM_BOT_TOKEN is required")
 	}
 	if cfg.TelegramAPIBaseURL == "" {
 		return cfg, errors.New("TELEGRAM_API_BASE_URL is required")
+	}
+	if err := validateHTTPURL("TELEGRAM_API_BASE_URL", cfg.TelegramAPIBaseURL); err != nil {
+		return cfg, err
+	}
+	if cfg.TelegramBotAPIDir == "" {
+		return cfg, errors.New("TELEGRAM_BOT_API_DIR is required")
 	}
 	if cfg.AllowedChatID == 0 {
 		return cfg, errors.New("ALLOWED_CHAT_ID is required")
@@ -130,6 +136,20 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func validateHTTPURL(key, raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s must be a valid URL: %w", key, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("%s must use http or https", key)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("%s must include a host", key)
+	}
+	return nil
 }
 
 func migrateDotEnv(path string) error {

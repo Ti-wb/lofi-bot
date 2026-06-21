@@ -21,6 +21,30 @@ info() {
   printf '%s\n' "$1" >&2
 }
 
+disable_xtrace() {
+  case $- in
+    *x*) set +x ;;
+  esac
+}
+
+reject_env_xtrace() {
+  awk '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line == "" || substr(line, 1, 1) == "#") {
+        next
+      }
+      if (line ~ /^set([[:space:]]|$)/ && line ~ /(^|[[:space:]])(-[^;#[:space:]]*x|-o[[:space:]]+xtrace|\+o[[:space:]]+xtrace)([;#[:space:]]|$)/) {
+        exit 1
+      }
+    }
+  ' "$ENV_FILE" || die ".env must not enable shell tracing"
+}
+
+disable_xtrace
+
 usage() {
   cat <<'EOF'
 Usage: ./run.sh <command>
@@ -220,10 +244,11 @@ migrate_env() {
 
 load_env() {
   migrate_env
-  set -a
+  reject_env_xtrace
+  disable_xtrace
   # shellcheck disable=SC1090
   . "$ENV_FILE"
-  set +a
+  disable_xtrace
 
   : "${TELEGRAM_BOT_API_BIN:=telegram-bot-api}"
   : "${TELEGRAM_BOT_API_HOST:=127.0.0.1}"
@@ -255,6 +280,74 @@ is_positive_integer() {
   esac
 }
 
+is_integer_value() {
+  printf '%s\n' "$1" | awk '/^-?[0-9]+$/ { exit 0 } { exit 1 }'
+}
+
+check_integer_range_env() {
+  key=$1
+  default_value=$2
+  min_value=$3
+  max_value=$4
+  eval "value=\${$key:-}"
+  if [ -z "$value" ]; then
+    value=$default_value
+  fi
+  if is_placeholder "$value"; then
+    return 0
+  fi
+  if ! is_integer_value "$value"; then
+    printf 'fail %s must be an integer\n' "$key"
+    return 1
+  fi
+  if ! awk -v value="$value" -v min="$min_value" -v max="$max_value" 'BEGIN { exit (value + 0 >= min && value + 0 <= max) ? 0 : 1 }'; then
+    printf 'fail %s must be between %s and %s\n' "$key" "$min_value" "$max_value"
+    return 1
+  fi
+  printf 'ok   %s numeric range\n' "$key"
+  return 0
+}
+
+check_nonzero_integer_env() {
+  key=$1
+  eval "value=\${$key:-}"
+  if is_placeholder "$value"; then
+    return 0
+  fi
+  if ! is_integer_value "$value"; then
+    printf 'fail %s must be an integer\n' "$key"
+    return 1
+  fi
+  case "$value" in
+    0|-0)
+      printf 'fail %s must be non-zero\n' "$key"
+      return 1
+      ;;
+  esac
+  printf 'ok   %s numeric value\n' "$key"
+  return 0
+}
+
+check_http_url_env() {
+  key=$1
+  eval "value=\${$key:-}"
+  if is_placeholder "$value"; then
+    return 0
+  fi
+  case "$value" in
+    http://*|https://*)
+      rest=${value#*://}
+      host=${rest%%/*}
+      if [ -n "$host" ]; then
+        printf 'ok   %s URL\n' "$key"
+        return 0
+      fi
+      ;;
+  esac
+  printf 'fail %s must be an http or https URL with a host\n' "$key"
+  return 1
+}
+
 require_stack_env() {
   require_value TELEGRAM_BOT_TOKEN
   require_value TELEGRAM_API_BASE_URL
@@ -275,15 +368,27 @@ ensure_go_cache() {
   mkdir -p "$GO_CACHE_DIR" "$GO_MOD_CACHE_DIR"
 }
 
+app_sources_newer_than_bin() {
+  [ -x "$DEFAULT_APP_BIN" ] || return 1
+  newer_files=$(find "$REPO_ROOT/cmd" "$REPO_ROOT/internal" "$REPO_ROOT/go.mod" "$REPO_ROOT/go.sum" -type f -newer "$DEFAULT_APP_BIN" -print 2>/dev/null) || return 0
+  [ -n "$newer_files" ] && return 0
+  return 1
+}
+
 run_app_process() {
   cd "$REPO_ROOT"
   if [ -n "${APP_BIN:-}" ]; then
     exec "$APP_BIN"
   fi
   if [ -x "$DEFAULT_APP_BIN" ]; then
-    exec "$DEFAULT_APP_BIN"
+    if app_sources_newer_than_bin; then
+      info "Built binary at $DEFAULT_APP_BIN is older than Go sources; falling back to go run. Run ./run.sh build before unattended production use."
+    else
+      exec "$DEFAULT_APP_BIN"
+    fi
+  else
+    info "Built binary not found at $DEFAULT_APP_BIN; falling back to go run. Run ./run.sh build for production."
   fi
-  info "Built binary not found at $DEFAULT_APP_BIN; falling back to go run. Run ./run.sh build for production."
   exec env GOCACHE="$GO_CACHE_DIR" GOMODCACHE="$GO_MOD_CACHE_DIR" "${GO:-go}" run ./cmd/tg-obs-bot
 }
 
@@ -463,6 +568,32 @@ doctor() {
       printf 'ok   %s\n' "$key"
     else
       printf 'fail %s is required\n' "$key"
+      failures=$((failures + 1))
+    fi
+  done
+
+  if ! check_nonzero_integer_env ALLOWED_CHAT_ID; then
+    failures=$((failures + 1))
+  fi
+  if ! check_http_url_env TELEGRAM_API_BASE_URL; then
+    failures=$((failures + 1))
+  fi
+  for item in \
+    "OBS_PORT:4455:1:65535" \
+    "TELEGRAM_BOT_API_PORT:8081:1:65535" \
+    "MAX_VIDEO_SIZE_MB:2000:1:2147483647" \
+    "MAX_VIDEO_DURATION_SECONDS:7200:0:2147483647" \
+    "MAX_QUEUE_LENGTH:50:1:2147483647" \
+    "RETENTION_DAYS:7:0:2147483647" \
+    "RETENTION_MAX_FILES:100:0:2147483647"
+  do
+    key=${item%%:*}
+    rest=${item#*:}
+    default_value=${rest%%:*}
+    rest=${rest#*:}
+    min_value=${rest%%:*}
+    max_value=${rest#*:}
+    if ! check_integer_range_env "$key" "$default_value" "$min_value" "$max_value"; then
       failures=$((failures + 1))
     fi
   done

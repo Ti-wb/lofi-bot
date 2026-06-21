@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -22,7 +23,7 @@ import (
 func TestRandomFallbackStartsAndNotifiesOnce(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS, fakeBot := newFallbackTestService(t, config.Config{FallbackMode: "random_played"})
-	played := addPlayedVideo(t, ctx, svc.store, "history.mp4", true)
+	played := addPlayedVideo(t, ctx, svc, "history.mp4", true)
 
 	if video, err := svc.advancePlayback(ctx); err != nil || video != nil {
 		t.Fatalf("first advance video=%#v err=%v", video, err)
@@ -74,12 +75,12 @@ func TestFallbackEndedEventAdvancesFallbackPlayback(t *testing.T) {
 func TestReadyQueueTakesPriorityAfterFallbackEnds(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS, _ := newFallbackTestService(t, config.Config{FallbackMode: "random_played"})
-	_ = addPlayedVideo(t, ctx, svc.store, "history.mp4", true)
+	_ = addPlayedVideo(t, ctx, svc, "history.mp4", true)
 
 	if _, err := svc.advancePlayback(ctx); err != nil {
 		t.Fatalf("start fallback: %v", err)
 	}
-	ready := addReadyVideo(t, ctx, svc.store, "ready.mp4")
+	ready := addReadyVideo(t, ctx, svc, "ready.mp4")
 
 	video, err := svc.advancePlayback(ctx)
 	if err != nil {
@@ -103,9 +104,9 @@ func TestCleanupRetentionSkipsCurrentRandomFallback(t *testing.T) {
 		RetentionMaxFiles: 1,
 		RetentionDays:     0,
 	})
-	locked := addPlayedVideo(t, ctx, svc.store, "locked.mp4", true)
+	locked := addPlayedVideo(t, ctx, svc, "locked.mp4", true)
 	time.Sleep(time.Millisecond)
-	_ = addPlayedVideo(t, ctx, svc.store, "other.mp4", true)
+	_ = addPlayedVideo(t, ctx, svc, "other.mp4", true)
 	svc.setPlaybackState(playbackRandom, locked.ID, locked.LocalPath)
 
 	if err := svc.CleanupRetention(ctx); err != nil {
@@ -126,9 +127,9 @@ func TestCleanupRetentionDoesNotDeleteLocalBotAPIFile(t *testing.T) {
 		RetentionMaxFiles: 1,
 		RetentionDays:     0,
 	})
-	removeCandidate := addPlayedVideo(t, ctx, svc.store, "old.mp4", true)
+	removeCandidate := addPlayedVideo(t, ctx, svc, "old.mp4", true)
 	time.Sleep(time.Millisecond)
-	keepCandidate := addPlayedVideo(t, ctx, svc.store, "new.mp4", true)
+	keepCandidate := addPlayedVideo(t, ctx, svc, "new.mp4", true)
 
 	if err := svc.CleanupRetention(ctx); err != nil {
 		t.Fatalf("cleanup: %v", err)
@@ -152,7 +153,7 @@ func TestMissingRandomFallbackUsesStaticFile(t *testing.T) {
 		FallbackMode:    "random_played",
 		OBSFallbackFile: staticPath,
 	})
-	_ = addPlayedVideo(t, ctx, svc.store, "missing.mp4", false)
+	_ = addPlayedVideo(t, ctx, svc, "missing.mp4", false)
 
 	if video, err := svc.advancePlayback(ctx); err != nil || video != nil {
 		t.Fatalf("advance video=%#v err=%v", video, err)
@@ -162,6 +163,27 @@ func TestMissingRandomFallbackUsesStaticFile(t *testing.T) {
 	}
 	if svc.playbackState() != playbackFile {
 		t.Fatalf("playback state = %s, want %s", svc.playbackState(), playbackFile)
+	}
+}
+
+func TestRandomFallbackSearchesPastNewestInvalidCandidates(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newFallbackTestService(t, config.Config{FallbackMode: "random_played"})
+	validOlder := addPlayedVideo(t, ctx, svc, "valid-older.mp4", true)
+	time.Sleep(time.Millisecond)
+	for i := 0; i < 101; i++ {
+		_ = addPlayedVideo(t, ctx, svc, fmt.Sprintf("missing-newer-%03d.mp4", i), false)
+	}
+
+	video, err := svc.playRandomFallbackLocked(ctx)
+	if err != nil {
+		t.Fatalf("play random fallback: %v", err)
+	}
+	if video == nil || video.ID != validOlder.ID {
+		t.Fatalf("fallback video = %#v, want older valid id %d", video, validOlder.ID)
+	}
+	if fakeOBS.lastPlayed != validOlder.LocalPath {
+		t.Fatalf("played path = %q, want %q", fakeOBS.lastPlayed, validOlder.LocalPath)
 	}
 }
 
@@ -195,8 +217,7 @@ func TestEnqueueUploadUsesLocalPath(t *testing.T) {
 		MaxVideoSizeBytes:       1024,
 		MaxVideoDurationSeconds: 120,
 	})
-	path := filepath.Join(t.TempDir(), "upload.mp4")
-	writeTestFile(t, path)
+	path := writeBotAPIFile(t, svc, "upload.mp4")
 
 	video, err := svc.EnqueueUpload(ctx, UploadRequest{
 		LocalPath:        path,
@@ -230,8 +251,7 @@ func TestEnqueueUploadMarksFailedWhenProbeFails(t *testing.T) {
 		t.Fatalf("new media manager: %v", err)
 	}
 	svc.media = manager
-	path := filepath.Join(t.TempDir(), "bad-probe.mp4")
-	writeTestFile(t, path)
+	path := writeBotAPIFile(t, svc, "bad-probe.mp4")
 
 	_, err = svc.EnqueueUpload(ctx, UploadRequest{
 		LocalPath:        path,
@@ -252,8 +272,7 @@ func TestEnqueueUploadMarksFailedWhenValidateFails(t *testing.T) {
 		MaxVideoSizeBytes:       1024,
 		MaxVideoDurationSeconds: 30,
 	})
-	path := filepath.Join(t.TempDir(), "too-long.mp4")
-	writeTestFile(t, path)
+	path := writeBotAPIFile(t, svc, "too-long.mp4")
 
 	_, err := svc.EnqueueUpload(ctx, UploadRequest{
 		LocalPath:        path,
@@ -268,10 +287,75 @@ func TestEnqueueUploadMarksFailedWhenValidateFails(t *testing.T) {
 	assertFailedUploadVisible(t, ctx, svc, "too-long.mp4", "video exceeds max duration")
 }
 
+func TestEnqueueUploadRejectsPathOutsideLocalBotAPIDir(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newLocalUploadTestService(t, config.Config{
+		MaxVideoSizeBytes:       1024,
+		MaxVideoDurationSeconds: 120,
+	})
+	path := filepath.Join(t.TempDir(), "outside.mp4")
+	writeTestFile(t, path)
+
+	_, err := svc.EnqueueUpload(ctx, UploadRequest{
+		LocalPath:        path,
+		TelegramFileID:   "file",
+		TelegramUniqueID: "unique",
+		FileName:         "outside.mp4",
+		SizeBytes:        5,
+	})
+	if err == nil || !strings.Contains(err.Error(), "outside TELEGRAM_BOT_API_DIR") {
+		t.Fatalf("err = %v, want outside bot api dir error", err)
+	}
+	if length, lengthErr := svc.store.QueueLength(ctx); lengthErr != nil {
+		t.Fatalf("queue length: %v", lengthErr)
+	} else if length != 0 {
+		t.Fatalf("queue length = %d, want 0", length)
+	}
+}
+
+func TestAdvancePlaybackSkipsStoredPathOutsideLocalBotAPIDir(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	outsidePath := filepath.Join(t.TempDir(), "outside-ready.mp4")
+	writeTestFile(t, outsidePath)
+	video, err := svc.store.AddDownloading(ctx, queue.Video{
+		TelegramFileID:   "outside",
+		TelegramUniqueID: "outside",
+		FileName:         "outside-ready.mp4",
+		LocalPath:        outsidePath,
+	})
+	if err != nil {
+		t.Fatalf("add outside downloading: %v", err)
+	}
+	invalidReady, err := svc.store.MarkReady(ctx, video.ID, outsidePath, 100, 60)
+	if err != nil {
+		t.Fatalf("mark outside ready: %v", err)
+	}
+	validReady := addReadyVideo(t, ctx, svc, "valid-ready.mp4")
+
+	playing, err := svc.advancePlayback(ctx)
+	if err != nil {
+		t.Fatalf("advance playback: %v", err)
+	}
+	if playing == nil || playing.ID != validReady.ID {
+		t.Fatalf("playing = %#v, want valid id %d", playing, validReady.ID)
+	}
+	if fakeOBS.lastPlayed != validReady.LocalPath {
+		t.Fatalf("played path = %q, want %q", fakeOBS.lastPlayed, validReady.LocalPath)
+	}
+	storedInvalid, err := svc.store.Get(ctx, invalidReady.ID)
+	if err != nil {
+		t.Fatalf("get invalid ready: %v", err)
+	}
+	if storedInvalid.Status != queue.StatusFailed {
+		t.Fatalf("invalid status = %s, want %s", storedInvalid.Status, queue.StatusFailed)
+	}
+}
+
 func TestAdvancePlaybackDoesNotMarkReadyPlayedWhenOBSPlayFails(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
-	ready := addReadyVideo(t, ctx, svc.store, "ready.mp4")
+	ready := addReadyVideo(t, ctx, svc, "ready.mp4")
 	fakeOBS.playErr = errors.New("obs play failed")
 
 	video, err := svc.advancePlayback(ctx)
@@ -341,10 +425,39 @@ func TestStatusTextRedactsLastErrorSecrets(t *testing.T) {
 	}
 }
 
+func TestRecoveredPlaybackLogRedactsPathSecrets(t *testing.T) {
+	const token = "123456:ABCdefghi_jklmnop"
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "bot"+token)
+	svc, _, _ := newLocalUploadTestService(t, config.Config{
+		FallbackMode:      "off",
+		TelegramBotToken:  token,
+		TelegramBotAPIDir: root,
+	})
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	ready := addReadyVideo(t, ctx, svc, "current.mp4")
+	if _, err := svc.store.MarkPlaying(ctx, ready.ID); err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+
+	if err := svc.recoverPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover playback: %v", err)
+	}
+
+	got := logs.String()
+	if strings.Contains(got, token) {
+		t.Fatalf("log leaked token in path: %q", got)
+	}
+	if !strings.Contains(got, "<redacted>") {
+		t.Fatalf("log = %q, want redacted marker", got)
+	}
+}
+
 func TestRecoverPlaybackAfterOBSConnectReplaysCurrent(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
-	ready := addReadyVideo(t, ctx, svc.store, "current.mp4")
+	ready := addReadyVideo(t, ctx, svc, "current.mp4")
 	playing, err := svc.store.MarkPlaying(ctx, ready.ID)
 	if err != nil {
 		t.Fatalf("mark playing: %v", err)
@@ -368,7 +481,7 @@ func TestRecoverPlaybackAfterOBSConnectReplaysCurrent(t *testing.T) {
 func TestRecoverPlaybackAfterOBSConnectFailureLeavesPlaybackIdleForRetry(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
-	ready := addReadyVideo(t, ctx, svc.store, "current.mp4")
+	ready := addReadyVideo(t, ctx, svc, "current.mp4")
 	playing, err := svc.store.MarkPlaying(ctx, ready.ID)
 	if err != nil {
 		t.Fatalf("mark playing: %v", err)
@@ -400,7 +513,7 @@ func TestRecoverPlaybackAfterOBSConnectRefreshesWatchdogDeadline(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "queue.db")
 	svc, _, _ := newFallbackTestServiceAtDBPath(t, config.Config{FallbackMode: "off"}, dbPath)
-	ready := addReadyVideoWithDuration(t, ctx, svc.store, "current.mp4", 30)
+	ready := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 30)
 	playing, err := svc.store.MarkPlaying(ctx, ready.ID)
 	if err != nil {
 		t.Fatalf("mark playing: %v", err)
@@ -416,7 +529,7 @@ UPDATE videos SET started_at = ?, updated_at = ? WHERE id = ?
 `, formatQueueTime(oldStarted), formatQueueTime(oldStarted), playing.ID); err != nil {
 		t.Fatalf("age current started_at: %v", err)
 	}
-	_ = addReadyVideo(t, ctx, svc.store, "next.mp4")
+	_ = addReadyVideo(t, ctx, svc, "next.mp4")
 
 	if err := svc.recoverPlaybackAfterOBSConnect(ctx); err != nil {
 		t.Fatalf("recover playback: %v", err)
@@ -471,7 +584,7 @@ func TestRecoverPlaybackAfterOBSConnectRestartsFallbackWhenNoCurrent(t *testing.
 func TestRecoverPlaybackAfterOBSConnectSkipsMissingCurrent(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
-	missing := addReadyVideo(t, ctx, svc.store, "missing-current.mp4")
+	missing := addReadyVideo(t, ctx, svc, "missing-current.mp4")
 	playing, err := svc.store.MarkPlaying(ctx, missing.ID)
 	if err != nil {
 		t.Fatalf("mark playing: %v", err)
@@ -479,7 +592,7 @@ func TestRecoverPlaybackAfterOBSConnectSkipsMissingCurrent(t *testing.T) {
 	if err := osRemove(playing.LocalPath); err != nil {
 		t.Fatalf("remove current file: %v", err)
 	}
-	next := addReadyVideo(t, ctx, svc.store, "next.mp4")
+	next := addReadyVideo(t, ctx, svc, "next.mp4")
 
 	if err := svc.recoverPlaybackAfterOBSConnect(ctx); err != nil {
 		t.Fatalf("recover playback: %v", err)
@@ -506,12 +619,12 @@ func TestRecoverPlaybackAfterOBSConnectSkipsMissingCurrent(t *testing.T) {
 func TestPlaybackWatchdogAdvancesExpiredCurrent(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS, fakeBot := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
-	currentReady := addReadyVideoWithDuration(t, ctx, svc.store, "current.mp4", 30)
+	currentReady := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 30)
 	playing, err := svc.store.MarkPlaying(ctx, currentReady.ID)
 	if err != nil {
 		t.Fatalf("mark playing: %v", err)
 	}
-	next := addReadyVideo(t, ctx, svc.store, "next.mp4")
+	next := addReadyVideo(t, ctx, svc, "next.mp4")
 	svc.now = func() time.Time {
 		return playing.StartedAt.Add(30*time.Second + playbackWatchdogGrace + time.Second)
 	}
@@ -544,13 +657,13 @@ func TestPlaybackWatchdogAdvancesExpiredCurrent(t *testing.T) {
 func TestEarlyStaleOBSEndedEventDoesNotSkipCurrentAfterWatchdogAdvance(t *testing.T) {
 	ctx := context.Background()
 	svc, _, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
-	firstReady := addReadyVideoWithDuration(t, ctx, svc.store, "first.mp4", 30)
+	firstReady := addReadyVideoWithDuration(t, ctx, svc, "first.mp4", 30)
 	firstPlaying, err := svc.store.MarkPlaying(ctx, firstReady.ID)
 	if err != nil {
 		t.Fatalf("mark first playing: %v", err)
 	}
-	second := addReadyVideo(t, ctx, svc.store, "second.mp4")
-	third := addReadyVideo(t, ctx, svc.store, "third.mp4")
+	second := addReadyVideo(t, ctx, svc, "second.mp4")
+	third := addReadyVideo(t, ctx, svc, "third.mp4")
 	svc.now = func() time.Time {
 		return firstPlaying.StartedAt.Add(30*time.Second + playbackWatchdogGrace + time.Second)
 	}
@@ -595,12 +708,12 @@ func TestEarlyStaleOBSEndedEventDoesNotSkipCurrentAfterWatchdogAdvance(t *testin
 func TestPlaybackWatchdogIgnoresUnknownDuration(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
-	currentReady := addReadyVideoWithDuration(t, ctx, svc.store, "current.mp4", 0)
+	currentReady := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 0)
 	playing, err := svc.store.MarkPlaying(ctx, currentReady.ID)
 	if err != nil {
 		t.Fatalf("mark playing: %v", err)
 	}
-	_ = addReadyVideo(t, ctx, svc.store, "next.mp4")
+	_ = addReadyVideo(t, ctx, svc, "next.mp4")
 	svc.now = func() time.Time {
 		return playing.StartedAt.Add(24 * time.Hour)
 	}
@@ -637,8 +750,7 @@ func TestRemoveQueuedDoesNotDeleteLocalBotAPIFile(t *testing.T) {
 		MaxVideoSizeBytes:       1024,
 		MaxVideoDurationSeconds: 120,
 	})
-	path := filepath.Join(t.TempDir(), "upload.mp4")
-	writeTestFile(t, path)
+	path := writeBotAPIFile(t, svc, "upload.mp4")
 
 	video, err := svc.EnqueueUpload(ctx, UploadRequest{
 		LocalPath:        path,
@@ -653,7 +765,7 @@ func TestRemoveQueuedDoesNotDeleteLocalBotAPIFile(t *testing.T) {
 	if err := svc.store.FinishCurrent(ctx); err != nil {
 		t.Fatalf("finish current: %v", err)
 	}
-	ready := addReadyVideo(t, ctx, svc.store, "queued.mp4")
+	ready := addReadyVideo(t, ctx, svc, "queued.mp4")
 	if err := svc.RemoveQueued(ctx, ready.ID); err != nil {
 		t.Fatalf("remove queued: %v", err)
 	}
@@ -725,6 +837,12 @@ func newFallbackTestServiceAtDBPath(t *testing.T, cfg config.Config, dbPath stri
 	if cfg.RetentionMaxFiles == 0 {
 		cfg.RetentionMaxFiles = 100
 	}
+	if cfg.TelegramBotAPIDir == "" {
+		cfg.TelegramBotAPIDir = t.TempDir()
+	}
+	if err := os.MkdirAll(cfg.TelegramBotAPIDir, 0o755); err != nil {
+		t.Fatalf("create telegram bot api dir: %v", err)
+	}
 	cfg.AllowedChatID = -100123
 	fakeOBS := &fakeOBS{state: obs.StateConnected}
 	fakeBot := &fakeBot{}
@@ -756,14 +874,15 @@ func newLocalUploadTestService(t *testing.T, cfg config.Config) (*Service, *fake
 	return svc, fakeOBS, fakeBot
 }
 
-func addReadyVideo(t *testing.T, ctx context.Context, store *queue.Store, name string) queue.Video {
+func addReadyVideo(t *testing.T, ctx context.Context, svc *Service, name string) queue.Video {
 	t.Helper()
-	return addReadyVideoWithDuration(t, ctx, store, name, 60)
+	return addReadyVideoWithDuration(t, ctx, svc, name, 60)
 }
 
-func addReadyVideoWithDuration(t *testing.T, ctx context.Context, store *queue.Store, name string, durationSeconds int) queue.Video {
+func addReadyVideoWithDuration(t *testing.T, ctx context.Context, svc *Service, name string, durationSeconds int) queue.Video {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), name)
+	store := svc.store
+	path := filepath.Join(svc.cfg.TelegramBotAPIDir, name)
 	writeTestFile(t, path)
 	video, err := store.AddDownloading(ctx, queue.Video{
 		TelegramFileID:   name,
@@ -781,9 +900,10 @@ func addReadyVideoWithDuration(t *testing.T, ctx context.Context, store *queue.S
 	return ready
 }
 
-func addPlayedVideo(t *testing.T, ctx context.Context, store *queue.Store, name string, createFile bool) queue.Video {
+func addPlayedVideo(t *testing.T, ctx context.Context, svc *Service, name string, createFile bool) queue.Video {
 	t.Helper()
-	ready := addReadyVideo(t, ctx, store, name)
+	store := svc.store
+	ready := addReadyVideo(t, ctx, svc, name)
 	if !createFile {
 		if err := osRemove(ready.LocalPath); err != nil {
 			t.Fatalf("remove test file: %v", err)
@@ -805,9 +925,19 @@ func addPlayedVideo(t *testing.T, ctx context.Context, store *queue.Store, name 
 
 func writeTestFile(t *testing.T, path string) {
 	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create file parent: %v", err)
+	}
 	if err := osWriteFile(path, []byte("video"), 0o600); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
+}
+
+func writeBotAPIFile(t *testing.T, svc *Service, name string) string {
+	t.Helper()
+	path := filepath.Join(svc.cfg.TelegramBotAPIDir, name)
+	writeTestFile(t, path)
+	return path
 }
 
 func fakeFFProbe(t *testing.T, duration int) string {

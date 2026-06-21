@@ -65,6 +65,9 @@ const (
 	playbackWatchdogGrace    = 60 * time.Second
 	obsEndedEarlyTolerance   = 2 * time.Second
 	staleDownloadingAge      = 6 * time.Hour
+	obsConnectAttemptTimeout = 15 * time.Second
+	uploadProbeTimeout       = 2 * time.Minute
+	uploadFailureTimeout     = 5 * time.Second
 )
 
 type UploadRequest struct {
@@ -78,6 +81,16 @@ type UploadRequest struct {
 	FileName         string
 	MimeType         string
 	SizeBytes        int64
+}
+
+type publicError string
+
+func (e publicError) Error() string {
+	return string(e)
+}
+
+func (e publicError) PublicMessage() string {
+	return string(e)
 }
 
 func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
@@ -139,19 +152,38 @@ func (s *Service) Close() {
 }
 
 func (s *Service) Run(ctx context.Context) error {
-	s.logger.Info("tg-obs-bot starting", "database", s.cfg.DatabasePath, "media_dir", s.cfg.MediaDir)
+	s.logger.Info("tg-obs-bot starting", "database", s.redactString(s.cfg.DatabasePath), "media_dir", s.redactString(s.cfg.MediaDir))
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
 
 	if err := s.recoverStartupState(ctx); err != nil {
 		return err
 	}
 
-	errCh := make(chan error, 4)
-	go func() { errCh <- s.bot.Run(ctx) }()
-	go s.obsReconnectLoop(ctx)
-	go s.obsEventLoop(ctx)
-	go s.playbackWatchdogLoop(ctx)
+	errCh := make(chan error, 1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := s.bot.Run(ctx)
+		select {
+		case errCh <- err:
+		case <-ctx.Done():
+		}
+	}()
+	startLoop := func(loop func(context.Context)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			loop(ctx)
+		}()
+	}
+	startLoop(s.obsReconnectLoop)
+	startLoop(s.obsEventLoop)
+	startLoop(s.playbackWatchdogLoop)
 
 	cleanupTicker := time.NewTicker(10 * time.Minute)
 	defer cleanupTicker.Stop()
@@ -167,6 +199,7 @@ func (s *Service) Run(ctx context.Context) error {
 			if err == nil {
 				return errors.New("telegram service stopped unexpectedly")
 			}
+			cancel()
 			return err
 		case <-cleanupTicker.C:
 			if err := s.CleanupRetention(ctx); err != nil {
@@ -179,7 +212,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 func (s *Service) EnqueueUpload(ctx context.Context, req UploadRequest) (queue.Video, error) {
 	if req.SizeBytes > s.cfg.MaxVideoSizeBytes {
-		err := fmt.Errorf("檔案太大，上限是 %s", formatBytes(s.cfg.MaxVideoSizeBytes))
+		err := publicError(fmt.Sprintf("檔案太大，上限是 %s", formatBytes(s.cfg.MaxVideoSizeBytes)))
 		s.setLastErr(err)
 		return queue.Video{}, err
 	}
@@ -193,6 +226,10 @@ func (s *Service) EnqueueUpload(ctx context.Context, req UploadRequest) (queue.V
 		s.setLastErr(err)
 		return queue.Video{}, err
 	}
+	if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, req.LocalPath); err != nil {
+		s.setLastErr(err)
+		return queue.Video{}, err
+	}
 
 	length, err := s.store.QueueLength(ctx)
 	if err != nil {
@@ -200,7 +237,7 @@ func (s *Service) EnqueueUpload(ctx context.Context, req UploadRequest) (queue.V
 		return queue.Video{}, err
 	}
 	if length >= s.cfg.MaxQueueLength {
-		err := fmt.Errorf("佇列已滿，目前上限是 %d 支", s.cfg.MaxQueueLength)
+		err := publicError(fmt.Sprintf("佇列已滿，目前上限是 %d 支", s.cfg.MaxQueueLength))
 		s.setLastErr(err)
 		return queue.Video{}, err
 	}
@@ -222,14 +259,16 @@ func (s *Service) EnqueueUpload(ctx context.Context, req UploadRequest) (queue.V
 		return queue.Video{}, err
 	}
 
-	meta, err := s.media.Probe(ctx, req.LocalPath)
+	probeCtx, cancelProbe := context.WithTimeout(ctx, uploadProbeTimeout)
+	meta, err := s.media.Probe(probeCtx, req.LocalPath)
+	cancelProbe()
 	if err != nil {
-		_ = s.store.MarkFailed(ctx, video.ID, err.Error())
+		s.markUploadFailed(ctx, video.ID, err)
 		s.setLastErr(err)
 		return queue.Video{}, err
 	}
 	if err := s.media.Validate(meta, s.cfg.MaxVideoSizeBytes, s.cfg.MaxVideoDurationSeconds); err != nil {
-		_ = s.store.MarkFailed(ctx, video.ID, err.Error())
+		s.markUploadFailed(ctx, video.ID, err)
 		s.setLastErr(err)
 		return queue.Video{}, err
 	}
@@ -285,26 +324,37 @@ func (s *Service) advancePlaybackLockedAfter(ctx context.Context, expectedCurren
 		return nil, err
 	}
 
-	video, err := s.store.NextReady(ctx)
-	if err != nil {
-		s.setLastErr(err)
-		return nil, err
+	for {
+		video, err := s.store.NextReady(ctx)
+		if err != nil {
+			s.setLastErr(err)
+			return nil, err
+		}
+		if video == nil {
+			return nil, s.advanceFallbackLocked(ctx)
+		}
+		if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, video.LocalPath); err != nil {
+			if markErr := s.store.MarkFailed(ctx, video.ID, err.Error()); markErr != nil {
+				s.setLastErr(markErr)
+				return nil, markErr
+			}
+			s.setLastErr(err)
+			s.logger.Warn("skip invalid ready video path", "video_id", video.ID, "path", s.redactString(video.LocalPath), "error", s.redactError(err))
+			continue
+		}
+		if err := s.obs.PlayFile(ctx, video.LocalPath); err != nil {
+			s.setLastErr(err)
+			return nil, err
+		}
+		playing, err := s.store.MarkPlaying(ctx, video.ID)
+		if err != nil {
+			_ = s.obs.StopCurrent(ctx)
+			s.setLastErr(err)
+			return nil, err
+		}
+		s.setPlaybackState(playbackNormal, 0, "")
+		return &playing, nil
 	}
-	if video == nil {
-		return nil, s.advanceFallbackLocked(ctx)
-	}
-	if err := s.obs.PlayFile(ctx, video.LocalPath); err != nil {
-		s.setLastErr(err)
-		return nil, err
-	}
-	playing, err := s.store.MarkPlaying(ctx, video.ID)
-	if err != nil {
-		_ = s.obs.StopCurrent(ctx)
-		s.setLastErr(err)
-		return nil, err
-	}
-	s.setPlaybackState(playbackNormal, 0, "")
-	return &playing, nil
 }
 
 func (s *Service) playIfIdle(ctx context.Context) error {
@@ -343,22 +393,13 @@ func (s *Service) recoverPlaybackAfterOBSConnect(ctx context.Context) error {
 		s.setPlaybackState(playbackIdle, 0, "")
 		return s.playIfIdleLocked(ctx)
 	}
-	if strings.TrimSpace(current.LocalPath) == "" {
-		err := fmt.Errorf("current video #%d has no local media path", current.ID)
-		if markErr := s.store.MarkFailed(ctx, current.ID, err.Error()); markErr != nil {
-			return markErr
-		}
-		s.setLastErr(err)
-		s.setPlaybackState(playbackIdle, 0, "")
-		return s.playIfIdleLocked(ctx)
-	}
-	if _, err := os.Stat(current.LocalPath); err != nil {
-		recoveryErr := fmt.Errorf("current video #%d media file is unavailable: %w", current.ID, err)
+	if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, current.LocalPath); err != nil {
+		recoveryErr := fmt.Errorf("current video #%d media path is invalid: %w", current.ID, err)
 		if markErr := s.store.MarkFailed(ctx, current.ID, recoveryErr.Error()); markErr != nil {
 			return markErr
 		}
 		s.setLastErr(recoveryErr)
-		s.logger.Warn("mark missing current video failed", "video_id", current.ID, "path", current.LocalPath, "error", s.redactError(err))
+		s.logger.Warn("mark invalid current video failed", "video_id", current.ID, "path", s.redactString(current.LocalPath), "error", s.redactError(err))
 		s.setPlaybackState(playbackIdle, 0, "")
 		return s.playIfIdleLocked(ctx)
 	}
@@ -372,7 +413,7 @@ func (s *Service) recoverPlaybackAfterOBSConnect(ctx context.Context) error {
 		return err
 	}
 	s.setPlaybackState(playbackNormal, 0, "")
-	s.logger.Info("recovered OBS playback", "video_id", current.ID, "path", current.LocalPath)
+	s.logger.Info("recovered OBS playback", "video_id", current.ID, "path", s.redactString(current.LocalPath))
 	return nil
 }
 
@@ -451,11 +492,8 @@ func (s *Service) playRandomFallbackLocked(ctx context.Context) (*queue.Video, e
 		idx := rand.Intn(len(candidates))
 		video := candidates[idx]
 		candidates = append(candidates[:idx], candidates[idx+1:]...)
-		if video.LocalPath == "" {
-			continue
-		}
-		if _, err := os.Stat(video.LocalPath); err != nil {
-			s.logger.Warn("skip missing random fallback file", "video_id", video.ID, "path", video.LocalPath, "error", s.redactError(err))
+		if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, video.LocalPath); err != nil {
+			s.logger.Warn("skip invalid random fallback file", "video_id", video.ID, "path", s.redactString(video.LocalPath), "error", s.redactError(err))
 			continue
 		}
 		if err := s.obs.PlayFile(ctx, video.LocalPath); err != nil {
@@ -543,12 +581,16 @@ func (s *Service) StatusText(ctx context.Context, obsConnected bool) (string, er
 	if usage, err := s.media.DiskUsage(); err == nil {
 		diskText = fmt.Sprintf("%s free / %s total", formatBytes(int64(usage.AvailableBytes)), formatBytes(int64(usage.TotalBytes)))
 	}
+	botAPIDiskText := "未知"
+	if usage, err := media.DiskUsageForPath(s.cfg.TelegramBotAPIDir); err == nil {
+		botAPIDiskText = fmt.Sprintf("%s free / %s total", formatBytes(int64(usage.AvailableBytes)), formatBytes(int64(usage.TotalBytes)))
+	}
 	lastErr := s.lastError()
 	if lastErr == "" {
 		lastErr = "無"
 	}
 	return fmt.Sprintf(
-		"狀態：\nOBS：%s\nReady：%d\nDownloading：%d\nPlayed：%d\nFailed：%d\nFallback：%s (%s)\nMedia DB：%s\nDisk：%s\nLast error：%s",
+		"狀態：\nOBS：%s\nReady：%d\nDownloading：%d\nPlayed：%d\nFailed：%d\nFallback：%s (%s)\nMedia DB：%s\nMedia Disk：%s\nBot API Disk：%s\nLast error：%s",
 		boolText(obsConnected),
 		stats.ReadyCount,
 		stats.DownloadingCount,
@@ -558,6 +600,7 @@ func (s *Service) StatusText(ctx context.Context, obsConnected bool) (string, er
 		s.playbackState(),
 		formatBytes(stats.TotalBytes),
 		diskText,
+		botAPIDiskText,
 		lastErr,
 	), nil
 }
@@ -610,7 +653,10 @@ func (s *Service) obsReconnectLoop(ctx context.Context) {
 	for {
 		switch s.obs.Status().State {
 		case obs.StateDisconnected:
-			if err := s.obs.Connect(ctx); err != nil {
+			connectCtx, cancelConnect := context.WithTimeout(ctx, obsConnectAttemptTimeout)
+			err := s.obs.Connect(connectCtx)
+			cancelConnect()
+			if err != nil {
 				s.setLastErr(err)
 				s.logger.Warn("connect OBS failed", "error", s.redactError(err))
 			} else {
@@ -730,7 +776,7 @@ func (s *Service) advancePlaybackForEndedEvent(ctx context.Context, event obs.Ev
 		if s.obsEventTooEarlyForCurrent(event, *current) {
 			s.logger.Warn("ignore early OBS ended event",
 				"video_id", current.ID,
-				"event_path", event.Path,
+				"event_path", s.redactString(event.Path),
 				"event_at", event.At,
 				"started_at", current.StartedAt,
 				"duration_seconds", current.DurationSeconds,
@@ -771,6 +817,9 @@ func (s *Service) recoverStartupState(ctx context.Context) error {
 }
 
 func (s *Service) CleanupRetention(ctx context.Context) error {
+	if s.cfg.RetentionMaxAge() <= 0 && s.cfg.RetentionMaxFiles <= 0 {
+		return nil
+	}
 	videos, err := s.store.Played(ctx)
 	if err != nil {
 		return err
@@ -797,6 +846,52 @@ func (s *Service) CleanupRetention(ctx context.Context) error {
 		if err := s.store.Delete(ctx, video.ID); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (s *Service) markUploadFailed(ctx context.Context, id int64, cause error) {
+	failCtx := ctx
+	cancel := func() {}
+	if ctx.Err() != nil {
+		failCtx, cancel = context.WithTimeout(context.Background(), uploadFailureTimeout)
+	}
+	defer cancel()
+	if err := s.store.MarkFailed(failCtx, id, cause.Error()); err != nil {
+		s.logger.Warn("mark upload failed", "video_id", id, "error", s.redactError(err))
+	}
+}
+
+func validateLocalBotAPIPath(root string, path string) error {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return nil
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("resolve TELEGRAM_BOT_API_DIR: %w", err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return fmt.Errorf("resolve TELEGRAM_BOT_API_DIR: %w", err)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return fmt.Errorf("resolve local video path: %w", err)
+	}
+	info, err := os.Stat(resolvedPath)
+	if err != nil {
+		return fmt.Errorf("stat local video path: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("local video path is not a regular file: %s", path)
+	}
+	rel, err := filepath.Rel(resolvedRoot, resolvedPath)
+	if err != nil {
+		return fmt.Errorf("compare local video path with TELEGRAM_BOT_API_DIR: %w", err)
+	}
+	if rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." || filepath.IsAbs(rel) {
+		return fmt.Errorf("local video path is outside TELEGRAM_BOT_API_DIR: %s", path)
 	}
 	return nil
 }
@@ -862,6 +957,10 @@ func (s *Service) randomFallbackLock() (int64, string) {
 
 func (s *Service) redactError(err error) error {
 	return secret.RedactError(err, s.cfg.SensitiveValues()...)
+}
+
+func (s *Service) redactString(value string) string {
+	return secret.RedactString(value, s.cfg.SensitiveValues()...)
 }
 
 func (s *Service) nowUTC() time.Time {

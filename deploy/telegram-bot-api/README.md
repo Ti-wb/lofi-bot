@@ -74,8 +74,10 @@ telegram-bot-api \
   --local \
   --http-ip-address="$TELEGRAM_BOT_API_HOST" \
   --http-port="$TELEGRAM_BOT_API_PORT" \
-  --dir="$TELEGRAM_BOT_API_DIR"
+  --dir="$BOT_API_DIR"
 ```
+
+`BOT_API_DIR` is the absolute path resolved from `TELEGRAM_BOT_API_DIR`; relative values are resolved from the repository root.
 
 Keep `TELEGRAM_BOT_API_DIR` stable across restarts. Changing or deleting it can invalidate file paths that were already returned by `getFile` and stored in the queue.
 
@@ -88,3 +90,5 @@ Keep `TELEGRAM_BOT_API_HOST=127.0.0.1` unless you have a specific local network 
 - `logout-public.sh`: loads the root `.env` and calls public Bot API `logOut`. Run it manually before the first local-server switch or when moving back from another Bot API server.
 
 The scripts do not print token or hash values. Error messages name the missing key only.
+
+`telegram-bot-api` receives `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` as process arguments because that is the CLI contract used by these portable helpers. On a shared host, local users or process collectors may be able to inspect argv. Run this stack under a dedicated local user/session on the OBS machine and restrict access to process listings and logs.

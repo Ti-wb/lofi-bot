@@ -56,6 +56,9 @@ OBS_MEDIA_SOURCE_NAME=player
 	if cfg.FallbackMode != "random_played" {
 		t.Fatalf("unexpected fallback mode: %q", cfg.FallbackMode)
 	}
+	if cfg.TelegramBotAPIDir != "./data/telegram-bot-api" {
+		t.Fatalf("unexpected telegram bot api dir: %q", cfg.TelegramBotAPIDir)
+	}
 	if cfg.MaxVideoSizeBytes != 2000*1024*1024 {
 		t.Fatalf("unexpected max video size: %d", cfg.MaxVideoSizeBytes)
 	}
@@ -99,6 +102,21 @@ ALLOWED_CHAT_ID=-1001
 	_, err = Load()
 	if err == nil || !strings.Contains(err.Error(), "TELEGRAM_API_BASE_URL") {
 		t.Fatalf("err = %v, want TELEGRAM_API_BASE_URL error", err)
+	}
+	if backups := backupFiles(t, dir); len(backups) != 0 {
+		t.Fatalf("Load should not migrate .env, backups = %v", backups)
+	}
+}
+
+func TestLoadRejectsInvalidTelegramAPIBaseURL(t *testing.T) {
+	clearConfigEnv(t)
+	chdirTemp(t)
+	setValidConfigEnv(t)
+	t.Setenv("TELEGRAM_API_BASE_URL", "127.0.0.1:8081")
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "TELEGRAM_API_BASE_URL must be a valid URL") {
+		t.Fatalf("err = %v, want invalid URL error", err)
 	}
 }
 
@@ -236,15 +254,8 @@ OBS_MEDIA_SOURCE_NAME=player
 		t.Fatalf("write env: %v", err)
 	}
 
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	if cfg.TelegramAPIBaseURL != "http://127.0.0.1:8081" {
-		t.Fatalf("telegram api base url = %q", cfg.TelegramAPIBaseURL)
-	}
-	if cfg.MaxVideoSizeBytes != 2000*1024*1024 {
-		t.Fatalf("max video size = %d", cfg.MaxVideoSizeBytes)
+	if err := migrateDotEnv(envPath); err != nil {
+		t.Fatalf("migrate env: %v", err)
 	}
 	migrated := readFile(t, envPath)
 	assertContains(t, migrated, "ENV_SCHEMA_VERSION=2")
@@ -276,8 +287,8 @@ MAX_VIDEO_SIZE_MB=2000
 		t.Fatalf("write env: %v", err)
 	}
 
-	if _, err := Load(); err != nil {
-		t.Fatalf("load: %v", err)
+	if err := migrateDotEnv(envPath); err != nil {
+		t.Fatalf("migrate env: %v", err)
 	}
 	migrated := readFile(t, envPath)
 	assertContains(t, migrated, "ENV_SCHEMA_VERSION=2")
@@ -308,15 +319,8 @@ MAX_VIDEO_SIZE_MB=123
 		t.Fatalf("write env: %v", err)
 	}
 
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	if cfg.TelegramAPIBaseURL != "http://10.0.0.1:9000" {
-		t.Fatalf("telegram api base url = %q", cfg.TelegramAPIBaseURL)
-	}
-	if cfg.MaxVideoSizeBytes != 123*1024*1024 {
-		t.Fatalf("max video size = %d", cfg.MaxVideoSizeBytes)
+	if err := migrateDotEnv(envPath); err != nil {
+		t.Fatalf("migrate env: %v", err)
 	}
 	migrated := readFile(t, envPath)
 	assertContains(t, migrated, "ENV_SCHEMA_VERSION=2")
@@ -349,8 +353,8 @@ ALLOWED_CHAT_ID=-1001
 		t.Fatalf("write env: %v", err)
 	}
 
-	if _, err := Load(); err != nil {
-		t.Fatalf("load: %v", err)
+	if err := migrateDotEnv(envPath); err != nil {
+		t.Fatalf("migrate env: %v", err)
 	}
 	migrated := readFile(t, envPath)
 	if countSubstring(migrated, "ENV_SCHEMA_VERSION=") != 1 {
@@ -392,7 +396,7 @@ ALLOWED_CHAT_ID=-1001
 	}
 }
 
-func TestLoadRejectsNewerDotEnvVersion(t *testing.T) {
+func TestMigrateRejectsNewerDotEnvVersion(t *testing.T) {
 	clearConfigEnv(t)
 	dir := chdirTemp(t)
 	envPath := filepath.Join(dir, ".env")
@@ -406,7 +410,7 @@ ALLOWED_CHAT_ID=-1001
 		t.Fatalf("write env: %v", err)
 	}
 
-	_, err := Load()
+	err := migrateDotEnv(envPath)
 	if err == nil || !strings.Contains(err.Error(), "newer than this binary supports") {
 		t.Fatalf("err = %v, want newer version error", err)
 	}

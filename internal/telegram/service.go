@@ -261,7 +261,7 @@ func (s *Service) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery
 
 	response, err := s.routeAction(ctx, cb.Message.Chat.ID, cb.From, cb.Data)
 	if err != nil {
-		response = botResponse{text: friendlyError(s.redactError(err))}
+		response = botResponse{text: s.friendlyError(err)}
 	}
 	s.answerCallback(ctx, cb.ID, truncateCallbackText(response.text))
 	if response.text != "" {
@@ -502,7 +502,7 @@ func (s *Service) responseFromMove(ctx context.Context, hook MoveFunc, id int64,
 
 func (s *Service) reply(ctx context.Context, chatID int64, response botResponse, err error) {
 	if err != nil {
-		response = botResponse{text: friendlyError(s.redactError(err))}
+		response = botResponse{text: s.friendlyError(err)}
 	}
 	if response.text == "" {
 		return
@@ -879,13 +879,15 @@ func formatBytes(value int64) string {
 func truncateCallbackText(text string) string {
 	text = strings.TrimSpace(text)
 	const limit = 180
-	if len(text) <= limit {
+	runes := []rune(text)
+	if len(runes) <= limit {
 		return text
 	}
-	return text[:limit-3] + "..."
+	return string(runes[:limit-3]) + "..."
 }
 
 func friendlyError(err error) string {
+	var public publicError
 	switch {
 	case errors.Is(err, errAdminOnly):
 		return "Only admins can use that command."
@@ -895,9 +897,15 @@ func friendlyError(err error) string {
 		return "Please send a video upload or a video document."
 	case errors.Is(err, errUploadTooLarge):
 		return strings.TrimPrefix(err.Error(), errUploadTooLarge.Error()+": ")
+	case errors.As(err, &public):
+		return public.PublicMessage()
 	default:
-		return "Sorry, I could not complete that: " + err.Error()
+		return "Sorry, I could not complete that. Check /status or the service logs for details."
 	}
+}
+
+func (s *Service) friendlyError(err error) string {
+	return secret.RedactString(friendlyError(s.redactError(err)), s.cfg.Token)
 }
 
 var (
@@ -911,6 +919,11 @@ type errHookNotConfigured string
 
 func (e errHookNotConfigured) Error() string {
 	return fmt.Sprintf("%s handler is not configured", string(e))
+}
+
+type publicError interface {
+	error
+	PublicMessage() string
 }
 
 type botAPI interface {

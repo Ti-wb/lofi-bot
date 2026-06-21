@@ -41,6 +41,19 @@ func TestRedactStringMasksTelegramBotURLToken(t *testing.T) {
 	}
 }
 
+func TestRedactStringMasksBareTelegramTokenEndingInDash(t *testing.T) {
+	const token = "123456:ABCdefghi_jklmnop-"
+
+	got := RedactString("telegram token " + token + " failed")
+
+	if strings.Contains(got, token) {
+		t.Fatalf("redacted string leaked token ending in dash: %q", got)
+	}
+	if !strings.Contains(got, redacted) {
+		t.Fatalf("redacted string = %q, want redacted marker", got)
+	}
+}
+
 func TestRedactErrorPreservesErrorsIs(t *testing.T) {
 	err := fmt.Errorf("request failed for /bot123456:ABCdefghi_jklmnop/getMe: %w", context.Canceled)
 	got := RedactError(err)
@@ -50,6 +63,14 @@ func TestRedactErrorPreservesErrorsIs(t *testing.T) {
 	}
 	if strings.Contains(got.Error(), "123456:ABCdefghi_jklmnop") {
 		t.Fatalf("redacted error leaked token: %q", got.Error())
+	}
+}
+
+func TestRedactStringIgnoresVeryShortLiteralSecrets(t *testing.T) {
+	got := RedactString("connect to OBS failed", "OBS")
+
+	if got != "connect to OBS failed" {
+		t.Fatalf("redacted string = %q, want original diagnostic text", got)
 	}
 }
 

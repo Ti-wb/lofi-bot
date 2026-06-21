@@ -12,10 +12,9 @@
 
    - create a bot with BotFather;
    - obtain `api_id` and `api_hash` from Telegram;
-   - fill the shared root `.env`;
-   - run the stack with `./run.sh up`.
+   - use `./run.sh logout-public` for the manual public API logout step before first switching to the local server.
 
-   The public Telegram Bot API is not supported. The Local Bot API Server must run with `--local` and return absolute local file paths from `getFile`. Use `./run.sh logout-public` for the manual public API logout step before first switching to the local server.
+   The public Telegram Bot API is not supported. The Local Bot API Server must run with `--local` and return absolute local file paths from `getFile`.
 
 3. Configure OBS:
 
@@ -41,6 +40,14 @@
 
 6. Fill `.env`. `.env` is ignored by git; `.env.example` is the versioned schema and starts with `ENV_SCHEMA_VERSION`.
 
+7. Validate, build, and start:
+
+   ```sh
+   ./run.sh doctor
+   ./run.sh build
+   ./run.sh up
+   ```
+
 The Go backend, Telegram Local Bot API Server, and OBS should run on the same machine. If they do not, their media paths must be on shared storage and readable at the same absolute paths by the backend and OBS.
 
 ## Production Config Upgrades
@@ -53,7 +60,7 @@ After migration, confirm the appended Telegram Local Bot API Server defaults are
 
 Numeric config values are strict in production: malformed integers fail startup instead of falling back to defaults. Keep `OBS_PORT` in `1..65535`, set `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` above `0`, and use non-negative values for `MAX_VIDEO_DURATION_SECONDS`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES`. A value of `0` remains valid for duration and retention limits where it means disabled.
 
-The stack helpers also run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing the v2 Local Bot API defaults.
+The stack helpers also run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing the v2 Local Bot API defaults. The Go app itself only reads config at startup; it does not rewrite `.env`.
 
 ## Local Runbook
 
@@ -97,6 +104,7 @@ Build:
 Run:
 
 ```sh
+./run.sh build
 ./run.sh up
 ```
 
@@ -107,9 +115,9 @@ For unattended shell-based production use, build once before starting the superv
 ./run.sh up
 ```
 
-The built binary is written to `dist/tg-obs-bot`. `./run.sh up` uses that binary when it exists; otherwise it falls back to `go run` and prints a warning. Set `APP_BIN` to run a different binary path.
+The built binary is written to `dist/tg-obs-bot`. `./run.sh up` uses that binary when it exists and is not older than Go source files; otherwise it falls back to `go run` and prints a warning. Set `APP_BIN` to run a different binary path.
 
-`./run.sh up` supervises the Telegram Local Bot API Server and `tg-obs-bot` as separate child services. If one exits, only that child restarts with exponential backoff. `Ctrl-C` or `TERM` stops both children. Tune restart delays with `RESTART_MIN_DELAY_SECONDS` and `RESTART_MAX_DELAY_SECONDS`; both must be positive integers no larger than 86400 seconds.
+`./run.sh up` supervises the Telegram Local Bot API Server and `tg-obs-bot` as separate child services. If one exits, only that child restarts with exponential backoff. `Ctrl-C` or `TERM` stops both children. The supervisor uses `dist/tg-obs-bot` when it is current; if the binary is missing or older than Go source files, it falls back to `go run` and prints a warning. Tune restart delays with `RESTART_MIN_DELAY_SECONDS` and `RESTART_MAX_DELAY_SECONDS`; both must be positive integers no larger than 86400 seconds.
 
 The supervisor loads `.env` once at startup. After changing `.env`, stop and restart the root `./run.sh up` process instead of killing only one child service.
 
@@ -133,11 +141,11 @@ The bot registers Telegram's command menu on startup. Most responses also includ
 
 ## Storage And Retention
 
-`RETENTION_DAYS` and `RETENTION_MAX_FILES` are both active. A played queue row can be removed from SQLite when it is older than the age limit or when the played history exceeds the file count limit.
+`RETENTION_DAYS` and `RETENTION_MAX_FILES` are both active. A played queue row can be removed from SQLite when it is older than the age limit or when the played history exceeds the file count limit. If both are set to `0`, retention cleanup is disabled and skips history scans.
 
 When `FALLBACK_MODE=random_played`, the currently playing random fallback row is protected from retention cleanup. Uploaded video files remain owned by Telegram Local Bot API Server and are not deleted by this project. App retention removes SQLite rows only; it does not remove media files under `TELEGRAM_BOT_API_DIR`.
 
-Monitor disk usage for `TELEGRAM_BOT_API_DIR` alongside `/status`. If `TELEGRAM_BOT_API_DIR` is relative, run `du -sh "$TELEGRAM_BOT_API_DIR"` from the repository root, or use the absolute resolved path. If manual cleanup is needed, first stop the stack or confirm the files are not referenced by queued, currently playing, or fallback history rows. Never delete paths that may still be queued, current, or used as random fallback candidates.
+`/status` reports both `MEDIA_DIR` disk and `TELEGRAM_BOT_API_DIR` disk. Monitor `TELEGRAM_BOT_API_DIR` as the upload storage source of truth. If `TELEGRAM_BOT_API_DIR` is relative, run `du -sh "$TELEGRAM_BOT_API_DIR"` from the repository root, or use the absolute resolved path. If manual cleanup is needed, first stop the stack or confirm the files are not referenced by queued, currently playing, or fallback history rows. Never delete paths that may still be queued, current, or used as random fallback candidates.
 
 Set conservative values on the MacBook first, for example:
 
@@ -164,6 +172,7 @@ If uploads fail after acceptance:
 - confirm the Local Bot API Server is running and `TELEGRAM_API_BASE_URL` points to it;
 - confirm it was started with `--local`;
 - confirm `getFile` returns an absolute path readable by the Go backend;
+- confirm returned paths resolve under `TELEGRAM_BOT_API_DIR`;
 - check `ffprobe` is installed;
 - check free disk space in `/status`;
 - check `MAX_VIDEO_SIZE_MB` and `MAX_VIDEO_DURATION_SECONDS`;
@@ -186,3 +195,5 @@ cd /path/to/tg-obs-bot
 ```
 
 Keep fixed Local Bot API data, `.env`, `data/`, and logs on local disk. The root and `deploy/telegram-bot-api` helper scripts load `.env` from the repository root and resolve a relative `TELEGRAM_BOT_API_DIR` against the repository root. If an external `start.sh` calls this project, call `./run.sh up` from the repository root so relative values such as `DATA_DIR`, `TELEGRAM_BOT_API_DIR`, and `DATABASE_PATH` resolve consistently.
+
+The portable supervisor writes app logs to stdout/stderr and does not rotate logs itself. For unattended operation, run it from a process wrapper or terminal multiplexer that captures stdout/stderr, rotates logs, restarts the root process after host reboot, and alerts on repeated child restarts. `./run.sh health` checks only Telegram Local Bot API `/getMe`; use Telegram `/status` and wrapper process state for app, queue, disk, and OBS readiness.

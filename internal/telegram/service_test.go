@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -219,6 +220,44 @@ func TestSendErrorLogRedactsTelegramToken(t *testing.T) {
 	}
 	if !strings.Contains(got, "/bot<redacted>/sendMessage") {
 		t.Fatalf("log = %q, want redacted bot URL", got)
+	}
+}
+
+func TestAdminLookupLogRedactsTelegramToken(t *testing.T) {
+	const token = "123456:ABCdefghi_jklmnop"
+	var logs bytes.Buffer
+	bot := &fakeBotAPI{
+		adminResponses: []adminResponse{
+			{err: errors.New(`Post "http://127.0.0.1:8081/bot123456:ABCdefghi_jklmnop/getChatAdministrators": EOF`)},
+		},
+	}
+	svc := newTestService(t, bot)
+	svc.cfg.Token = token
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	_ = svc.isAdmin(context.Background(), testChatID, &tgbotapi.User{ID: 42})
+
+	got := logs.String()
+	if strings.Contains(got, token) {
+		t.Fatalf("log leaked token: %q", got)
+	}
+	if !strings.Contains(got, "/bot<redacted>/getChatAdministrators") {
+		t.Fatalf("log = %q, want redacted bot URL", got)
+	}
+}
+
+func TestFriendlyErrorRedactsPublicMessage(t *testing.T) {
+	const token = "123456:ABCdefghi_jklmnop"
+	svc := newTestService(t, &fakeBotAPI{})
+	svc.cfg.Token = token
+
+	got := svc.friendlyError(testPublicError(`public message includes http://127.0.0.1:8081/bot123456:ABCdefghi_jklmnop/getMe`))
+
+	if strings.Contains(got, token) {
+		t.Fatalf("friendly error leaked token: %q", got)
+	}
+	if !strings.Contains(got, "/bot<redacted>/getMe") {
+		t.Fatalf("friendly error = %q, want redacted bot URL", got)
 	}
 }
 
@@ -745,6 +784,30 @@ func TestUploadRejectsRelativeLocalBotAPIFilePath(t *testing.T) {
 	}
 }
 
+func TestFriendlyErrorHidesInternalDetailsByDefault(t *testing.T) {
+	got := friendlyError(errors.New("ffprobe failed for /private/upload.mp4"))
+	if strings.Contains(got, "ffprobe") || strings.Contains(got, "/private") {
+		t.Fatalf("friendly error leaked internal detail: %q", got)
+	}
+	if !strings.Contains(got, "Check /status") {
+		t.Fatalf("friendly error = %q, want status guidance", got)
+	}
+}
+
+func TestTruncateCallbackTextKeepsUTF8Valid(t *testing.T) {
+	input := strings.Repeat("開始播放", 80)
+	got := truncateCallbackText(input)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated callback text is invalid UTF-8: %q", got)
+	}
+	if len([]rune(got)) != 180 {
+		t.Fatalf("truncated callback rune length = %d, want 180", len([]rune(got)))
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Fatalf("truncated callback text = %q, want ellipsis suffix", got)
+	}
+}
+
 func newTestService(t *testing.T, bot *fakeBotAPI) *Service {
 	t.Helper()
 
@@ -860,6 +923,16 @@ type fakeBotAPI struct {
 	adminBlock       <-chan struct{}
 	fileStarted      chan struct{}
 	adminStarted     chan struct{}
+}
+
+type testPublicError string
+
+func (e testPublicError) Error() string {
+	return string(e)
+}
+
+func (e testPublicError) PublicMessage() string {
+	return string(e)
 }
 
 func (f *fakeBotAPI) GetUpdates(ctx context.Context, config tgbotapi.UpdateConfig) ([]tgbotapi.Update, error) {

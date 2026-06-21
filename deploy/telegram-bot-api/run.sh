@@ -10,6 +10,30 @@ die() {
   exit 1
 }
 
+disable_xtrace() {
+  case $- in
+    *x*) set +x ;;
+  esac
+}
+
+reject_env_xtrace() {
+  awk '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line == "" || substr(line, 1, 1) == "#") {
+        next
+      }
+      if (line ~ /^set([[:space:]]|$)/ && line ~ /(^|[[:space:]])(-[^;#[:space:]]*x|-o[[:space:]]+xtrace|\+o[[:space:]]+xtrace)([;#[:space:]]|$)/) {
+        exit 1
+      }
+    }
+  ' "$ENV_FILE" || die ".env must not enable shell tracing"
+}
+
+disable_xtrace
+
 is_placeholder() {
   case "$1" in
     ""|replace-with-*) return 0 ;;
@@ -19,10 +43,11 @@ is_placeholder() {
 
 [ -f "$ENV_FILE" ] || die ".env is required at repo root"
 
-set -a
+reject_env_xtrace
+disable_xtrace
 # shellcheck disable=SC1090
 . "$ENV_FILE"
-set +a
+disable_xtrace
 
 : "${TELEGRAM_BOT_API_BIN:=telegram-bot-api}"
 : "${TELEGRAM_BOT_API_HOST:=127.0.0.1}"

@@ -161,8 +161,12 @@ func (m *Manager) Validate(meta Metadata, maxBytes int64, maxDurationSeconds int
 }
 
 func (m *Manager) DiskUsage() (DiskUsage, error) {
+	return DiskUsageForPath(m.dir)
+}
+
+func DiskUsageForPath(path string) (DiskUsage, error) {
 	var stat syscall.Statfs_t
-	if err := syscall.Statfs(m.dir, &stat); err != nil {
+	if err := syscall.Statfs(path, &stat); err != nil {
 		return DiskUsage{}, err
 	}
 	blockSize := uint64(stat.Bsize)

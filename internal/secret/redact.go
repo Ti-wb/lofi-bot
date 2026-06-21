@@ -8,6 +8,7 @@ import (
 )
 
 const redacted = "<redacted>"
+const minLiteralSecretLength = 4
 
 var (
 	sensitiveEnvKeys = []string{
@@ -16,7 +17,7 @@ var (
 		"OBS_PASSWORD",
 	}
 	telegramBotURLTokenPattern = regexp.MustCompile(`(/bot)[^/\s"']+`)
-	telegramTokenPattern       = regexp.MustCompile(`\b[0-9]{5,}:[A-Za-z0-9_-]{10,}\b`)
+	telegramTokenPattern       = regexp.MustCompile(`(^|[^A-Za-z0-9_-])([0-9]{5,}:[A-Za-z0-9_-]{10,})`)
 )
 
 type redactedError struct {
@@ -37,7 +38,7 @@ func RedactString(value string, secretValues ...string) string {
 		return value
 	}
 	redactedValue := telegramBotURLTokenPattern.ReplaceAllString(value, `${1}`+redacted)
-	redactedValue = telegramTokenPattern.ReplaceAllString(redactedValue, redacted)
+	redactedValue = telegramTokenPattern.ReplaceAllString(redactedValue, `${1}`+redacted)
 	for _, secretValue := range normalizedSecretValues(secretValues) {
 		redactedValue = strings.ReplaceAll(redactedValue, secretValue, redacted)
 	}
@@ -66,7 +67,7 @@ func normalizedSecretValues(secretValues []string) []string {
 	seen := make(map[string]struct{})
 	values := make([]string, 0, len(secretValues)+len(sensitiveEnvKeys))
 	add := func(value string) {
-		if value == "" || isPlaceholder(value) {
+		if len(value) < minLiteralSecretLength || isPlaceholder(value) {
 			return
 		}
 		if _, ok := seen[value]; ok {

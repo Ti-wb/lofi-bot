@@ -371,7 +371,7 @@ func (c *Client) requestResponse(ctx context.Context, requestType string, reques
 	default:
 	}
 
-	err = c.write(timeoutCtx, conn, envelope{Op: opRequest, D: mustMarshal(requestDataPayload{
+	err = c.write(ctx, timeoutCtx, conn, envelope{Op: opRequest, D: mustMarshal(requestDataPayload{
 		RequestType: requestType,
 		RequestID:   id,
 		RequestData: requestData,
@@ -418,10 +418,10 @@ func (c *Client) connectedConn() (*websocket.Conn, error) {
 	return c.conn, nil
 }
 
-func (c *Client) write(ctx context.Context, conn *websocket.Conn, value any) error {
+func (c *Client) write(ctx context.Context, timeoutCtx context.Context, conn *websocket.Conn, value any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return writeJSON(ctx, conn, value)
+	return writeJSONWithTimeout(ctx, timeoutCtx, conn, value)
 }
 
 func (c *Client) readLoop(conn *websocket.Conn) {
@@ -550,6 +550,29 @@ func writeJSON(ctx context.Context, conn *websocket.Conn, value any) error {
 	case <-ctx.Done():
 		_ = conn.Close()
 		return ctx.Err()
+	case err := <-done:
+		return err
+	}
+}
+
+func writeJSONWithTimeout(ctx context.Context, timeoutCtx context.Context, conn *websocket.Conn, value any) error {
+	return waitWriteJSON(ctx, timeoutCtx, func() error {
+		return conn.WriteJSON(value)
+	}, conn.Close)
+}
+
+func waitWriteJSON(ctx context.Context, timeoutCtx context.Context, write func() error, closeConn func() error) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- write()
+	}()
+	select {
+	case <-ctx.Done():
+		_ = closeConn()
+		return ctx.Err()
+	case <-timeoutCtx.Done():
+		_ = closeConn()
+		return timeoutCtx.Err()
 	case err := <-done:
 		return err
 	}

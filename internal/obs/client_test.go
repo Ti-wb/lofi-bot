@@ -80,6 +80,59 @@ func TestClientConnectHandshakeSuccess(t *testing.T) {
 	}
 }
 
+func TestClientConnectHandshakeTimeoutDisconnects(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer conn.Close()
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	client := newTestClient(t, "ws"+strings.TrimPrefix(server.URL, "http"), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	err := client.Connect(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Connect error = %v, want context deadline exceeded", err)
+	}
+	if got := client.Status().State; got != StateDisconnected {
+		t.Fatalf("state = %s, want %s", got, StateDisconnected)
+	}
+}
+
+func TestWaitWriteJSONTimeoutClosesConnection(t *testing.T) {
+	releaseWrite := make(chan struct{})
+	closed := make(chan struct{}, 1)
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	err := waitWriteJSON(context.Background(), timeoutCtx, func() error {
+		<-releaseWrite
+		return nil
+	}, func() error {
+		closed <- struct{}{}
+		return nil
+	})
+	close(releaseWrite)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait write error = %v, want context deadline exceeded", err)
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("close function was not called on timeout")
+	}
+}
+
 func TestClientPlayFileSendsMediaRequestsAndCentersSource(t *testing.T) {
 	requests := make(chan requestDataPayload, 6)
 	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
