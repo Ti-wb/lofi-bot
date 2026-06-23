@@ -8,7 +8,7 @@ BOT_API_HEALTH="$REPO_ROOT/deploy/telegram-bot-api/healthcheck.sh"
 BOT_API_LOGOUT="$REPO_ROOT/deploy/telegram-bot-api/logout-public.sh"
 GO_CACHE_DIR="$REPO_ROOT/.cache/go-build"
 GO_MOD_CACHE_DIR="$REPO_ROOT/.cache/go-mod"
-CURRENT_ENV_SCHEMA_VERSION=2
+CURRENT_ENV_SCHEMA_VERSION=3
 DEFAULT_APP_BIN="$REPO_ROOT/dist/tg-obs-bot"
 MAX_RESTART_DELAY_SECONDS=86400
 
@@ -197,6 +197,11 @@ migrate_env() {
       add_env_migration_line "$line"
     fi
   done
+  if [ "$version" -lt 3 ]; then
+    if ! dotenv_has_key RETENTION_DELETE_LOCAL_FILES; then
+      add_env_migration_line "RETENTION_DELETE_LOCAL_FILES=false"
+    fi
+  fi
 
   if [ "$update_schema_version" -eq 0 ] && [ -z "$ENV_MIGRATION_ADDITIONS" ]; then
     return 0
@@ -326,6 +331,23 @@ check_nonzero_integer_env() {
   esac
   printf 'ok   %s numeric value\n' "$key"
   return 0
+}
+
+check_bool_env() {
+  key=$1
+  default_value=$2
+  eval "value=\${$key:-}"
+  if [ -z "$value" ]; then
+    value=$default_value
+  fi
+  case "$value" in
+    true|false|TRUE|FALSE|True|False|1|0)
+      printf 'ok   %s boolean value\n' "$key"
+      return 0
+      ;;
+  esac
+  printf 'fail %s must be true or false\n' "$key"
+  return 1
 }
 
 check_http_url_env() {
@@ -578,6 +600,9 @@ doctor() {
   if ! check_http_url_env TELEGRAM_API_BASE_URL; then
     failures=$((failures + 1))
   fi
+  if ! check_bool_env RETENTION_DELETE_LOCAL_FILES false; then
+    failures=$((failures + 1))
+  fi
   for item in \
     "OBS_PORT:4455:1:65535" \
     "TELEGRAM_BOT_API_PORT:8081:1:65535" \
@@ -646,6 +671,7 @@ print_env() {
   printf 'DATA_DIR=%s\n' "${DATA_DIR:-./data}"
   printf 'MEDIA_DIR=%s\n' "${MEDIA_DIR:-./data/media}"
   printf 'DATABASE_PATH=%s\n' "${DATABASE_PATH:-./data/queue.db}"
+  printf 'RETENTION_DELETE_LOCAL_FILES=%s\n' "${RETENTION_DELETE_LOCAL_FILES:-false}"
   printf 'FFPROBE_PATH=%s\n' "${FFPROBE_PATH:-ffprobe}"
   printf 'LOG_LEVEL=%s\n' "${LOG_LEVEL:-info}"
 }

@@ -63,7 +63,7 @@ On restart:
 - OBS reconnect replays the current `playing` row instead of waiting for a playback-ended event that may never arrive after a process or OBS restart.
 - OBS playback failure leaves the next `ready` item in the queue instead of marking it played.
 - A canceled item cannot become `ready` after cancellation.
-- Retention cleanup removes old played queue rows by age and maximum file count.
+- Retention cleanup removes old played queue rows by age and maximum file count. By default it keeps local Telegram Bot API media files; `RETENTION_DELETE_LOCAL_FILES=true` opts into deleting unreferenced local files with removed rows.
 - Random fallback playback locks the active history row so retention cleanup cannot remove it mid-playback.
 
 ## Fallback Playback

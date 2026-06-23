@@ -483,6 +483,17 @@ func (s *Store) Delete(ctx context.Context, id int64) error {
 	return err
 }
 
+func (s *Store) LocalPathReferenced(ctx context.Context, path string, excludeID int64) (bool, error) {
+	if path == "" {
+		return false, nil
+	}
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM videos WHERE local_path = ? AND id <> ?
+`, path, excludeID).Scan(&count)
+	return count > 0, err
+}
+
 func (s *Store) Get(ctx context.Context, id int64) (Video, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+videoColumns+` FROM videos WHERE id = ?`, id)
 	if err != nil {

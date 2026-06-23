@@ -58,9 +58,9 @@ Before starting services, run `./run.sh migrate-env` to apply the stack helper's
 
 After migration, confirm the appended Telegram Local Bot API Server defaults are correct for production. If they are wrong, edit `.env` and restart the root `./run.sh up` supervisor so both child services inherit the same configuration.
 
-Numeric config values are strict in production: malformed integers fail startup instead of falling back to defaults. Keep `OBS_PORT` in `1..65535`, set `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` above `0`, and use non-negative values for `MAX_VIDEO_DURATION_SECONDS`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES`. A value of `0` remains valid for duration and retention limits where it means disabled.
+Numeric config values are strict in production: malformed integers fail startup instead of falling back to defaults. Keep `OBS_PORT` in `1..65535`, set `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` above `0`, and use non-negative values for `MAX_VIDEO_DURATION_SECONDS`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES`. A value of `0` remains valid for duration and retention limits where it means disabled. `RETENTION_DELETE_LOCAL_FILES` must be boolean and defaults to `false`.
 
-The stack helpers also run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing the v2 Local Bot API defaults. The Go app itself only reads config at startup; it does not rewrite `.env`.
+The stack helpers also run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing supported schema defaults. The Go app itself only reads config at startup; it does not rewrite `.env`.
 
 ## Local Runbook
 
@@ -143,7 +143,7 @@ The bot registers Telegram's command menu on startup. Most responses also includ
 
 `RETENTION_DAYS` and `RETENTION_MAX_FILES` are both active. A played queue row can be removed from SQLite when it is older than the age limit or when the played history exceeds the file count limit. If both are set to `0`, retention cleanup is disabled and skips history scans.
 
-When `FALLBACK_MODE=random_played`, the currently playing random fallback row is protected from retention cleanup. Uploaded video files remain owned by Telegram Local Bot API Server and are not deleted by this project. App retention removes SQLite rows only; it does not remove media files under `TELEGRAM_BOT_API_DIR`.
+When `FALLBACK_MODE=random_played`, the currently playing random fallback row is protected from retention cleanup. Uploaded video files remain owned by Telegram Local Bot API Server and are not deleted by default. App retention removes SQLite rows only unless `RETENTION_DELETE_LOCAL_FILES=true`; even then, it skips deleting a local file while another queue/history row still references the same path.
 
 `/status` reports both `MEDIA_DIR` disk and `TELEGRAM_BOT_API_DIR` disk. Monitor `TELEGRAM_BOT_API_DIR` as the upload storage source of truth. If `TELEGRAM_BOT_API_DIR` is relative, run `du -sh "$TELEGRAM_BOT_API_DIR"` from the repository root, or use the absolute resolved path. If manual cleanup is needed, first stop the stack or confirm the files are not referenced by queued, currently playing, or fallback history rows. Never delete paths that may still be queued, current, or used as random fallback candidates.
 
@@ -153,6 +153,7 @@ Set conservative values on the MacBook first, for example:
 FALLBACK_MODE=random_played
 RETENTION_DAYS=7
 RETENTION_MAX_FILES=100
+RETENTION_DELETE_LOCAL_FILES=false
 MAX_VIDEO_SIZE_MB=2000
 MAX_QUEUE_LENGTH=50
 ```

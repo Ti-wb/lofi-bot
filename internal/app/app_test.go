@@ -145,6 +145,63 @@ func TestCleanupRetentionDoesNotDeleteLocalBotAPIFile(t *testing.T) {
 	}
 }
 
+func TestCleanupRetentionDeletesLocalBotAPIFileWhenEnabled(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newFallbackTestService(t, config.Config{
+		FallbackMode:              "random_played",
+		RetentionMaxFiles:         1,
+		RetentionDays:             0,
+		RetentionDeleteLocalFiles: true,
+	})
+	removeCandidate := addPlayedVideo(t, ctx, svc, "old.mp4", true)
+	time.Sleep(time.Millisecond)
+	keepCandidate := addPlayedVideo(t, ctx, svc, "new.mp4", true)
+
+	if err := svc.CleanupRetention(ctx); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if _, err := svc.store.Get(ctx, removeCandidate.ID); err == nil {
+		t.Fatalf("old row should be removed")
+	}
+	if _, err := svc.store.Get(ctx, keepCandidate.ID); err != nil {
+		t.Fatalf("new row should remain: %v", err)
+	}
+	if fileExists(removeCandidate.LocalPath) {
+		t.Fatalf("local bot api file should be deleted when retention file deletion is enabled")
+	}
+	if !fileExists(keepCandidate.LocalPath) {
+		t.Fatalf("kept local bot api file should remain")
+	}
+}
+
+func TestCleanupRetentionDoesNotDeleteSharedLocalPath(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newFallbackTestService(t, config.Config{
+		FallbackMode:              "random_played",
+		RetentionMaxFiles:         1,
+		RetentionDays:             0,
+		RetentionDeleteLocalFiles: true,
+	})
+	sharedPath := filepath.Join(svc.cfg.TelegramBotAPIDir, "shared.mp4")
+	writeTestFile(t, sharedPath)
+	removeCandidate := addPlayedVideoWithPath(t, ctx, svc, "old-shared.mp4", sharedPath)
+	time.Sleep(time.Millisecond)
+	keepCandidate := addPlayedVideoWithPath(t, ctx, svc, "new-shared.mp4", sharedPath)
+
+	if err := svc.CleanupRetention(ctx); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if _, err := svc.store.Get(ctx, removeCandidate.ID); err == nil {
+		t.Fatalf("old row should be removed")
+	}
+	if _, err := svc.store.Get(ctx, keepCandidate.ID); err != nil {
+		t.Fatalf("new row should remain: %v", err)
+	}
+	if !fileExists(sharedPath) {
+		t.Fatalf("shared local bot api file should remain while another row references it")
+	}
+}
+
 func TestMissingRandomFallbackUsesStaticFile(t *testing.T) {
 	ctx := context.Background()
 	staticPath := filepath.Join(t.TempDir(), "fallback.mp4")
@@ -902,13 +959,37 @@ func addReadyVideoWithDuration(t *testing.T, ctx context.Context, svc *Service, 
 
 func addPlayedVideo(t *testing.T, ctx context.Context, svc *Service, name string, createFile bool) queue.Video {
 	t.Helper()
-	store := svc.store
 	ready := addReadyVideo(t, ctx, svc, name)
 	if !createFile {
 		if err := osRemove(ready.LocalPath); err != nil {
 			t.Fatalf("remove test file: %v", err)
 		}
 	}
+	return markReadyVideoPlayed(t, ctx, svc, ready)
+}
+
+func addPlayedVideoWithPath(t *testing.T, ctx context.Context, svc *Service, name string, path string) queue.Video {
+	t.Helper()
+	store := svc.store
+	video, err := store.AddDownloading(ctx, queue.Video{
+		TelegramFileID:   name,
+		TelegramUniqueID: name,
+		FileName:         name,
+		LocalPath:        path,
+	})
+	if err != nil {
+		t.Fatalf("add downloading: %v", err)
+	}
+	ready, err := store.MarkReady(ctx, video.ID, path, 100, 60)
+	if err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	return markReadyVideoPlayed(t, ctx, svc, ready)
+}
+
+func markReadyVideoPlayed(t *testing.T, ctx context.Context, svc *Service, ready queue.Video) queue.Video {
+	t.Helper()
+	store := svc.store
 	playing, err := store.MarkPlaying(ctx, ready.ID)
 	if err != nil {
 		t.Fatalf("mark playing: %v", err)

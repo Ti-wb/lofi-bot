@@ -843,8 +843,25 @@ func (s *Service) CleanupRetention(ctx context.Context) error {
 		if video.ID == fallbackID || (fallbackPath != "" && video.LocalPath == fallbackPath) {
 			continue
 		}
+		deleteLocalFile := false
+		if s.cfg.RetentionDeleteLocalFiles {
+			referenced, err := s.store.LocalPathReferenced(ctx, video.LocalPath, video.ID)
+			if err != nil {
+				return err
+			}
+			deleteLocalFile = !referenced
+		}
 		if err := s.store.Delete(ctx, video.ID); err != nil {
 			return err
+		}
+		if deleteLocalFile {
+			if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, video.LocalPath); err != nil {
+				s.logger.Warn("skip retention local file delete", "video_id", video.ID, "path", s.redactString(video.LocalPath), "error", s.redactError(err))
+				continue
+			}
+			if err := media.RemoveFile(video.LocalPath); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

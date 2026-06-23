@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const currentEnvSchemaVersion = 2
+const currentEnvSchemaVersion = 3
 
 type Config struct {
 	TelegramBotToken   string
@@ -27,14 +27,15 @@ type Config struct {
 	OBSFallbackFile    string
 	FallbackMode       string
 
-	DataDir                 string
-	MediaDir                string
-	DatabasePath            string
-	MaxVideoSizeBytes       int64
-	MaxVideoDurationSeconds int
-	MaxQueueLength          int
-	RetentionDays           int
-	RetentionMaxFiles       int
+	DataDir                   string
+	MediaDir                  string
+	DatabasePath              string
+	MaxVideoSizeBytes         int64
+	MaxVideoDurationSeconds   int
+	MaxQueueLength            int
+	RetentionDays             int
+	RetentionMaxFiles         int
+	RetentionDeleteLocalFiles bool
 
 	FFProbePath string
 	LogLevel    slog.Level
@@ -71,26 +72,31 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	retentionDeleteLocalFiles, err := getenvBool("RETENTION_DELETE_LOCAL_FILES", false)
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
-		TelegramBotToken:        strings.TrimSpace(getenv("TELEGRAM_BOT_TOKEN", "")),
-		TelegramAPIBaseURL:      strings.TrimRight(strings.TrimSpace(getenv("TELEGRAM_API_BASE_URL", "")), "/"),
-		TelegramBotAPIDir:       strings.TrimSpace(getenv("TELEGRAM_BOT_API_DIR", "./data/telegram-bot-api")),
-		AllowedChatID:           allowedChatID,
-		OBSHost:                 strings.TrimSpace(getenv("OBS_HOST", "127.0.0.1")),
-		OBSPort:                 obsPort,
-		OBSPassword:             getenv("OBS_PASSWORD", ""),
-		OBSMediaSourceName:      strings.TrimSpace(getenv("OBS_MEDIA_SOURCE_NAME", "tg_queue_player")),
-		OBSFallbackFile:         strings.TrimSpace(getenv("OBS_FALLBACK_FILE", "")),
-		FallbackMode:            strings.TrimSpace(getenv("FALLBACK_MODE", "random_played")),
-		DataDir:                 strings.TrimSpace(getenv("DATA_DIR", "./data")),
-		MaxVideoSizeBytes:       int64(maxVideoSizeMB) * 1024 * 1024,
-		MaxVideoDurationSeconds: maxVideoDurationSeconds,
-		MaxQueueLength:          maxQueueLength,
-		RetentionDays:           retentionDays,
-		RetentionMaxFiles:       retentionMaxFiles,
-		FFProbePath:             strings.TrimSpace(getenv("FFPROBE_PATH", "ffprobe")),
-		LogLevel:                parseLogLevel(strings.TrimSpace(getenv("LOG_LEVEL", "info"))),
+		TelegramBotToken:          strings.TrimSpace(getenv("TELEGRAM_BOT_TOKEN", "")),
+		TelegramAPIBaseURL:        strings.TrimRight(strings.TrimSpace(getenv("TELEGRAM_API_BASE_URL", "")), "/"),
+		TelegramBotAPIDir:         strings.TrimSpace(getenv("TELEGRAM_BOT_API_DIR", "./data/telegram-bot-api")),
+		AllowedChatID:             allowedChatID,
+		OBSHost:                   strings.TrimSpace(getenv("OBS_HOST", "127.0.0.1")),
+		OBSPort:                   obsPort,
+		OBSPassword:               getenv("OBS_PASSWORD", ""),
+		OBSMediaSourceName:        strings.TrimSpace(getenv("OBS_MEDIA_SOURCE_NAME", "tg_queue_player")),
+		OBSFallbackFile:           strings.TrimSpace(getenv("OBS_FALLBACK_FILE", "")),
+		FallbackMode:              strings.TrimSpace(getenv("FALLBACK_MODE", "random_played")),
+		DataDir:                   strings.TrimSpace(getenv("DATA_DIR", "./data")),
+		MaxVideoSizeBytes:         int64(maxVideoSizeMB) * 1024 * 1024,
+		MaxVideoDurationSeconds:   maxVideoDurationSeconds,
+		MaxQueueLength:            maxQueueLength,
+		RetentionDays:             retentionDays,
+		RetentionMaxFiles:         retentionMaxFiles,
+		RetentionDeleteLocalFiles: retentionDeleteLocalFiles,
+		FFProbePath:               strings.TrimSpace(getenv("FFPROBE_PATH", "ffprobe")),
+		LogLevel:                  parseLogLevel(strings.TrimSpace(getenv("LOG_LEVEL", "info"))),
 	}
 	cfg.MediaDir = strings.TrimSpace(getenv("MEDIA_DIR", filepath.Join(cfg.DataDir, "media")))
 	cfg.DatabasePath = strings.TrimSpace(getenv("DATABASE_PATH", filepath.Join(cfg.DataDir, "queue.db")))
@@ -230,7 +236,7 @@ func envMigrationAdditions(version int, values map[string]string) []string {
 	var additions []string
 	if version < 1 {
 		if _, ok := values["ENV_SCHEMA_VERSION"]; !ok {
-			additions = append(additions, "ENV_SCHEMA_VERSION=2")
+			additions = append(additions, fmt.Sprintf("ENV_SCHEMA_VERSION=%d", currentEnvSchemaVersion))
 		}
 		if _, ok := values["TELEGRAM_API_BASE_URL"]; !ok {
 			additions = append(additions, "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081")
@@ -257,6 +263,11 @@ func envMigrationAdditions(version int, values map[string]string) []string {
 		}
 		if _, ok := values["TELEGRAM_BOT_API_DIR"]; !ok {
 			additions = append(additions, "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api")
+		}
+	}
+	if version < 3 {
+		if _, ok := values["RETENTION_DELETE_LOCAL_FILES"]; !ok {
+			additions = append(additions, "RETENTION_DELETE_LOCAL_FILES=false")
 		}
 	}
 	return additions
@@ -341,6 +352,18 @@ func getenvInt64(key string, fallback int64) (int64, error) {
 	parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("%s must be an integer", key)
+	}
+	return parsed, nil
+}
+
+func getenvBool(key string, fallback bool) (bool, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean", key)
 	}
 	return parsed, nil
 }

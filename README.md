@@ -71,9 +71,9 @@ After changing `.env`, restart the root `./run.sh up` process so both child serv
 
 Before deploying a new build, back up the production `.env`. You can run `./run.sh migrate-env` to apply the stack helper's lightweight `.env` repair without starting the Go app. It copies the original to `.env.backup.<unix_timestamp>`, updates older schema markers, and appends missing fields needed by the Local Bot API helper. If appended Local Bot API Server defaults are not correct for production, edit `.env` before starting the stack.
 
-Numeric config values must be valid integers; malformed values fail startup instead of silently falling back to defaults. `OBS_PORT` must be `1..65535`; `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` must be positive; `MAX_VIDEO_DURATION_SECONDS`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES` may be `0` to disable that limit where supported.
+Numeric config values must be valid integers; malformed values fail startup instead of silently falling back to defaults. `OBS_PORT` must be `1..65535`; `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` must be positive; `MAX_VIDEO_DURATION_SECONDS`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES` may be `0` to disable that limit where supported. `RETENTION_DELETE_LOCAL_FILES` defaults to `false`, so retention removes old SQLite rows without deleting Telegram Local Bot API media files unless you explicitly opt in.
 
-The stack helpers run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing the v2 Local Bot API defaults. The Go app itself only reads config at startup; it does not rewrite `.env`.
+The stack helpers run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing supported schema defaults. The Go app itself only reads config at startup; it does not rewrite `.env`.
 
 Build a local binary:
 
@@ -115,7 +115,7 @@ Common runtime commands:
 ## Notes
 
 - The MVP avoids transcoding to keep CPU use low on the MacBook.
-- Played queue history is retained by `RETENTION_DAYS` and `RETENTION_MAX_FILES`; uploaded files are owned by Telegram Local Bot API Server.
+- Played queue history is retained by `RETENTION_DAYS` and `RETENTION_MAX_FILES`; uploaded files are owned by Telegram Local Bot API Server and are kept by default.
 - SQLite state is stored under `DATA_DIR` so the queue survives restarts.
 - `FALLBACK_MODE=random_played` keeps the channel alive by replaying completed history when the queue is empty.
 - `OBS_PASSWORD` can be left empty when OBS WebSocket authentication is disabled.
