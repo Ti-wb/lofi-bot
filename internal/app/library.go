@@ -85,7 +85,7 @@ func (s *Service) recoverLibraryPlaybackAfterOBSConnect(ctx context.Context) err
 func (s *Service) handleLibraryOBSEvent(ctx context.Context, event obs.Event) error {
 	switch event.InputName {
 	case s.cfg.OBSMusicSourceName:
-		return s.playNextMusicAfterEnded(ctx)
+		return s.playNextMusicAfterEnded(ctx, event.Path)
 	case s.cfg.OBSLoopSourceName:
 		return s.restartLibraryLoopAfterEnded(ctx)
 	default:
@@ -185,9 +185,12 @@ func (s *Service) playNextMusic(ctx context.Context, force bool) error {
 	return s.playNextMusicLocked(ctx, force)
 }
 
-func (s *Service) playNextMusicAfterEnded(ctx context.Context) error {
+func (s *Service) playNextMusicAfterEnded(ctx context.Context, eventPath string) error {
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
+	if eventPath != "" && s.activeMusicPath != "" && eventPath != s.activeMusicPath {
+		return nil
+	}
 	s.clearActiveMusicLocked()
 	return s.playNextMusicLocked(ctx, true)
 }
@@ -397,16 +400,13 @@ func (s *Service) ImportLibraryUpload(ctx context.Context, req UploadRequest) (s
 	}
 
 	var (
-		kind    medialib.Kind
 		destDir string
 		label   string
 	)
 	if parsed, err := medialib.ParseLoopFilename(fileName); err == nil {
-		kind = medialib.KindLoop
 		destDir = s.cfg.LoopMediaDir
 		label = fmt.Sprintf("loop %s/%s", parsed.Period, parsed.Theme)
 	} else if parsed, musicErr := medialib.ParseMusicFilename(fileName); musicErr == nil {
-		kind = medialib.KindMusic
 		destDir = s.cfg.MusicMediaDir
 		label = fmt.Sprintf("music %s", parsed.Track)
 	} else {
@@ -433,20 +433,18 @@ func (s *Service) ImportLibraryUpload(ctx context.Context, req UploadRequest) (s
 		return "", err
 	}
 
-	if kind == medialib.KindLoop {
-		probeCtx, cancelProbe := context.WithTimeout(ctx, uploadProbeTimeout)
-		meta, err := s.media.Probe(probeCtx, destPath)
-		cancelProbe()
-		if err != nil {
-			_ = os.Remove(destPath)
-			s.setLastErr(err)
-			return "", err
-		}
-		if err := s.media.Validate(meta, s.cfg.MaxVideoSizeBytes, s.cfg.MaxVideoDurationSeconds); err != nil {
-			_ = os.Remove(destPath)
-			s.setLastErr(err)
-			return "", err
-		}
+	probeCtx, cancelProbe := context.WithTimeout(ctx, uploadProbeTimeout)
+	meta, err := s.media.Probe(probeCtx, destPath)
+	cancelProbe()
+	if err != nil {
+		_ = os.Remove(destPath)
+		s.setLastErr(err)
+		return "", err
+	}
+	if err := s.media.Validate(meta, s.cfg.MaxVideoSizeBytes, s.cfg.MaxVideoDurationSeconds); err != nil {
+		_ = os.Remove(destPath)
+		s.setLastErr(err)
+		return "", err
 	}
 
 	if err := s.ScanLibrary(ctx); err != nil {

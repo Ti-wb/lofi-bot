@@ -223,6 +223,48 @@ func TestLibraryMusicEndedEventClearsActiveStateWhenReplayFails(t *testing.T) {
 	}
 }
 
+func TestLibraryMusicEndedEventIgnoresStalePath(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_beta.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	stalePath := svc.activeMusicPath
+	if stalePath == "" {
+		t.Fatal("expected initial music path")
+	}
+	if _, err := svc.SkipMusicText(ctx); err != nil {
+		t.Fatalf("skip music: %v", err)
+	}
+	currentPath := svc.activeMusicPath
+	if currentPath == "" || currentPath == stalePath {
+		t.Fatalf("current music path = %q, want different from stale %q", currentPath, stalePath)
+	}
+	playCount := fakeOBS.sourcePlayCount[svc.cfg.OBSMusicSourceName]
+
+	if err := svc.handleLibraryOBSEvent(ctx, obs.Event{
+		Type:      obs.EventMediaEnded,
+		InputName: svc.cfg.OBSMusicSourceName,
+		Path:      stalePath,
+	}); err != nil {
+		t.Fatalf("handle stale music ended event: %v", err)
+	}
+	if svc.activeMusicPath != currentPath {
+		t.Fatalf("active music path = %q, want unchanged %q", svc.activeMusicPath, currentPath)
+	}
+	if got := fakeOBS.sourcePlayCount[svc.cfg.OBSMusicSourceName]; got != playCount {
+		t.Fatalf("music play count = %d, want unchanged %d", got, playCount)
+	}
+}
+
 func TestLibraryThemeOverrideAndDirectSelect(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS := newLibraryTestService(t)
@@ -500,6 +542,33 @@ func TestLibraryImportCopiesValidAssetsAndRejectsDuplicates(t *testing.T) {
 		SizeBytes: 5,
 	}); err == nil {
 		t.Fatalf("expected duplicate import rejection")
+	}
+}
+
+func TestLibraryImportRejectsMusicWhenProbeFails(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newLibraryTestService(t)
+	manager, err := media.NewManager(svc.cfg.MediaDir, fakeFailingFFProbe(t))
+	if err != nil {
+		t.Fatalf("new media manager: %v", err)
+	}
+	svc.media = manager
+	source := writeBotAPIFile(t, svc, "music_bad.mp3")
+
+	_, err = svc.ImportLibraryUpload(ctx, UploadRequest{
+		LocalPath: source,
+		FileName:  "music_bad.mp3",
+		SizeBytes: 5,
+	})
+	if err == nil {
+		t.Fatal("expected music import probe failure")
+	}
+	if !strings.Contains(err.Error(), "ffprobe failed") {
+		t.Fatalf("err = %v, want ffprobe failed", err)
+	}
+	dest := filepath.Join(svc.cfg.MusicMediaDir, "music_bad.mp3")
+	if fileExists(dest) {
+		t.Fatalf("expected failed music import to remove %s", dest)
 	}
 }
 
