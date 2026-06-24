@@ -32,6 +32,7 @@ type Config struct {
 	APIBaseURL         string
 	AllowedChatID      int64
 	MaxUploadSizeBytes int64
+	PlayerMode         string
 	UpdateTimeout      int
 	RequestTimeout     time.Duration
 	Debug              bool
@@ -55,6 +56,13 @@ type adminCacheEntry struct {
 
 type Hooks struct {
 	EnqueueUpload EnqueueUploadFunc
+	Library       SimpleFunc
+	Scan          SimpleFunc
+	Preview       SimpleFunc
+	SetTheme      TextFunc
+	SelectLoop    TextFunc
+	SkipLoop      SimpleFunc
+	SkipMusic     SimpleFunc
 	ListQueue     SimpleFunc
 	Move          MoveFunc
 	Remove        IDFunc
@@ -66,6 +74,7 @@ type Hooks struct {
 
 type EnqueueUploadFunc func(context.Context, Upload) (string, error)
 type SimpleFunc func(context.Context) (string, error)
+type TextFunc func(context.Context, string) (string, error)
 type IDFunc func(context.Context, int64) (string, error)
 type MoveFunc func(context.Context, int64, int) (string, error)
 
@@ -95,6 +104,7 @@ type UploadKind string
 const (
 	UploadKindVideo    UploadKind = "video"
 	UploadKindDocument UploadKind = "document"
+	UploadKindAudio    UploadKind = "audio"
 )
 
 type Option func(*Service)
@@ -151,7 +161,40 @@ func WithBotAPI(bot botAPI) Option {
 	}
 }
 
+func (s *Service) libraryMode() bool {
+	return s.cfg.PlayerMode != "queue"
+}
+
 func (s *Service) registerCommands(ctx context.Context) error {
+	if !s.libraryMode() {
+		return s.registerQueueCommands(ctx)
+	}
+	publicCommands := []tgbotapi.BotCommand{
+		{Command: "library", Description: "查看媒體庫"},
+		{Command: "preview", Description: "預覽目前候選"},
+		{Command: "now", Description: "查看目前播放"},
+		{Command: "status", Description: "查看服務狀態"},
+		{Command: "help", Description: "顯示說明"},
+	}
+	adminCommands := []tgbotapi.BotCommand{
+		{Command: "library", Description: "查看媒體庫"},
+		{Command: "scan", Description: "掃描媒體庫"},
+		{Command: "preview", Description: "預覽目前候選"},
+		{Command: "theme", Description: "設定主題"},
+		{Command: "select", Description: "選擇循環素材"},
+		{Command: "skip", Description: "略過循環或音樂"},
+		{Command: "now", Description: "查看目前播放"},
+		{Command: "status", Description: "查看服務狀態"},
+		{Command: "help", Description: "顯示說明"},
+	}
+
+	if err := s.request(ctx, tgbotapi.NewSetMyCommandsWithScope(tgbotapi.NewBotCommandScopeChat(s.cfg.AllowedChatID), publicCommands...)); err != nil {
+		return err
+	}
+	return s.request(ctx, tgbotapi.NewSetMyCommandsWithScope(tgbotapi.NewBotCommandScopeChatAdministrators(s.cfg.AllowedChatID), adminCommands...))
+}
+
+func (s *Service) registerQueueCommands(ctx context.Context) error {
 	publicCommands := []tgbotapi.BotCommand{
 		{Command: "queue", Description: "Show queued videos"},
 		{Command: "now", Description: "Show what is playing"},
@@ -247,7 +290,7 @@ func (s *Service) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		return
 	}
 
-	if msg.Video != nil || msg.Document != nil {
+	if msg.Video != nil || msg.Document != nil || msg.Audio != nil {
 		response, err := s.handleUpload(ctx, msg)
 		s.reply(ctx, msg.Chat.ID, response, err)
 	}
@@ -282,15 +325,57 @@ func (s *Service) handleCommand(ctx context.Context, msg *tgbotapi.Message) (bot
 	admin := s.isAdmin(ctx, msg.Chat.ID, msg.From)
 	switch command {
 	case "start", "help":
-		return botResponse{text: helpText(admin), markup: homeKeyboard(admin)}, nil
+		return botResponse{text: helpTextForMode(admin, s.libraryMode()), markup: homeKeyboardForMode(admin, s.libraryMode())}, nil
+	case "library":
+		if !s.libraryMode() {
+			return s.responseFromQueue(ctx, admin)
+		}
+		return s.responseFromLibrary(ctx, admin)
+	case "preview":
+		if !s.libraryMode() {
+			return s.responseFromQueue(ctx, admin)
+		}
+		return s.responseFromSimple(ctx, "preview", s.hooks.Preview, previewKeyboard(admin))
+	case "scan":
+		if !s.libraryMode() {
+			return botResponse{}, errBadCommand
+		}
+		if !admin {
+			return botResponse{}, errAdminOnly
+		}
+		return s.responseFromSimple(ctx, "scan library", s.hooks.Scan, libraryKeyboard(admin))
+	case "theme":
+		if !s.libraryMode() {
+			return botResponse{}, errBadCommand
+		}
+		if !admin {
+			return botResponse{}, errAdminOnly
+		}
+		theme, err := parseTextArg(args, "theme", "<theme|random>")
+		if err != nil {
+			return botResponse{}, err
+		}
+		return s.responseFromText(ctx, "set theme", s.hooks.SetTheme, theme, libraryKeyboard(admin))
+	case "select":
+		if !s.libraryMode() {
+			return botResponse{}, errBadCommand
+		}
+		if !admin {
+			return botResponse{}, errAdminOnly
+		}
+		assetID, err := parseTextArg(args, "select", "<asset_id|clear>")
+		if err != nil {
+			return botResponse{}, err
+		}
+		return s.responseFromText(ctx, "select loop", s.hooks.SelectLoop, assetID, libraryKeyboard(admin))
 	case "queue", "list":
 		return s.responseFromQueue(ctx, admin)
 	case "now":
-		return s.responseFromSimple(ctx, "current video", s.hooks.Now, nowKeyboard(admin))
+		return s.responseFromSimple(ctx, "current video", s.hooks.Now, nowKeyboardForMode(admin, s.libraryMode()))
 	case "history":
-		return s.responseFromSimple(ctx, "history", s.hooks.History, historyKeyboard(admin))
+		return s.responseFromSimple(ctx, "history", s.hooks.History, historyKeyboardForMode(admin, s.libraryMode()))
 	case "status":
-		return s.responseFromSimple(ctx, "status", s.hooks.Status, statusKeyboard(admin))
+		return s.responseFromSimple(ctx, "status", s.hooks.Status, statusKeyboardForMode(admin, s.libraryMode()))
 	case "remove":
 		if !admin {
 			return botResponse{}, errAdminOnly
@@ -313,9 +398,12 @@ func (s *Service) handleCommand(ctx context.Context, msg *tgbotapi.Message) (bot
 		if !admin {
 			return botResponse{}, errAdminOnly
 		}
-		return s.responseFromSimple(ctx, "skip", s.hooks.Skip, queueKeyboard(admin, ""))
+		return s.responseFromSkip(ctx, args, admin)
 	default:
-		return botResponse{text: "I do not know that command. Try /queue, /now, /status, or /help.", markup: homeKeyboard(admin)}, nil
+		if s.libraryMode() {
+			return botResponse{text: "我不認得這個指令。請試 /library、/preview、/now、/status 或 /help。", markup: homeKeyboard(admin)}, nil
+		}
+		return botResponse{text: "I do not know that command. Try /queue, /now, /status, or /help.", markup: homeKeyboardForMode(admin, false)}, nil
 	}
 }
 
@@ -328,14 +416,56 @@ func (s *Service) routeAction(ctx context.Context, chatID int64, user *tgbotapi.
 	action := strings.ToLower(parts[0])
 	admin := s.isAdmin(ctx, chatID, user)
 	switch action {
+	case "library":
+		if !s.libraryMode() {
+			return s.responseFromQueue(ctx, admin)
+		}
+		return s.responseFromLibrary(ctx, admin)
+	case "preview":
+		if !s.libraryMode() {
+			return s.responseFromQueue(ctx, admin)
+		}
+		return s.responseFromSimple(ctx, "preview", s.hooks.Preview, previewKeyboard(admin))
+	case "scan":
+		if !s.libraryMode() {
+			return botResponse{}, nil
+		}
+		if !admin {
+			return botResponse{}, errAdminOnly
+		}
+		return s.responseFromSimple(ctx, "scan library", s.hooks.Scan, libraryKeyboard(admin))
+	case "theme":
+		if !s.libraryMode() {
+			return botResponse{}, nil
+		}
+		if !admin {
+			return botResponse{}, errAdminOnly
+		}
+		theme, err := parseTextArg(parts[1:], "theme", "<theme|random>")
+		if err != nil {
+			return botResponse{}, err
+		}
+		return s.responseFromText(ctx, "set theme", s.hooks.SetTheme, theme, libraryKeyboard(admin))
+	case "select":
+		if !s.libraryMode() {
+			return botResponse{}, nil
+		}
+		if !admin {
+			return botResponse{}, errAdminOnly
+		}
+		assetID, err := parseTextArg(parts[1:], "select", "<asset_id|clear>")
+		if err != nil {
+			return botResponse{}, err
+		}
+		return s.responseFromText(ctx, "select loop", s.hooks.SelectLoop, assetID, libraryKeyboard(admin))
 	case "queue", "list":
 		return s.responseFromQueue(ctx, admin)
 	case "now":
-		return s.responseFromSimple(ctx, "current video", s.hooks.Now, nowKeyboard(admin))
+		return s.responseFromSimple(ctx, "current video", s.hooks.Now, nowKeyboardForMode(admin, s.libraryMode()))
 	case "history":
-		return s.responseFromSimple(ctx, "history", s.hooks.History, historyKeyboard(admin))
+		return s.responseFromSimple(ctx, "history", s.hooks.History, historyKeyboardForMode(admin, s.libraryMode()))
 	case "status":
-		return s.responseFromSimple(ctx, "status", s.hooks.Status, statusKeyboard(admin))
+		return s.responseFromSimple(ctx, "status", s.hooks.Status, statusKeyboardForMode(admin, s.libraryMode()))
 	case "remove":
 		if !admin {
 			return botResponse{}, errAdminOnly
@@ -358,13 +488,16 @@ func (s *Service) routeAction(ctx context.Context, chatID int64, user *tgbotapi.
 		if !admin {
 			return botResponse{}, errAdminOnly
 		}
-		return s.responseFromSimple(ctx, "skip", s.hooks.Skip, queueKeyboard(admin, ""))
+		return s.responseFromSkip(ctx, parts[1:], admin)
 	default:
 		return botResponse{}, nil
 	}
 }
 
 func (s *Service) handleUpload(ctx context.Context, msg *tgbotapi.Message) (botResponse, error) {
+	if s.libraryMode() && !s.isAdmin(ctx, msg.Chat.ID, msg.From) {
+		return botResponse{}, errAdminOnly
+	}
 	if s.hooks.EnqueueUpload == nil {
 		return botResponse{}, errHookNotConfigured("enqueue upload")
 	}
@@ -372,6 +505,9 @@ func (s *Service) handleUpload(ctx context.Context, msg *tgbotapi.Message) (botR
 	upload, err := uploadFromMessage(msg)
 	if err != nil {
 		return botResponse{}, err
+	}
+	if !s.libraryMode() && !uploadLooksLikeQueueVideo(upload) {
+		return botResponse{}, errUnsupportedUpload
 	}
 	if s.cfg.MaxUploadSizeBytes > 0 && upload.SizeBytes > s.cfg.MaxUploadSizeBytes {
 		return botResponse{}, fmt.Errorf("%w: %s is larger than the limit of %s", errUploadTooLarge, formatBytes(upload.SizeBytes), formatBytes(s.cfg.MaxUploadSizeBytes))
@@ -402,7 +538,7 @@ func (s *Service) handleUpload(ctx context.Context, msg *tgbotapi.Message) (botR
 	if strings.TrimSpace(response) == "" {
 		response = fmt.Sprintf("Queued %s.", displayName(upload))
 	}
-	return botResponse{text: response, markup: uploadAcceptedKeyboard()}, nil
+	return botResponse{text: response, markup: uploadAcceptedKeyboardForMode(s.libraryMode())}, nil
 }
 
 func uploadFromMessage(msg *tgbotapi.Message) (Upload, error) {
@@ -438,8 +574,22 @@ func uploadFromMessage(msg *tgbotapi.Message) (Upload, error) {
 		if upload.FileName == "" {
 			upload.FileName = defaultUploadName(upload.FileUniqueID, "")
 		}
-		if !looksLikeVideoDocument(upload.FileName, upload.MimeType) {
+		if !looksLikeMediaDocument(upload.FileName, upload.MimeType) {
 			return Upload{}, errUnsupportedUpload
+		}
+		return upload, nil
+	}
+
+	if msg.Audio != nil {
+		upload.Kind = UploadKindAudio
+		upload.FileID = msg.Audio.FileID
+		upload.FileUniqueID = msg.Audio.FileUniqueID
+		upload.FileName = strings.TrimSpace(msg.Audio.FileName)
+		upload.MimeType = strings.TrimSpace(msg.Audio.MimeType)
+		upload.SizeBytes = int64(msg.Audio.FileSize)
+		upload.DurationSeconds = msg.Audio.Duration
+		if upload.FileName == "" {
+			upload.FileName = defaultUploadName(upload.FileUniqueID, ".mp3")
 		}
 		return upload, nil
 	}
@@ -452,6 +602,13 @@ func (s *Service) callSimple(ctx context.Context, name string, hook SimpleFunc) 
 		return "", errHookNotConfigured(name)
 	}
 	return hook(ctx)
+}
+
+func (s *Service) callText(ctx context.Context, name string, hook TextFunc, value string) (string, error) {
+	if hook == nil {
+		return "", errHookNotConfigured(name)
+	}
+	return hook(ctx, value)
 }
 
 func (s *Service) callID(ctx context.Context, name string, hook IDFunc, id int64) (string, error) {
@@ -474,6 +631,41 @@ func (s *Service) responseFromSimple(ctx context.Context, name string, hook Simp
 		return botResponse{}, err
 	}
 	return botResponse{text: text, markup: markup}, nil
+}
+
+func (s *Service) responseFromText(ctx context.Context, name string, hook TextFunc, value string, markup *tgbotapi.InlineKeyboardMarkup) (botResponse, error) {
+	text, err := s.callText(ctx, name, hook, value)
+	if err != nil {
+		return botResponse{}, err
+	}
+	return botResponse{text: text, markup: markup}, nil
+}
+
+func (s *Service) responseFromLibrary(ctx context.Context, admin bool) (botResponse, error) {
+	return s.responseFromSimple(ctx, "library", s.hooks.Library, libraryKeyboard(admin))
+}
+
+func (s *Service) responseFromSkip(ctx context.Context, args []string, admin bool) (botResponse, error) {
+	if !s.libraryMode() {
+		if len(args) != 0 {
+			return botResponse{}, fmt.Errorf("%w: use /skip", errBadCommand)
+		}
+		return s.responseFromSimple(ctx, "skip", s.hooks.Skip, queueKeyboard(admin, ""))
+	}
+	if len(args) == 0 {
+		return s.responseFromSimple(ctx, "skip", s.hooks.Skip, libraryKeyboard(admin))
+	}
+	if len(args) != 1 {
+		return botResponse{}, fmt.Errorf("%w: use /skip loop or /skip music", errBadCommand)
+	}
+	switch strings.ToLower(args[0]) {
+	case "loop":
+		return s.responseFromSimple(ctx, "skip loop", s.hooks.SkipLoop, libraryKeyboard(admin))
+	case "music":
+		return s.responseFromSimple(ctx, "skip music", s.hooks.SkipMusic, libraryKeyboard(admin))
+	default:
+		return botResponse{}, fmt.Errorf("%w: use /skip loop or /skip music", errBadCommand)
+	}
 }
 
 func (s *Service) responseFromQueue(ctx context.Context, admin bool) (botResponse, error) {
@@ -653,6 +845,33 @@ func parseMoveArgs(args []string) (int64, int, error) {
 	return id, position, nil
 }
 
+func parseTextArg(args []string, command string, placeholder string) (string, error) {
+	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
+		return "", fmt.Errorf("%w: use /%s %s", errBadCommand, command, placeholder)
+	}
+	return strings.TrimSpace(args[0]), nil
+}
+
+func looksLikeMediaDocument(name string, mimeType string) bool {
+	mimeType = strings.ToLower(strings.TrimSpace(mimeType))
+	if strings.HasPrefix(mimeType, "video/") || strings.HasPrefix(mimeType, "audio/") {
+		return true
+	}
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".oga", ".opus":
+		return true
+	default:
+		return false
+	}
+}
+
+func uploadLooksLikeQueueVideo(upload Upload) bool {
+	if upload.Kind == UploadKindVideo {
+		return true
+	}
+	return looksLikeVideoDocument(upload.FileName, upload.MimeType)
+}
+
 func looksLikeVideoDocument(name string, mimeType string) bool {
 	if strings.HasPrefix(strings.ToLower(mimeType), "video/") {
 		return true
@@ -670,7 +889,7 @@ func defaultUploadName(uniqueID string, ext string) string {
 		uniqueID = strconv.FormatInt(time.Now().UnixNano(), 10)
 	}
 	if ext == "" {
-		ext = ".video"
+		ext = ".media"
 	}
 	return "telegram-" + uniqueID + ext
 }
@@ -704,27 +923,88 @@ func userID(user *tgbotapi.User) int64 {
 }
 
 func helpText(admin bool) string {
+	return helpTextForMode(admin, true)
+}
+
+func helpTextForMode(admin bool, libraryMode bool) string {
+	if !libraryMode {
+		lines := []string{
+			"Send a video file here to add it to the OBS queue.",
+			"",
+			"/queue - show queued videos",
+			"/now - show what is playing",
+			"/status - show queue status",
+			"/history - show recent completed items",
+		}
+		if admin {
+			lines = append(lines,
+				"",
+				"Admin:",
+				"/move <video_id> <position> - reorder a queued video",
+				"/remove <video_id> - remove a queued video",
+				"/skip - skip the current video",
+			)
+		}
+		return strings.Join(lines, "\n")
+	}
 	lines := []string{
-		"Send a video file here to add it to the OBS queue.",
+		"傳送影片或音訊檔給我，管理員可匯入媒體庫。",
 		"",
-		"/queue - show queued videos",
-		"/now - show what is playing",
-		"/status - show queue status",
-		"/history - show recent completed items",
+		"/library - 查看媒體庫",
+		"/preview - 預覽目前候選",
+		"/now - 目前播放",
+		"/status - 系統狀態",
+		"/help - 顯示說明",
 	}
 	if admin {
 		lines = append(lines,
 			"",
 			"Admin:",
-			"/move <video_id> <position> - reorder a queued video",
-			"/remove <video_id> - remove a queued video",
-			"/skip - skip the current video",
+			"/scan - 掃描媒體庫",
+			"/theme <theme|random> - 設定主題",
+			"/select <asset_id|clear> - 選擇循環素材",
+			"/skip loop - 略過循環",
+			"/skip music - 略過音樂",
 		)
 	}
 	return strings.Join(lines, "\n")
 }
 
 func homeKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
+	return homeKeyboardForMode(admin, true)
+}
+
+func homeKeyboardForMode(admin bool, libraryMode bool) *tgbotapi.InlineKeyboardMarkup {
+	if !libraryMode {
+		return queueHomeKeyboard(admin)
+	}
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("媒體庫", "library"),
+			tgbotapi.NewInlineKeyboardButtonData("預覽", "preview"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("現在", "now"),
+			tgbotapi.NewInlineKeyboardButtonData("狀態", "status"),
+		),
+	}
+	if admin {
+		rows = append(rows,
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("掃描", "scan"),
+				tgbotapi.NewInlineKeyboardButtonData("隨機主題", "theme:random"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("清除選取", "select:clear"),
+				tgbotapi.NewInlineKeyboardButtonData("略過循環", "skip:loop"),
+				tgbotapi.NewInlineKeyboardButtonData("略過音樂", "skip:music"),
+			),
+		)
+	}
+	return inlineKeyboard(rows...)
+}
+
+func queueHomeKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
 	rows := [][]tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
@@ -737,6 +1017,53 @@ func homeKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
 	}
 	if admin {
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Skip", "skip")))
+	}
+	return inlineKeyboard(rows...)
+}
+
+func libraryKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("刷新", "library"),
+			tgbotapi.NewInlineKeyboardButtonData("預覽", "preview"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("現在", "now"),
+			tgbotapi.NewInlineKeyboardButtonData("狀態", "status"),
+		),
+	}
+	if admin {
+		rows = append(rows,
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("掃描", "scan"),
+				tgbotapi.NewInlineKeyboardButtonData("隨機主題", "theme:random"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("清除選取", "select:clear"),
+				tgbotapi.NewInlineKeyboardButtonData("略過循環", "skip:loop"),
+				tgbotapi.NewInlineKeyboardButtonData("略過音樂", "skip:music"),
+			),
+		)
+	}
+	return inlineKeyboard(rows...)
+}
+
+func previewKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("刷新", "preview"),
+			tgbotapi.NewInlineKeyboardButtonData("媒體庫", "library"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("現在", "now"),
+			tgbotapi.NewInlineKeyboardButtonData("狀態", "status"),
+		),
+	}
+	if admin {
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("略過循環", "skip:loop"),
+			tgbotapi.NewInlineKeyboardButtonData("略過音樂", "skip:music"),
+		))
 	}
 	return inlineKeyboard(rows...)
 }
@@ -796,52 +1123,121 @@ func queueItems(text string) []queueItem {
 }
 
 func nowKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
+	return nowKeyboardForMode(admin, true)
+}
+
+func nowKeyboardForMode(admin bool, libraryMode bool) *tgbotapi.InlineKeyboardMarkup {
+	if !libraryMode {
+		rows := [][]tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
+				tgbotapi.NewInlineKeyboardButtonData("Status", "status"),
+			),
+		}
+		if admin {
+			rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Skip", "skip")))
+		}
+		return inlineKeyboard(rows...)
+	}
 	rows := [][]tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
-			tgbotapi.NewInlineKeyboardButtonData("Status", "status"),
+			tgbotapi.NewInlineKeyboardButtonData("媒體庫", "library"),
+			tgbotapi.NewInlineKeyboardButtonData("狀態", "status"),
 		),
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("預覽", "preview")),
 	}
 	if admin {
-		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Skip", "skip")))
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("略過循環", "skip:loop"),
+			tgbotapi.NewInlineKeyboardButtonData("略過音樂", "skip:music"),
+		))
 	}
 	return inlineKeyboard(rows...)
 }
 
-func statusKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
+func statusKeyboardForMode(admin bool, libraryMode bool) *tgbotapi.InlineKeyboardMarkup {
+	if !libraryMode {
+		rows := [][]tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Refresh", "status"),
+				tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
+			),
+			tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Now", "now")),
+		}
+		if admin {
+			rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Skip", "skip")))
+		}
+		return inlineKeyboard(rows...)
+	}
 	rows := [][]tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Refresh", "status"),
-			tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
+			tgbotapi.NewInlineKeyboardButtonData("刷新", "status"),
+			tgbotapi.NewInlineKeyboardButtonData("媒體庫", "library"),
 		),
-		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Now", "now")),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("預覽", "preview"),
+			tgbotapi.NewInlineKeyboardButtonData("現在", "now"),
+		),
 	}
 	if admin {
-		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Skip", "skip")))
+		rows = append(rows,
+			tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("掃描", "scan")),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("略過循環", "skip:loop"),
+				tgbotapi.NewInlineKeyboardButtonData("略過音樂", "skip:music"),
+			),
+		)
 	}
 	return inlineKeyboard(rows...)
 }
 
-func historyKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
+func historyKeyboardForMode(admin bool, libraryMode bool) *tgbotapi.InlineKeyboardMarkup {
+	if !libraryMode {
+		rows := [][]tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
+				tgbotapi.NewInlineKeyboardButtonData("Status", "status"),
+			),
+		}
+		if admin {
+			rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Skip", "skip")))
+		}
+		return inlineKeyboard(rows...)
+	}
 	rows := [][]tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
-			tgbotapi.NewInlineKeyboardButtonData("Status", "status"),
+			tgbotapi.NewInlineKeyboardButtonData("媒體庫", "library"),
+			tgbotapi.NewInlineKeyboardButtonData("狀態", "status"),
 		),
 	}
 	if admin {
-		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Skip", "skip")))
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("略過循環", "skip:loop"),
+			tgbotapi.NewInlineKeyboardButtonData("略過音樂", "skip:music"),
+		))
 	}
 	return inlineKeyboard(rows...)
 }
 
-func uploadAcceptedKeyboard() *tgbotapi.InlineKeyboardMarkup {
+func uploadAcceptedKeyboardForMode(libraryMode bool) *tgbotapi.InlineKeyboardMarkup {
+	if !libraryMode {
+		return inlineKeyboard(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
+				tgbotapi.NewInlineKeyboardButtonData("Now", "now"),
+			),
+			tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Status", "status")),
+		)
+	}
 	return inlineKeyboard(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Queue", "queue"),
-			tgbotapi.NewInlineKeyboardButtonData("Now", "now"),
+			tgbotapi.NewInlineKeyboardButtonData("媒體庫", "library"),
+			tgbotapi.NewInlineKeyboardButtonData("預覽", "preview"),
 		),
-		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Status", "status")),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("狀態", "status"),
+			tgbotapi.NewInlineKeyboardButtonData("掃描", "scan"),
+		),
 	)
 }
 
@@ -856,7 +1252,7 @@ func isRefreshAction(data string) bool {
 		return false
 	}
 	switch strings.ToLower(parts[0]) {
-	case "queue", "list", "now", "status", "history":
+	case "library", "preview", "queue", "list", "now", "status", "history":
 		return true
 	default:
 		return false
@@ -890,17 +1286,17 @@ func friendlyError(err error) string {
 	var public publicError
 	switch {
 	case errors.Is(err, errAdminOnly):
-		return "Only admins can use that command."
+		return "這個操作只有管理員可以使用。"
 	case errors.Is(err, errBadCommand):
 		return strings.TrimPrefix(err.Error(), errBadCommand.Error()+": ")
 	case errors.Is(err, errUnsupportedUpload):
-		return "Please send a video upload or a video document."
+		return "請傳影片或音訊檔。"
 	case errors.Is(err, errUploadTooLarge):
 		return strings.TrimPrefix(err.Error(), errUploadTooLarge.Error()+": ")
 	case errors.As(err, &public):
 		return public.PublicMessage()
 	default:
-		return "Sorry, I could not complete that. Check /status or the service logs for details."
+		return "抱歉，這次沒有完成。可用 /status 查看狀態，細節請看服務日誌。"
 	}
 }
 

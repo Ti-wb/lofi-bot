@@ -2,10 +2,10 @@
 
 Go backend for a 24h Lo-Fi Music channel workflow:
 
-- Telegram group members submit videos.
-- The bot validates and queues videos.
-- OBS plays queued videos through one Media Source controlled by OBS WebSocket.
-- Telegram group admins manage queue order from Telegram.
+- OBS plays time-of-day loop animations from a local media library.
+- Independent Lo-Fi tracks play through a separate OBS source.
+- Telegram group admins import media, switch the day theme, force a loop, skip playback, and preview the next period.
+- The legacy Telegram queue player remains available through `PLAYER_MODE=queue`.
 
 ## Requirements
 
@@ -25,12 +25,13 @@ brew install go ffmpeg
 
 1. Open OBS.
 2. Enable WebSocket server in OBS settings.
-3. Create a Media Source named `tg_queue_player`.
-4. Add that source to the Program scene used for playback.
-5. Disable looping on that source.
-6. Keep the backend running on the same Mac.
+3. Create a Media Source named `tg_loop_player` for loop animation.
+4. Create a Media Source named `tg_music_player` for Lo-Fi music.
+5. Add both sources to the Program scene used for playback.
+6. Keep looping disabled in OBS; the app sets loop/music behavior through OBS WebSocket.
+7. Keep the backend running on the same Mac.
 
-Before each playback restart, the bot tries to center the media source in the current Program scene without changing its scale, bounds, or crop.
+The app mutes the loop source, plays music through the music source, and centers the loop source in the current Program scene without changing scale, bounds, or crop. The legacy queue source name is still configured by `OBS_MEDIA_SOURCE_NAME`.
 
 ## Telegram Setup
 
@@ -43,6 +44,28 @@ Before each playback restart, the bot tries to center the media source in the cu
 7. Copy `.env.example` to `.env` and fill the shared bot, group, OBS, and Local Bot API Server values.
 
 See [deploy/telegram-bot-api](deploy/telegram-bot-api/README.md) for Local Bot API Server setup scripts and the shared `.env` contract.
+
+## Media Library
+
+Put loop videos under `LOOP_MEDIA_DIR` and music files under `MUSIC_MEDIA_DIR`. Defaults are `./data/media/loops` and `./data/media/music`.
+
+Loop filenames must use:
+
+```text
+loop_<period>_<theme>_<variant>.<ext>
+```
+
+`period` must be `morning`, `day`, `evening`, or `night`, for example `loop_morning_xiaozhu-cafe_001.mp4`.
+
+Music filenames must use:
+
+```text
+music_<track>.<ext>
+```
+
+For example `music_lofi-chill-001.mp3`.
+
+Without a Telegram override, each period randomly picks one playable theme and one matching loop asset, then keeps that loop until the period ends. `/preview` materializes and reports the next period's planned pick so the preview matches what will actually play.
 
 ## Run
 
@@ -102,22 +125,24 @@ Common runtime commands:
 
 ## Commands
 
-- Telegram group admins can manage queue playback automatically; no separate admin ID list is required.
+- Telegram group admins can manage library playback automatically; no separate admin ID list is required.
 - The bot registers Telegram command menus and adds inline buttons to common responses.
-- `/queue` shows now playing and upcoming videos.
-- `/now` shows the current video.
-- `/remove <id>` cancels a queued video.
-- `/move <id> <position>` reorders a queued video.
-- `/skip` skips current playback.
-- `/history` shows recently completed/canceled/failed items.
-- `/status` shows queue, OBS, disk, and error state.
+- `/library` shows available loop/music assets by period and theme.
+- `/now` shows the current period, loop, theme, and music.
+- `/preview` shows the next period's planned loop under the current algorithm.
+- `/theme <theme|random>` sets or clears today's theme override.
+- `/select <asset_id|clear>` forces or clears today's direct loop override.
+- `/skip loop` redraws the current period loop.
+- `/skip music` skips to another music track.
+- `/scan` rescans the media library.
+- `/status` shows OBS, library, override, disk, and error state.
 
 ## Notes
 
 - The MVP avoids transcoding to keep CPU use low on the MacBook.
-- Played queue history is retained by `RETENTION_DAYS` and `RETENTION_MAX_FILES`; uploaded files are owned by Telegram Local Bot API Server and are kept by default.
-- SQLite state is stored under `DATA_DIR` so the queue survives restarts.
-- `FALLBACK_MODE=random_played` keeps the channel alive by replaying completed history when the queue is empty.
+- Imported library media is copied into `LOOP_MEDIA_DIR` or `MUSIC_MEDIA_DIR`.
+- SQLite state is stored under `DATA_DIR` so today's overrides and period picks survive restarts.
+- `PLAYER_MODE=queue` enables the legacy queue player; `FALLBACK_MODE=random_played` only applies there.
 - `OBS_PASSWORD` can be left empty when OBS WebSocket authentication is disabled.
 - `TELEGRAM_API_BASE_URL` must point at the Local Bot API Server, for example `http://127.0.0.1:8081`.
 

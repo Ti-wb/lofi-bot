@@ -190,6 +190,276 @@ func TestCallbackRefreshEditsMessage(t *testing.T) {
 	}
 }
 
+func TestLibraryReadOnlyCommandsForNonAdmin(t *testing.T) {
+	bot := &fakeBotAPI{
+		adminResponses: []adminResponse{
+			{admins: []tgbotapi.ChatMember{}},
+			{admins: []tgbotapi.ChatMember{}},
+		},
+	}
+	svc := newTestService(t, bot)
+	svc.hooks.Library = func(context.Context) (string, error) {
+		return "媒體庫", nil
+	}
+	svc.hooks.Preview = func(context.Context) (string, error) {
+		return "預覽", nil
+	}
+
+	response, err := svc.handleCommand(context.Background(), commandMessage(42, "/library"))
+	if err != nil {
+		t.Fatalf("library command: %v", err)
+	}
+	if response.text != "媒體庫" {
+		t.Fatalf("library response = %q", response.text)
+	}
+	assertButton(t, response.markup, "刷新", "library")
+	assertButton(t, response.markup, "預覽", "preview")
+	assertNoButton(t, response.markup, "掃描")
+
+	response, err = svc.handleCommand(context.Background(), commandMessage(42, "/preview"))
+	if err != nil {
+		t.Fatalf("preview command: %v", err)
+	}
+	if response.text != "預覽" {
+		t.Fatalf("preview response = %q", response.text)
+	}
+	assertButton(t, response.markup, "媒體庫", "library")
+	assertNoButton(t, response.markup, "略過循環")
+}
+
+func TestAdminLibraryCommandsRouteArguments(t *testing.T) {
+	svc := newTestService(t, &fakeBotAPI{})
+	cacheAdmin(svc, 42)
+	svc.hooks.Scan = func(context.Context) (string, error) {
+		return "scan ok", nil
+	}
+	svc.hooks.SetTheme = func(_ context.Context, theme string) (string, error) {
+		return "theme " + theme, nil
+	}
+	svc.hooks.SelectLoop = func(_ context.Context, assetID string) (string, error) {
+		return "select " + assetID, nil
+	}
+	svc.hooks.SkipLoop = func(context.Context) (string, error) {
+		return "loop skipped", nil
+	}
+	svc.hooks.SkipMusic = func(context.Context) (string, error) {
+		return "music skipped", nil
+	}
+
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{name: "scan", text: "/scan", want: "scan ok"},
+		{name: "theme", text: "/theme random", want: "theme random"},
+		{name: "select", text: "/select clear", want: "select clear"},
+		{name: "skip loop", text: "/skip loop", want: "loop skipped"},
+		{name: "skip music", text: "/skip music", want: "music skipped"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response, err := svc.handleCommand(context.Background(), commandMessage(42, tt.text))
+			if err != nil {
+				t.Fatalf("handle command: %v", err)
+			}
+			if response.text != tt.want {
+				t.Fatalf("response = %q, want %q", response.text, tt.want)
+			}
+		})
+	}
+}
+
+func TestAdminOnlyLibraryCommandsRejectedForNonAdmin(t *testing.T) {
+	tests := []string{
+		"/scan",
+		"/theme random",
+		"/select asset-1",
+		"/skip loop",
+		"/skip music",
+	}
+	for _, text := range tests {
+		t.Run(text, func(t *testing.T) {
+			bot := &fakeBotAPI{
+				adminResponses: []adminResponse{
+					{admins: []tgbotapi.ChatMember{}},
+					{admins: []tgbotapi.ChatMember{}},
+				},
+			}
+			svc := newTestService(t, bot)
+
+			_, err := svc.handleCommand(context.Background(), commandMessage(42, text))
+			if !errors.Is(err, errAdminOnly) {
+				t.Fatalf("err = %v, want %v", err, errAdminOnly)
+			}
+		})
+	}
+}
+
+func TestLibraryCommandBadArguments(t *testing.T) {
+	svc := newTestService(t, &fakeBotAPI{})
+	cacheAdmin(svc, 42)
+
+	tests := []string{
+		"/theme",
+		"/theme random extra",
+		"/select",
+		"/skip track",
+	}
+	for _, text := range tests {
+		t.Run(text, func(t *testing.T) {
+			_, err := svc.handleCommand(context.Background(), commandMessage(42, text))
+			if !errors.Is(err, errBadCommand) {
+				t.Fatalf("err = %v, want %v", err, errBadCommand)
+			}
+		})
+	}
+}
+
+func TestLibraryCallbackRefreshEditsMessage(t *testing.T) {
+	bot := &fakeBotAPI{
+		adminResponses: []adminResponse{
+			{admins: []tgbotapi.ChatMember{}},
+			{admins: []tgbotapi.ChatMember{}},
+		},
+	}
+	svc := newTestService(t, bot)
+	svc.hooks.Library = func(context.Context) (string, error) {
+		return "library refreshed", nil
+	}
+
+	svc.handleCallback(context.Background(), callbackQuery(42, "library"))
+
+	if bot.editTextCount != 1 {
+		t.Fatalf("edit calls = %d, want 1", bot.editTextCount)
+	}
+	if bot.sendCount != 0 {
+		t.Fatalf("send calls = %d, want 0", bot.sendCount)
+	}
+}
+
+func TestAdminLibraryCallbacksRouteActions(t *testing.T) {
+	svc := newTestService(t, &fakeBotAPI{})
+	cacheAdmin(svc, 42)
+	user := &tgbotapi.User{ID: 42}
+	svc.hooks.Scan = func(context.Context) (string, error) {
+		return "scan ok", nil
+	}
+	svc.hooks.SetTheme = func(_ context.Context, theme string) (string, error) {
+		return "theme " + theme, nil
+	}
+	svc.hooks.SelectLoop = func(_ context.Context, assetID string) (string, error) {
+		return "select " + assetID, nil
+	}
+	svc.hooks.SkipLoop = func(context.Context) (string, error) {
+		return "loop skipped", nil
+	}
+	svc.hooks.SkipMusic = func(context.Context) (string, error) {
+		return "music skipped", nil
+	}
+
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{name: "scan", data: "scan", want: "scan ok"},
+		{name: "theme", data: "theme:random", want: "theme random"},
+		{name: "select", data: "select:asset-1", want: "select asset-1"},
+		{name: "skip loop", data: "skip:loop", want: "loop skipped"},
+		{name: "skip music", data: "skip:music", want: "music skipped"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response, err := svc.routeAction(context.Background(), testChatID, user, tt.data)
+			if err != nil {
+				t.Fatalf("route action: %v", err)
+			}
+			if response.text != tt.want {
+				t.Fatalf("response = %q, want %q", response.text, tt.want)
+			}
+		})
+	}
+}
+
+func TestAdminOnlyLibraryCallbackRejectedForNonAdmin(t *testing.T) {
+	bot := &fakeBotAPI{
+		adminResponses: []adminResponse{
+			{admins: []tgbotapi.ChatMember{}},
+			{admins: []tgbotapi.ChatMember{}},
+		},
+	}
+	svc := newTestService(t, bot)
+	svc.hooks.SkipMusic = func(context.Context) (string, error) {
+		t.Fatal("skip music hook should not be called")
+		return "", nil
+	}
+
+	_, err := svc.routeAction(context.Background(), testChatID, &tgbotapi.User{ID: 42}, "skip:music")
+	if !errors.Is(err, errAdminOnly) {
+		t.Fatalf("err = %v, want %v", err, errAdminOnly)
+	}
+}
+
+func TestHelpAndHomeMenuExposeLibraryControls(t *testing.T) {
+	publicHelp := helpText(false)
+	for _, want := range []string{"/library", "/preview", "/now", "/status", "/help"} {
+		if !strings.Contains(publicHelp, want) {
+			t.Fatalf("public help missing %q: %q", want, publicHelp)
+		}
+	}
+	for _, notWant := range []string{"/scan", "/theme", "/select", "/skip loop"} {
+		if strings.Contains(publicHelp, notWant) {
+			t.Fatalf("public help unexpectedly includes %q: %q", notWant, publicHelp)
+		}
+	}
+
+	adminHelp := helpText(true)
+	for _, want := range []string{"/scan", "/theme <theme|random>", "/select <asset_id|clear>", "/skip loop", "/skip music"} {
+		if !strings.Contains(adminHelp, want) {
+			t.Fatalf("admin help missing %q: %q", want, adminHelp)
+		}
+	}
+
+	publicMenu := homeKeyboard(false)
+	assertButton(t, publicMenu, "媒體庫", "library")
+	assertButton(t, publicMenu, "預覽", "preview")
+	assertNoButton(t, publicMenu, "掃描")
+
+	adminMenu := homeKeyboard(true)
+	assertButton(t, adminMenu, "掃描", "scan")
+	assertButton(t, adminMenu, "隨機主題", "theme:random")
+	assertButton(t, adminMenu, "清除選取", "select:clear")
+	assertButton(t, adminMenu, "略過循環", "skip:loop")
+	assertButton(t, adminMenu, "略過音樂", "skip:music")
+}
+
+func TestQueueModeHelpAndHomeMenuExposeQueueControls(t *testing.T) {
+	publicHelp := helpTextForMode(false, false)
+	for _, want := range []string{"/queue", "/now", "/status", "/history"} {
+		if !strings.Contains(publicHelp, want) {
+			t.Fatalf("queue public help missing %q: %q", want, publicHelp)
+		}
+	}
+	for _, notWant := range []string{"/library", "/preview", "/theme"} {
+		if strings.Contains(publicHelp, notWant) {
+			t.Fatalf("queue public help unexpectedly includes %q: %q", notWant, publicHelp)
+		}
+	}
+	adminHelp := helpTextForMode(true, false)
+	for _, want := range []string{"/move <video_id> <position>", "/remove <video_id>", "/skip"} {
+		if !strings.Contains(adminHelp, want) {
+			t.Fatalf("queue admin help missing %q: %q", want, adminHelp)
+		}
+	}
+
+	menu := homeKeyboardForMode(true, false)
+	assertButton(t, menu, "Queue", "queue")
+	assertButton(t, menu, "History", "history")
+	assertButton(t, menu, "Skip", "skip")
+	assertNoButton(t, menu, "媒體庫")
+}
+
 func TestRegisterCommandsSetsPublicAndAdminScopes(t *testing.T) {
 	bot := &fakeBotAPI{}
 	svc := newTestService(t, bot)
@@ -199,6 +469,64 @@ func TestRegisterCommandsSetsPublicAndAdminScopes(t *testing.T) {
 	}
 	if bot.setCommandsCount != 2 {
 		t.Fatalf("set command calls = %d, want 2", bot.setCommandsCount)
+	}
+	if len(bot.setCommands) != 2 {
+		t.Fatalf("captured command calls = %d, want 2", len(bot.setCommands))
+	}
+	publicCommands := bot.setCommands[0].Commands
+	for _, command := range []string{"library", "preview", "now", "status", "help"} {
+		assertCommand(t, publicCommands, command)
+	}
+	for _, command := range []string{"scan", "theme", "select", "skip", "queue", "history"} {
+		assertNoCommand(t, publicCommands, command)
+	}
+	adminCommands := bot.setCommands[1].Commands
+	for _, command := range []string{"library", "scan", "preview", "theme", "select", "skip", "now", "status", "help"} {
+		assertCommand(t, adminCommands, command)
+	}
+}
+
+func TestQueueModeRegisterCommandsSetsQueueScopes(t *testing.T) {
+	bot := &fakeBotAPI{}
+	svc := newTestService(t, bot)
+	svc.cfg.PlayerMode = "queue"
+
+	if err := svc.registerCommands(context.Background()); err != nil {
+		t.Fatalf("register commands: %v", err)
+	}
+	publicCommands := bot.setCommands[0].Commands
+	for _, command := range []string{"queue", "now", "status", "history", "help"} {
+		assertCommand(t, publicCommands, command)
+	}
+	for _, command := range []string{"library", "preview", "theme", "select"} {
+		assertNoCommand(t, publicCommands, command)
+	}
+	adminCommands := bot.setCommands[1].Commands
+	assertCommand(t, adminCommands, "skip")
+}
+
+func TestQueueModeNowStatusHistoryUseQueueKeyboards(t *testing.T) {
+	bot := &fakeBotAPI{
+		adminResponses: []adminResponse{
+			{admins: []tgbotapi.ChatMember{chatMember(42, "administrator")}},
+			{admins: []tgbotapi.ChatMember{chatMember(42, "administrator")}},
+			{admins: []tgbotapi.ChatMember{chatMember(42, "administrator")}},
+		},
+	}
+	svc := newTestService(t, bot)
+	svc.cfg.PlayerMode = "queue"
+	svc.hooks.Now = func(context.Context) (string, error) { return "now", nil }
+	svc.hooks.Status = func(context.Context) (string, error) { return "status", nil }
+	svc.hooks.History = func(context.Context) (string, error) { return "history", nil }
+
+	for _, command := range []string{"/now", "/status", "/history"} {
+		response, err := svc.handleCommand(context.Background(), commandMessage(42, command))
+		if err != nil {
+			t.Fatalf("%s: %v", command, err)
+		}
+		assertButton(t, response.markup, "Queue", "queue")
+		assertNoButton(t, response.markup, "媒體庫")
+		assertNoButton(t, response.markup, "預覽")
 	}
 }
 
@@ -392,6 +720,7 @@ func TestGetFileCanceledContextDoesNotCallBot(t *testing.T) {
 	defer close(block)
 	bot := &fakeBotAPI{fileBlock: block}
 	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
@@ -419,6 +748,7 @@ func TestGetFileInFlightCanceledContextReturnsQuickly(t *testing.T) {
 	started := make(chan struct{})
 	bot := &fakeBotAPI{fileBlock: block, fileStarted: started}
 	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
 	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
 		t.Fatal("enqueue hook should not be called")
 		return "", nil
@@ -662,6 +992,7 @@ func TestUploadUsesLocalBotAPIFilePath(t *testing.T) {
 		},
 	}
 	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
 	var got Upload
 	svc.hooks.EnqueueUpload = func(_ context.Context, upload Upload) (string, error) {
 		got = upload
@@ -683,10 +1014,175 @@ func TestUploadUsesLocalBotAPIFilePath(t *testing.T) {
 	}
 }
 
+func TestUploadRequiresAdmin(t *testing.T) {
+	bot := &fakeBotAPI{
+		adminResponses: []adminResponse{
+			{admins: []tgbotapi.ChatMember{}},
+			{admins: []tgbotapi.ChatMember{}},
+		},
+	}
+	svc := newTestService(t, bot)
+	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("enqueue hook should not be called")
+		return "", nil
+	}
+
+	_, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 1))
+	if !errors.Is(err, errAdminOnly) {
+		t.Fatalf("err = %v, want %v", err, errAdminOnly)
+	}
+	if bot.fileCallCount != 0 {
+		t.Fatalf("getFile calls = %d, want 0", bot.fileCallCount)
+	}
+}
+
+func TestUploadAcceptsAudioAndVideoDocuments(t *testing.T) {
+	tests := []struct {
+		name     string
+		message  *tgbotapi.Message
+		filePath string
+		wantName string
+		wantMIME string
+		wantKind UploadKind
+	}{
+		{
+			name:     "audio mime",
+			message:  documentMessage("file-id", "unique-id", "song.bin", "audio/mpeg", 12),
+			filePath: "/tmp/song.mp3",
+			wantName: "song.bin",
+			wantMIME: "audio/mpeg",
+			wantKind: UploadKindDocument,
+		},
+		{
+			name:     "video extension",
+			message:  documentMessage("file-id", "unique-id", "clip.mkv", "application/octet-stream", 12),
+			filePath: "/tmp/clip.mkv",
+			wantName: "clip.mkv",
+			wantMIME: "application/octet-stream",
+			wantKind: UploadKindDocument,
+		},
+		{
+			name:     "telegram audio",
+			message:  audioMessage("file-id", "unique-id", "music_lofi.mp3", "audio/mpeg", 12),
+			filePath: "/tmp/music_lofi.mp3",
+			wantName: "music_lofi.mp3",
+			wantMIME: "audio/mpeg",
+			wantKind: UploadKindAudio,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bot := &fakeBotAPI{
+				file: tgbotapi.File{
+					FilePath: tt.filePath,
+					FileSize: 12,
+				},
+			}
+			svc := newTestService(t, bot)
+			cacheAdmin(svc, 42)
+			var got Upload
+			svc.hooks.EnqueueUpload = func(_ context.Context, upload Upload) (string, error) {
+				got = upload
+				return "imported", nil
+			}
+
+			response, err := svc.handleUpload(context.Background(), tt.message)
+			if err != nil {
+				t.Fatalf("handle upload: %v", err)
+			}
+			if response.text != "imported" {
+				t.Fatalf("response = %q, want imported", response.text)
+			}
+			if got.Kind != tt.wantKind {
+				t.Fatalf("kind = %q, want %q", got.Kind, tt.wantKind)
+			}
+			if got.FileName != tt.wantName {
+				t.Fatalf("file name = %q, want %q", got.FileName, tt.wantName)
+			}
+			if got.MimeType != tt.wantMIME {
+				t.Fatalf("mime = %q, want %q", got.MimeType, tt.wantMIME)
+			}
+			if got.LocalPath != tt.filePath {
+				t.Fatalf("local path = %q, want %q", got.LocalPath, tt.filePath)
+			}
+		})
+	}
+}
+
+func TestHandleMessageRoutesAudioUploads(t *testing.T) {
+	bot := &fakeBotAPI{
+		file: tgbotapi.File{
+			FilePath: "/tmp/music_lofi.mp3",
+			FileSize: 12,
+		},
+	}
+	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
+	var got Upload
+	svc.hooks.EnqueueUpload = func(_ context.Context, upload Upload) (string, error) {
+		got = upload
+		return "imported", nil
+	}
+
+	svc.handleMessage(context.Background(), audioMessage("file-id", "unique-id", "music_lofi.mp3", "audio/mpeg", 12))
+
+	if got.Kind != UploadKindAudio {
+		t.Fatalf("kind = %q, want %q", got.Kind, UploadKindAudio)
+	}
+	if got.LocalPath != "/tmp/music_lofi.mp3" {
+		t.Fatalf("local path = %q, want /tmp/music_lofi.mp3", got.LocalPath)
+	}
+	if bot.sendCount != 1 {
+		t.Fatalf("send calls = %d, want 1", bot.sendCount)
+	}
+}
+
+func TestQueueModeRejectsAudioUploadsBeforeGetFile(t *testing.T) {
+	bot := &fakeBotAPI{
+		file: tgbotapi.File{FilePath: "/tmp/music_lofi.mp3"},
+	}
+	svc := newTestService(t, bot)
+	svc.cfg.PlayerMode = "queue"
+	cacheAdmin(svc, 42)
+	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("enqueue hook should not be called")
+		return "", nil
+	}
+
+	_, err := svc.handleUpload(context.Background(), audioMessage("file-id", "unique-id", "music_lofi.mp3", "audio/mpeg", 12))
+	if !errors.Is(err, errUnsupportedUpload) {
+		t.Fatalf("err = %v, want %v", err, errUnsupportedUpload)
+	}
+	if bot.fileCallCount != 0 {
+		t.Fatalf("getFile calls = %d, want 0", bot.fileCallCount)
+	}
+}
+
+func TestUploadRejectsUnsupportedDocumentsBeforeGetFile(t *testing.T) {
+	bot := &fakeBotAPI{
+		file: tgbotapi.File{FilePath: "/tmp/notes.pdf"},
+	}
+	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
+	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("enqueue hook should not be called")
+		return "", nil
+	}
+
+	_, err := svc.handleUpload(context.Background(), documentMessage("file-id", "unique-id", "notes.pdf", "application/pdf", 12))
+	if !errors.Is(err, errUnsupportedUpload) {
+		t.Fatalf("err = %v, want %v", err, errUnsupportedUpload)
+	}
+	if bot.fileCallCount != 0 {
+		t.Fatalf("getFile calls = %d, want 0", bot.fileCallCount)
+	}
+}
+
 func TestUploadReturnsGetFileError(t *testing.T) {
 	getFileErr := errors.New("telegram getFile failed")
 	bot := &fakeBotAPI{fileErr: getFileErr}
 	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
 	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
 		t.Fatal("enqueue hook should not be called")
 		return "", nil
@@ -705,6 +1201,7 @@ func TestUploadReturnsGetFileError(t *testing.T) {
 func TestUploadRejectsDeclaredSizeOverLimit(t *testing.T) {
 	bot := &fakeBotAPI{}
 	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
 	svc.cfg.MaxUploadSizeBytes = 10
 	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
 		t.Fatal("enqueue hook should not be called")
@@ -729,6 +1226,7 @@ func TestUploadRejectsGetFileSizeOverLimit(t *testing.T) {
 		},
 	}
 	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
 	svc.cfg.MaxUploadSizeBytes = 10
 	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
 		t.Fatal("enqueue hook should not be called")
@@ -750,6 +1248,7 @@ func TestUploadAcceptsSizeAtLimit(t *testing.T) {
 		},
 	}
 	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
 	svc.cfg.MaxUploadSizeBytes = 10
 	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
 		return "queued", nil
@@ -770,6 +1269,7 @@ func TestUploadRejectsRelativeLocalBotAPIFilePath(t *testing.T) {
 		file: tgbotapi.File{FilePath: "relative/video.mp4"},
 	}
 	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
 	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
 		t.Fatal("enqueue hook should not be called")
 		return "", nil
@@ -789,7 +1289,7 @@ func TestFriendlyErrorHidesInternalDetailsByDefault(t *testing.T) {
 	if strings.Contains(got, "ffprobe") || strings.Contains(got, "/private") {
 		t.Fatalf("friendly error leaked internal detail: %q", got)
 	}
-	if !strings.Contains(got, "Check /status") {
+	if !strings.Contains(got, "/status") {
 		t.Fatalf("friendly error = %q, want status guidance", got)
 	}
 }
@@ -830,13 +1330,24 @@ func newTestService(t *testing.T, bot *fakeBotAPI) *Service {
 	return svc
 }
 
+func cacheAdmin(svc *Service, userID int64) {
+	svc.adminCache[testChatID] = adminCacheEntry{
+		adminIDs:  map[int64]struct{}{userID: {}},
+		expiresAt: svc.now().Add(adminCacheTTL),
+	}
+}
+
 func commandMessage(userID int64, text string) *tgbotapi.Message {
+	commandLength := len(text)
+	if index := strings.IndexByte(text, ' '); index >= 0 {
+		commandLength = index
+	}
 	return &tgbotapi.Message{
 		Chat: &tgbotapi.Chat{ID: testChatID},
 		From: &tgbotapi.User{ID: userID},
 		Text: text,
 		Entities: []tgbotapi.MessageEntity{
-			{Type: "bot_command", Offset: 0, Length: len(text)},
+			{Type: "bot_command", Offset: 0, Length: commandLength},
 		},
 	}
 }
@@ -862,6 +1373,34 @@ func videoMessage(fileID string, uniqueID string, size int) *tgbotapi.Message {
 			FileUniqueID: uniqueID,
 			FileName:     "video.mp4",
 			MimeType:     "video/mp4",
+			FileSize:     size,
+		},
+	}
+}
+
+func documentMessage(fileID string, uniqueID string, name string, mimeType string, size int) *tgbotapi.Message {
+	return &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: testChatID},
+		From: &tgbotapi.User{ID: 42},
+		Document: &tgbotapi.Document{
+			FileID:       fileID,
+			FileUniqueID: uniqueID,
+			FileName:     name,
+			MimeType:     mimeType,
+			FileSize:     size,
+		},
+	}
+}
+
+func audioMessage(fileID string, uniqueID string, name string, mimeType string, size int) *tgbotapi.Message {
+	return &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: testChatID},
+		From: &tgbotapi.User{ID: 42},
+		Audio: &tgbotapi.Audio{
+			FileID:       fileID,
+			FileUniqueID: uniqueID,
+			FileName:     name,
+			MimeType:     mimeType,
 			FileSize:     size,
 		},
 	}
@@ -911,6 +1450,7 @@ type fakeBotAPI struct {
 	requestCount     int
 	editTextCount    int
 	setCommandsCount int
+	setCommands      []tgbotapi.SetMyCommandsConfig
 	fileCallCount    int
 	file             tgbotapi.File
 	fileErr          error
@@ -974,11 +1514,12 @@ func (f *fakeBotAPI) Request(ctx context.Context, req tgbotapi.Chattable) (*tgbo
 			return nil, ctx.Err()
 		}
 	}
-	switch req.(type) {
+	switch config := req.(type) {
 	case tgbotapi.EditMessageTextConfig:
 		f.editTextCount++
 	case tgbotapi.SetMyCommandsConfig:
 		f.setCommandsCount++
+		f.setCommands = append(f.setCommands, config)
 	}
 	return &tgbotapi.APIResponse{}, f.requestErr
 }
@@ -1043,6 +1584,25 @@ func assertNoButton(t *testing.T, markup *tgbotapi.InlineKeyboardMarkup, text st
 			if button.Text == text {
 				t.Fatalf("unexpected button %q in %#v", text, markup.InlineKeyboard)
 			}
+		}
+	}
+}
+
+func assertCommand(t *testing.T, commands []tgbotapi.BotCommand, command string) {
+	t.Helper()
+	for _, got := range commands {
+		if got.Command == command {
+			return
+		}
+	}
+	t.Fatalf("missing command %q in %#v", command, commands)
+}
+
+func assertNoCommand(t *testing.T, commands []tgbotapi.BotCommand, command string) {
+	t.Helper()
+	for _, got := range commands {
+		if got.Command == command {
+			t.Fatalf("unexpected command %q in %#v", command, commands)
 		}
 	}
 }
