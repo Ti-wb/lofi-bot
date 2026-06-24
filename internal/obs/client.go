@@ -25,6 +25,11 @@ const (
 	opRequestResponse = 7
 
 	defaultRequestTimeout = 10 * time.Second
+	// OBS media-ended events do not include a playback generation or file path.
+	// A just-replaced source can still emit the previous file's ended event, so
+	// keep the superseded path briefly instead of attributing that event to the
+	// new file.
+	supersededEndedEventWindow = 2 * time.Second
 
 	mediaActionRestart = "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART"
 	mediaActionStop    = "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_STOP"
@@ -82,18 +87,24 @@ type PlaySourceOptions struct {
 	CenterSceneItem bool
 }
 
+type supersededSourceFile struct {
+	path  string
+	until time.Time
+}
+
 type Client struct {
 	opts Options
 
-	mu           sync.Mutex
-	state        State
-	conn         *websocket.Conn
-	connectedAt  time.Time
-	currentFile  string
-	currentFiles map[string]string
-	lastErr      error
-	pending      map[string]chan requestResponseData
-	closed       bool
+	mu              sync.Mutex
+	state           State
+	conn            *websocket.Conn
+	connectedAt     time.Time
+	currentFile     string
+	currentFiles    map[string]string
+	supersededFiles map[string]supersededSourceFile
+	lastErr         error
+	pending         map[string]chan requestResponseData
+	closed          bool
 
 	writeMu sync.Mutex
 	nextID  atomic.Uint64
@@ -120,11 +131,12 @@ func NewClient(opts Options) (*Client, error) {
 		opts.Logger = slog.Default()
 	}
 	return &Client{
-		opts:         opts,
-		state:        StateDisconnected,
-		currentFiles: make(map[string]string),
-		pending:      make(map[string]chan requestResponseData),
-		events:       make(chan Event, opts.EventBuffer),
+		opts:            opts,
+		state:           StateDisconnected,
+		currentFiles:    make(map[string]string),
+		supersededFiles: make(map[string]supersededSourceFile),
+		pending:         make(map[string]chan requestResponseData),
+		events:          make(chan Event, opts.EventBuffer),
 	}, nil
 }
 
@@ -326,6 +338,14 @@ func (c *Client) StopSource(ctx context.Context, sourceName string) error {
 
 func (c *Client) setCurrentFile(sourceName string, path string) {
 	c.mu.Lock()
+	if previous, ok := c.currentFiles[sourceName]; ok {
+		c.supersededFiles[sourceName] = supersededSourceFile{
+			path:  previous,
+			until: time.Now().UTC().Add(supersededEndedEventWindow),
+		}
+	} else {
+		delete(c.supersededFiles, sourceName)
+	}
 	c.currentFiles[sourceName] = path
 	if sourceName == c.opts.MediaSourceName {
 		c.currentFile = path
@@ -336,6 +356,7 @@ func (c *Client) setCurrentFile(sourceName string, path string) {
 func (c *Client) clearCurrentFile(sourceName string) {
 	c.mu.Lock()
 	delete(c.currentFiles, sourceName)
+	delete(c.supersededFiles, sourceName)
 	if sourceName == c.opts.MediaSourceName {
 		c.currentFile = ""
 	}
@@ -521,6 +542,24 @@ func (c *Client) handleEvent(raw json.RawMessage) {
 	if c.closed {
 		c.mu.Unlock()
 		return
+	}
+	if superseded, ok := c.supersededFiles[inputName]; ok {
+		if !event.At.After(superseded.until) {
+			delete(c.supersededFiles, inputName)
+			if superseded.path == "" || superseded.path == c.currentFiles[inputName] {
+				c.mu.Unlock()
+				return
+			}
+			event.Path = superseded.path
+			select {
+			case c.events <- event:
+			default:
+				c.opts.Logger.Warn("drop OBS event because event channel is full", "event", event.Type)
+			}
+			c.mu.Unlock()
+			return
+		}
+		delete(c.supersededFiles, inputName)
 	}
 	path, tracked := c.currentFiles[inputName]
 	if inputName != c.opts.MediaSourceName && !tracked {

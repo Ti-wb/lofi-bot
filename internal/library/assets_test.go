@@ -146,6 +146,57 @@ func TestScanFiltersAndBuildsStableAssets(t *testing.T) {
 	}
 }
 
+func TestScanDirsReturnsAbsoluteAssetPathsForRelativeDirs(t *testing.T) {
+	root := t.TempDir()
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previousWD); err != nil {
+			t.Fatalf("restore working directory: %v", err)
+		}
+	})
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("change working directory: %v", err)
+	}
+	mkdir(t, filepath.Join("media", "loops"))
+	mkdir(t, filepath.Join("media", "music"))
+	writeFile(t, filepath.Join("media", "loops", "loop_day_cafe_001.mp4"))
+	writeFile(t, filepath.Join("media", "music", "music_alpha.mp3"))
+
+	lib, err := ScanDirs(filepath.Join("media", "loops"), filepath.Join("media", "music"))
+	if err != nil {
+		t.Fatalf("ScanDirs() error = %v", err)
+	}
+	if len(lib.Loops) != 1 || len(lib.Music) != 1 {
+		t.Fatalf("library counts: loops=%d music=%d", len(lib.Loops), len(lib.Music))
+	}
+	wantLoopPath, err := filepath.Abs(filepath.Join("media", "loops", "loop_day_cafe_001.mp4"))
+	if err != nil {
+		t.Fatalf("absolute loop path: %v", err)
+	}
+	if lib.Loops[0].Path != wantLoopPath {
+		t.Fatalf("loop path = %q, want %q", lib.Loops[0].Path, wantLoopPath)
+	}
+	wantMusicPath, err := filepath.Abs(filepath.Join("media", "music", "music_alpha.mp3"))
+	if err != nil {
+		t.Fatalf("absolute music path: %v", err)
+	}
+	if lib.Music[0].Path != wantMusicPath {
+		t.Fatalf("music path = %q, want %q", lib.Music[0].Path, wantMusicPath)
+	}
+	if !filepath.IsAbs(lib.Loops[0].Path) || !filepath.IsAbs(lib.Music[0].Path) {
+		t.Fatalf("asset paths should be absolute: loop=%q music=%q", lib.Loops[0].Path, lib.Music[0].Path)
+	}
+	if lib.Loops[0].ID != StableID(KindLoop, "loops/loop_day_cafe_001.mp4") {
+		t.Fatalf("loop ID = %q, want stable relpath ID", lib.Loops[0].ID)
+	}
+	if lib.Music[0].ID != StableID(KindMusic, "music/music_alpha.mp3") {
+		t.Fatalf("music ID = %q, want stable relpath ID", lib.Music[0].ID)
+	}
+}
+
 func TestScanReturnsStructuredIssuesAndValidAssets(t *testing.T) {
 	mediaDir := t.TempDir()
 	mkdir(t, filepath.Join(mediaDir, "loops"))

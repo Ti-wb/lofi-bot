@@ -243,7 +243,10 @@ func (l Library) Summary() Summary {
 }
 
 func scanLoops(mediaDir string) ([]Loop, []*Error) {
-	dir := mediaDir
+	dir, err := filepath.Abs(mediaDir)
+	if err != nil {
+		return nil, []*Error{fileError(ErrorReadDirectory, KindLoop, "", "directory", mediaDir, err)}
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -284,7 +287,10 @@ func scanLoops(mediaDir string) ([]Loop, []*Error) {
 }
 
 func scanMusic(mediaDir string) ([]Music, []*Error) {
-	dir := mediaDir
+	dir, err := filepath.Abs(mediaDir)
+	if err != nil {
+		return nil, []*Error{fileError(ErrorReadDirectory, KindMusic, "", "directory", mediaDir, err)}
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
