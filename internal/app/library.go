@@ -18,6 +18,7 @@ import (
 )
 
 const librarySchedulerInterval = 15 * time.Second
+const importedLibraryFileMode = 0o644
 
 func (s *Service) libraryMode() bool {
 	return s.cfg.PlayerMode == "library"
@@ -77,9 +78,21 @@ func (s *Service) recoverLibraryPlaybackAfterOBSConnect(ctx context.Context) err
 	}
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
+	activeMusic, replayActiveMusic := s.musicForActiveStateLocked(s.activeMusicID, s.activeMusicPath)
 	s.clearActiveLoopLocked()
-	s.clearActiveMusicLocked()
-	return s.ensureLibraryPlaybackLocked(ctx, false)
+	if !replayActiveMusic {
+		s.clearActiveMusicLocked()
+	}
+	if err := s.ensureLibraryPlaybackLocked(ctx, false); err != nil {
+		return err
+	}
+	if replayActiveMusic {
+		if err := s.playMusicLocked(ctx, activeMusic, false); err != nil {
+			s.clearActiveMusicLocked()
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Service) handleLibraryOBSEvent(ctx context.Context, event obs.Event) error {
@@ -215,6 +228,10 @@ func (s *Service) playNextMusicLocked(ctx context.Context, force bool) error {
 	if err != nil {
 		return err
 	}
+	return s.playMusicLocked(ctx, music, force)
+}
+
+func (s *Service) playMusicLocked(ctx context.Context, music medialib.Music, requireStatePersist bool) error {
 	looping := false
 	mute := false
 	if err := s.obs.PlaySourceFile(ctx, s.cfg.OBSMusicSourceName, music.Path, obs.PlaySourceOptions{
@@ -227,10 +244,24 @@ func (s *Service) playNextMusicLocked(ctx context.Context, force bool) error {
 	}
 	s.activeMusicID = music.ID
 	s.activeMusicPath = music.Path
-	if err := s.libDB.SetLastMusicID(ctx, music.ID); err != nil && force {
+	if err := s.libDB.SetLastMusicID(ctx, music.ID); err != nil && requireStatePersist {
 		return err
 	}
 	return nil
+}
+
+func (s *Service) musicForActiveStateLocked(id string, path string) (medialib.Music, bool) {
+	for _, music := range s.librarySnapshot.Music {
+		if id != "" && music.ID == id {
+			return music, true
+		}
+	}
+	for _, music := range s.librarySnapshot.Music {
+		if path != "" && music.Path == path {
+			return music, true
+		}
+	}
+	return medialib.Music{}, false
 }
 
 func (s *Service) loopForTimeLocked(ctx context.Context, t time.Time, force bool) (medialib.Loop, medialib.PeriodInfo, string, error) {
@@ -460,7 +491,7 @@ func copyFile(dst string, src string) error {
 	}
 	defer in.Close()
 	tmp := dst + ".tmp-" + shortHash(src+time.Now().String())
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, importedLibraryFileMode)
 	if err != nil {
 		return err
 	}
@@ -473,6 +504,10 @@ func copyFile(dst string, src string) error {
 	if closeErr != nil {
 		_ = os.Remove(tmp)
 		return closeErr
+	}
+	if err := os.Chmod(tmp, importedLibraryFileMode); err != nil {
+		_ = os.Remove(tmp)
+		return err
 	}
 	if err := os.Rename(tmp, dst); err != nil {
 		_ = os.Remove(tmp)

@@ -93,6 +93,7 @@ func TestLibraryReconnectReplaysActiveSources(t *testing.T) {
 	svc, fakeOBS := newLibraryTestService(t)
 	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
 	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_beta.mp3")
 	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
 
 	if err := svc.ScanLibrary(ctx); err != nil {
@@ -535,6 +536,13 @@ func TestLibraryImportCopiesValidAssetsAndRejectsDuplicates(t *testing.T) {
 	dest := filepath.Join(svc.cfg.LoopMediaDir, "loop_morning_cafe_001.mp4")
 	if !fileExists(dest) {
 		t.Fatalf("expected imported file at %s", dest)
+	}
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatalf("stat imported file: %v", err)
+	}
+	if got := info.Mode().Perm(); got != importedLibraryFileMode {
+		t.Fatalf("imported file mode = %#o, want %#o", got, importedLibraryFileMode)
 	}
 	if _, err := svc.ImportLibraryUpload(ctx, UploadRequest{
 		LocalPath: source,

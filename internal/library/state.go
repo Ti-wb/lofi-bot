@@ -90,7 +90,7 @@ SELECT date_key, theme, direct_loop_id FROM library_overrides WHERE date_key = ?
 }
 
 func (s *StateStore) SetThemeOverride(ctx context.Context, date string, theme string) error {
-	now := formatStateTime(time.Now().UTC())
+	now := formatStateTime(time.Now())
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO library_overrides (date_key, theme, direct_loop_id, updated_at)
 VALUES (?, ?, '', ?)
@@ -100,7 +100,7 @@ ON CONFLICT(date_key) DO UPDATE SET theme = excluded.theme, direct_loop_id = '',
 }
 
 func (s *StateStore) ClearThemeOverride(ctx context.Context, date string) error {
-	now := formatStateTime(time.Now().UTC())
+	now := formatStateTime(time.Now())
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO library_overrides (date_key, theme, direct_loop_id, updated_at)
 VALUES (?, '', '', ?)
@@ -110,7 +110,7 @@ ON CONFLICT(date_key) DO UPDATE SET theme = '', updated_at = excluded.updated_at
 }
 
 func (s *StateStore) SetDirectLoopOverride(ctx context.Context, date string, loopID string) error {
-	now := formatStateTime(time.Now().UTC())
+	now := formatStateTime(time.Now())
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO library_overrides (date_key, theme, direct_loop_id, updated_at)
 VALUES (?, '', ?, ?)
@@ -120,7 +120,7 @@ ON CONFLICT(date_key) DO UPDATE SET direct_loop_id = excluded.direct_loop_id, up
 }
 
 func (s *StateStore) ClearDirectLoopOverride(ctx context.Context, date string) error {
-	now := formatStateTime(time.Now().UTC())
+	now := formatStateTime(time.Now())
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO library_overrides (date_key, theme, direct_loop_id, updated_at)
 VALUES (?, '', '', ?)
@@ -130,7 +130,7 @@ ON CONFLICT(date_key) DO UPDATE SET direct_loop_id = '', updated_at = excluded.u
 }
 
 func (s *StateStore) ClearOverride(ctx context.Context, date string) error {
-	now := formatStateTime(time.Now().UTC())
+	now := formatStateTime(time.Now())
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO library_overrides (date_key, theme, direct_loop_id, updated_at)
 VALUES (?, '', '', ?)
@@ -160,7 +160,7 @@ SELECT date_key, period, theme, loop_id FROM library_period_plans WHERE date_key
 }
 
 func (s *StateStore) SavePeriodPlan(ctx context.Context, plan PeriodPlan) error {
-	now := formatStateTime(time.Now().UTC())
+	now := formatStateTime(time.Now())
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO library_period_plans (date_key, period, theme, loop_id, updated_at)
 VALUES (?, ?, ?, ?, ?)
@@ -191,7 +191,7 @@ func (s *StateStore) LastMusicID(ctx context.Context) (string, error) {
 }
 
 func (s *StateStore) SetLastMusicID(ctx context.Context, id string) error {
-	now := formatStateTime(time.Now().UTC())
+	now := formatStateTime(time.Now())
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO library_kv (key, value, updated_at) VALUES ('last_music_id', ?, ?)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
