@@ -101,7 +101,7 @@ type Client struct {
 	connectedAt     time.Time
 	currentFile     string
 	currentFiles    map[string]string
-	supersededFiles map[string]supersededSourceFile
+	supersededFiles map[string][]supersededSourceFile
 	lastErr         error
 	pending         map[string]chan requestResponseData
 	closed          bool
@@ -134,7 +134,7 @@ func NewClient(opts Options) (*Client, error) {
 		opts:            opts,
 		state:           StateDisconnected,
 		currentFiles:    make(map[string]string),
-		supersededFiles: make(map[string]supersededSourceFile),
+		supersededFiles: make(map[string][]supersededSourceFile),
 		pending:         make(map[string]chan requestResponseData),
 		events:          make(chan Event, opts.EventBuffer),
 	}, nil
@@ -338,10 +338,13 @@ func (c *Client) StopSource(ctx context.Context, sourceName string) error {
 
 func (c *Client) setCurrentFile(sourceName string, path string) {
 	c.mu.Lock()
+	now := time.Now().UTC()
 	if previous, ok := c.currentFiles[sourceName]; ok {
-		c.supersededFiles[sourceName] = supersededSourceFile{
-			path:  previous,
-			until: time.Now().UTC().Add(supersededEndedEventWindow),
+		if previous != "" && previous != path {
+			c.supersededFiles[sourceName] = appendSupersededSourceFile(c.supersededFiles[sourceName], supersededSourceFile{
+				path:  previous,
+				until: now.Add(supersededEndedEventWindow),
+			}, now)
 		}
 	} else {
 		delete(c.supersededFiles, sourceName)
@@ -351,6 +354,19 @@ func (c *Client) setCurrentFile(sourceName string, path string) {
 		c.currentFile = path
 	}
 	c.mu.Unlock()
+}
+
+func appendSupersededSourceFile(queue []supersededSourceFile, file supersededSourceFile, now time.Time) []supersededSourceFile {
+	queue = pruneSupersededSourceFiles(queue, now)
+	return append(queue, file)
+}
+
+func pruneSupersededSourceFiles(queue []supersededSourceFile, now time.Time) []supersededSourceFile {
+	idx := 0
+	for idx < len(queue) && now.After(queue[idx].until) {
+		idx++
+	}
+	return queue[idx:]
 }
 
 func (c *Client) clearCurrentFile(sourceName string) {
@@ -543,23 +559,15 @@ func (c *Client) handleEvent(raw json.RawMessage) {
 		c.mu.Unlock()
 		return
 	}
-	if superseded, ok := c.supersededFiles[inputName]; ok {
-		if !event.At.After(superseded.until) {
-			delete(c.supersededFiles, inputName)
-			if superseded.path == "" || superseded.path == c.currentFiles[inputName] {
-				c.mu.Unlock()
-				return
-			}
-			event.Path = superseded.path
-			select {
-			case c.events <- event:
-			default:
-				c.opts.Logger.Warn("drop OBS event because event channel is full", "event", event.Type)
-			}
-			c.mu.Unlock()
-			return
+	if supersededPath, ok := c.popSupersededSourceFileLocked(inputName, event.At); ok {
+		event.Path = supersededPath
+		select {
+		case c.events <- event:
+		default:
+			c.opts.Logger.Warn("drop OBS event because event channel is full", "event", event.Type)
 		}
-		delete(c.supersededFiles, inputName)
+		c.mu.Unlock()
+		return
 	}
 	path, tracked := c.currentFiles[inputName]
 	if inputName != c.opts.MediaSourceName && !tracked {
@@ -581,6 +589,24 @@ func (c *Client) handleEvent(raw json.RawMessage) {
 		c.opts.Logger.Warn("drop OBS event because event channel is full", "event", event.Type)
 	}
 	c.mu.Unlock()
+}
+
+func (c *Client) popSupersededSourceFileLocked(inputName string, now time.Time) (string, bool) {
+	queue := pruneSupersededSourceFiles(c.supersededFiles[inputName], now)
+	for len(queue) > 0 {
+		superseded := queue[0]
+		queue = queue[1:]
+		if superseded.path != "" && superseded.path != c.currentFiles[inputName] {
+			if len(queue) == 0 {
+				delete(c.supersededFiles, inputName)
+			} else {
+				c.supersededFiles[inputName] = queue
+			}
+			return superseded.path, true
+		}
+	}
+	delete(c.supersededFiles, inputName)
+	return "", false
 }
 
 func (c *Client) handleRequestResponse(raw json.RawMessage) {

@@ -730,6 +730,82 @@ func TestClientDoesNotAttributeSupersededEndedEventToCurrentPath(t *testing.T) {
 	assertCurrentFile(t, client, "music", "/tmp/new.mp3")
 }
 
+func TestClientQueuesMultipleSupersededEndedEvents(t *testing.T) {
+	sendEnded := make(chan struct{})
+	wroteEnded := make(chan struct{}, 3)
+	defer close(sendEnded)
+
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		for i := 0; i < 3; i++ {
+			req, err := readRequest(conn)
+			if err != nil {
+				return err
+			}
+			if err := writeEnvelope(conn, successfulRequestResponse(req)); err != nil {
+				return err
+			}
+		}
+		for i := 0; i < 3; i++ {
+			<-sendEnded
+			if err := writeEnvelope(conn, mediaEndedEvent("music")); err != nil {
+				return err
+			}
+			wroteEnded <- struct{}{}
+		}
+		return nil
+	})
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
+
+	if err := client.PlaySourceFile(context.Background(), "music", "/tmp/old.mp3", PlaySourceOptions{}); err != nil {
+		t.Fatalf("PlaySourceFile old: %v", err)
+	}
+	if err := client.PlaySourceFile(context.Background(), "music", "/tmp/middle.mp3", PlaySourceOptions{}); err != nil {
+		t.Fatalf("PlaySourceFile middle: %v", err)
+	}
+	if err := client.PlaySourceFile(context.Background(), "music", "/tmp/new.mp3", PlaySourceOptions{}); err != nil {
+		t.Fatalf("PlaySourceFile new: %v", err)
+	}
+
+	for _, wantPath := range []string{"/tmp/old.mp3", "/tmp/middle.mp3"} {
+		sendEnded <- struct{}{}
+		event := receiveEvent(t, client.Events())
+		if event.InputName != "music" {
+			t.Fatalf("event inputName = %q, want music", event.InputName)
+		}
+		if event.Path != wantPath {
+			t.Fatalf("event path = %q, want superseded path %q", event.Path, wantPath)
+		}
+		waitForSignal(t, wroteEnded, "server did not write superseded ended event")
+		assertCurrentFile(t, client, "music", "/tmp/new.mp3")
+	}
+
+	sendEnded <- struct{}{}
+	event := receiveEvent(t, client.Events())
+	if event.Path != "/tmp/new.mp3" {
+		t.Fatalf("event path = %q, want current path /tmp/new.mp3", event.Path)
+	}
+	waitForSignal(t, wroteEnded, "server did not write current ended event")
+	assertNoCurrentFile(t, client, "music")
+}
+
 func TestClientRequestTimeoutClearsPendingAndDisconnects(t *testing.T) {
 	requestReceived := make(chan struct{}, 1)
 	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
