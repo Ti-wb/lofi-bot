@@ -299,14 +299,33 @@ func envMigrationAdditions(version int, values map[string]string) []string {
 		if _, ok := values["OBS_MUSIC_SOURCE_NAME"]; !ok {
 			additions = append(additions, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
 		}
+		mediaDir := libraryMediaDirDefault(values)
 		if _, ok := values["LOOP_MEDIA_DIR"]; !ok {
-			additions = append(additions, "LOOP_MEDIA_DIR=./data/media/loops")
+			additions = append(additions, "LOOP_MEDIA_DIR="+joinEnvPath(mediaDir, "loops"))
 		}
 		if _, ok := values["MUSIC_MEDIA_DIR"]; !ok {
-			additions = append(additions, "MUSIC_MEDIA_DIR=./data/media/music")
+			additions = append(additions, "MUSIC_MEDIA_DIR="+joinEnvPath(mediaDir, "music"))
 		}
 	}
 	return additions
+}
+
+func libraryMediaDirDefault(values map[string]string) string {
+	if mediaDir := strings.TrimSpace(values["MEDIA_DIR"]); mediaDir != "" {
+		return mediaDir
+	}
+	if dataDir := strings.TrimSpace(values["DATA_DIR"]); dataDir != "" {
+		return joinEnvPath(dataDir, "media")
+	}
+	return "./data/media"
+}
+
+func joinEnvPath(base string, elem string) string {
+	base = strings.TrimRight(strings.TrimSpace(base), `/\`)
+	if base == "" {
+		return "/" + elem
+	}
+	return base + "/" + elem
 }
 
 func parseDotEnv(body []byte) map[string]string {

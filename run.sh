@@ -149,6 +149,29 @@ add_env_migration_line() {
 "
 }
 
+join_env_path() {
+  base=$(printf '%s' "$1" | sed 's#[/\\]*$##')
+  if [ -z "$base" ]; then
+    printf '/%s' "$2"
+  else
+    printf '%s/%s' "$base" "$2"
+  fi
+}
+
+library_media_dir_default_from_env_file() {
+  media_dir=$(dotenv_value MEDIA_DIR)
+  if [ -n "$media_dir" ]; then
+    printf '%s' "$media_dir"
+    return
+  fi
+  data_dir=$(dotenv_value DATA_DIR)
+  if [ -n "$data_dir" ]; then
+    join_env_path "$data_dir" media
+    return
+  fi
+  printf './data/media'
+}
+
 migrate_env() {
   [ -f "$ENV_FILE" ] || die ".env is required at repo root"
 
@@ -206,15 +229,20 @@ migrate_env() {
     for line in \
       "PLAYER_MODE=library" \
       "OBS_LOOP_SOURCE_NAME=tg_loop_player" \
-      "OBS_MUSIC_SOURCE_NAME=tg_music_player" \
-      "LOOP_MEDIA_DIR=./data/media/loops" \
-      "MUSIC_MEDIA_DIR=./data/media/music"
+      "OBS_MUSIC_SOURCE_NAME=tg_music_player"
     do
       key=${line%%=*}
       if ! dotenv_has_key "$key"; then
         add_env_migration_line "$line"
       fi
     done
+    library_media_dir=$(library_media_dir_default_from_env_file)
+    if ! dotenv_has_key LOOP_MEDIA_DIR; then
+      add_env_migration_line "LOOP_MEDIA_DIR=$(join_env_path "$library_media_dir" loops)"
+    fi
+    if ! dotenv_has_key MUSIC_MEDIA_DIR; then
+      add_env_migration_line "MUSIC_MEDIA_DIR=$(join_env_path "$library_media_dir" music)"
+    fi
   fi
 
   if [ "$update_schema_version" -eq 0 ] && [ -z "$ENV_MIGRATION_ADDITIONS" ]; then
@@ -277,9 +305,10 @@ load_env() {
   : "${PLAYER_MODE:=library}"
   : "${OBS_LOOP_SOURCE_NAME:=tg_loop_player}"
   : "${OBS_MUSIC_SOURCE_NAME:=tg_music_player}"
-  : "${MEDIA_DIR:=./data/media}"
-  : "${LOOP_MEDIA_DIR:=./data/media/loops}"
-  : "${MUSIC_MEDIA_DIR:=./data/media/music}"
+  : "${DATA_DIR:=./data}"
+  : "${MEDIA_DIR:=$(join_env_path "$DATA_DIR" media)}"
+  : "${LOOP_MEDIA_DIR:=$(join_env_path "$MEDIA_DIR" loops)}"
+  : "${MUSIC_MEDIA_DIR:=$(join_env_path "$MEDIA_DIR" music)}"
 }
 
 require_value() {
@@ -407,10 +436,14 @@ bot_api_dir_abs() {
 }
 
 media_dir_default() {
+  default_media_dir=${MEDIA_DIR:-}
+  if [ -z "$default_media_dir" ]; then
+    default_media_dir=$(join_env_path "${DATA_DIR:-./data}" media)
+  fi
   case "$1" in
-    MEDIA_DIR) printf './data/media' ;;
-    LOOP_MEDIA_DIR) printf './data/media/loops' ;;
-    MUSIC_MEDIA_DIR) printf './data/media/music' ;;
+    MEDIA_DIR) printf '%s' "$default_media_dir" ;;
+    LOOP_MEDIA_DIR) join_env_path "$default_media_dir" loops ;;
+    MUSIC_MEDIA_DIR) join_env_path "$default_media_dir" music ;;
     *) printf '' ;;
   esac
 }

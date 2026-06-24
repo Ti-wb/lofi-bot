@@ -439,6 +439,59 @@ MAX_VIDEO_SIZE_MB=123
 	assertContains(t, migrated, "MUSIC_MEDIA_DIR=./data/media/music")
 }
 
+func TestLoadMigrationDerivesLibraryDirsFromCustomMediaDir(t *testing.T) {
+	clearConfigEnv(t)
+	dir := chdirTemp(t)
+	envPath := filepath.Join(dir, ".env")
+	body := []byte(`
+ENV_SCHEMA_VERSION=3
+TELEGRAM_BOT_TOKEN=token
+TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
+ALLOWED_CHAT_ID=-1001
+MEDIA_DIR=/srv/lofi/media
+`)
+	if err := os.WriteFile(envPath, body, 0o600); err != nil {
+		t.Fatalf("write env: %v", err)
+	}
+
+	if err := migrateDotEnv(envPath); err != nil {
+		t.Fatalf("migrate env: %v", err)
+	}
+	migrated := readFile(t, envPath)
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=4")
+	assertContains(t, migrated, "MEDIA_DIR=/srv/lofi/media")
+	assertContains(t, migrated, "LOOP_MEDIA_DIR=/srv/lofi/media/loops")
+	assertContains(t, migrated, "MUSIC_MEDIA_DIR=/srv/lofi/media/music")
+	if strings.Contains(migrated, "LOOP_MEDIA_DIR=./data/media/loops") || strings.Contains(migrated, "MUSIC_MEDIA_DIR=./data/media/music") {
+		t.Fatalf("migration should not hard-code default media dirs when MEDIA_DIR is set:\n%s", migrated)
+	}
+}
+
+func TestLoadMigrationDerivesLibraryDirsFromCustomDataDir(t *testing.T) {
+	clearConfigEnv(t)
+	dir := chdirTemp(t)
+	envPath := filepath.Join(dir, ".env")
+	body := []byte(`
+ENV_SCHEMA_VERSION=3
+TELEGRAM_BOT_TOKEN=token
+TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
+ALLOWED_CHAT_ID=-1001
+DATA_DIR=/srv/lofi/data
+`)
+	if err := os.WriteFile(envPath, body, 0o600); err != nil {
+		t.Fatalf("write env: %v", err)
+	}
+
+	if err := migrateDotEnv(envPath); err != nil {
+		t.Fatalf("migrate env: %v", err)
+	}
+	migrated := readFile(t, envPath)
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=4")
+	assertContains(t, migrated, "DATA_DIR=/srv/lofi/data")
+	assertContains(t, migrated, "LOOP_MEDIA_DIR=/srv/lofi/data/media/loops")
+	assertContains(t, migrated, "MUSIC_MEDIA_DIR=/srv/lofi/data/media/music")
+}
+
 func TestLoadMigrationUpdatesExplicitOldVersion(t *testing.T) {
 	clearConfigEnv(t)
 	dir := chdirTemp(t)

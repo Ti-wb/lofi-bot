@@ -75,23 +75,28 @@ func (s *Service) recoverLibraryPlaybackAfterOBSConnect(ctx context.Context) err
 	if err := s.ScanLibrary(ctx); err != nil {
 		s.logger.Warn("media library scan found issues during OBS recovery", "error", s.redactError(err))
 	}
-	return s.ensureLibraryPlayback(ctx, false)
+	s.playbackMu.Lock()
+	defer s.playbackMu.Unlock()
+	s.clearActiveLoopLocked()
+	s.clearActiveMusicLocked()
+	return s.ensureLibraryPlaybackLocked(ctx, false)
 }
 
 func (s *Service) handleLibraryOBSEvent(ctx context.Context, event obs.Event) error {
 	switch event.InputName {
 	case s.cfg.OBSMusicSourceName:
-		return s.playNextMusic(ctx, true)
+		return s.playNextMusicAfterEnded(ctx)
 	case s.cfg.OBSLoopSourceName:
-		return s.restartLibraryLoop(ctx)
+		return s.restartLibraryLoopAfterEnded(ctx)
 	default:
 		return nil
 	}
 }
 
-func (s *Service) restartLibraryLoop(ctx context.Context) error {
+func (s *Service) restartLibraryLoopAfterEnded(ctx context.Context) error {
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
+	s.clearActiveLoopLocked()
 
 	loop, info, _, err := s.loopForTimeLocked(ctx, s.now(), false)
 	if err != nil {
@@ -114,6 +119,19 @@ func (s *Service) restartLibraryLoop(ctx context.Context) error {
 	s.activeLoopEndsAt = info.EndsAt
 	s.setPlaybackState(playbackFile, 0, loop.Path)
 	return nil
+}
+
+func (s *Service) clearActiveLoopLocked() {
+	s.activeLoopID = ""
+	s.activeLoopPath = ""
+	s.activeLoopTheme = ""
+	s.activeLoopPeriod = ""
+	s.activeLoopEndsAt = time.Time{}
+}
+
+func (s *Service) clearActiveMusicLocked() {
+	s.activeMusicID = ""
+	s.activeMusicPath = ""
 }
 
 func (s *Service) ensureLibraryPlayback(ctx context.Context, forceLoop bool) error {
@@ -165,6 +183,13 @@ func (s *Service) playNextMusic(ctx context.Context, force bool) error {
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
 	return s.playNextMusicLocked(ctx, force)
+}
+
+func (s *Service) playNextMusicAfterEnded(ctx context.Context) error {
+	s.playbackMu.Lock()
+	defer s.playbackMu.Unlock()
+	s.clearActiveMusicLocked()
+	return s.playNextMusicLocked(ctx, true)
 }
 
 func (s *Service) playNextMusicLocked(ctx context.Context, force bool) error {

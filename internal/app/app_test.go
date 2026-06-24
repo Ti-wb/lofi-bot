@@ -88,6 +88,44 @@ func TestLibraryPlaybackKeepsLoopUntilPeriodEnds(t *testing.T) {
 	}
 }
 
+func TestLibraryReconnectReplaysActiveSources(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	loopPath := fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]
+	musicPath := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]
+	loopCount := fakeOBS.sourcePlayCount[svc.cfg.OBSLoopSourceName]
+	musicCount := fakeOBS.sourcePlayCount[svc.cfg.OBSMusicSourceName]
+	if loopPath == "" || musicPath == "" {
+		t.Fatalf("expected initial loop and music playback, loop=%q music=%q", loopPath, musicPath)
+	}
+
+	if err := svc.recoverLibraryPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover playback: %v", err)
+	}
+	if got := fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]; got != loopPath {
+		t.Fatalf("recovered loop path = %q, want %q", got, loopPath)
+	}
+	if got := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]; got != musicPath {
+		t.Fatalf("recovered music path = %q, want %q", got, musicPath)
+	}
+	if got := fakeOBS.sourcePlayCount[svc.cfg.OBSLoopSourceName]; got != loopCount+1 {
+		t.Fatalf("loop play count = %d, want %d", got, loopCount+1)
+	}
+	if got := fakeOBS.sourcePlayCount[svc.cfg.OBSMusicSourceName]; got != musicCount+1 {
+		t.Fatalf("music play count = %d, want %d", got, musicCount+1)
+	}
+}
+
 func TestLibraryLoopEndedEventDoesNotRedrawCurrentPeriodPlan(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS := newLibraryTestService(t)
@@ -121,6 +159,67 @@ func TestLibraryLoopEndedEventDoesNotRedrawCurrentPeriodPlan(t *testing.T) {
 	}
 	if got := fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]; got != firstPath {
 		t.Fatalf("loop ended event restarted %q, want existing plan path %q", got, firstPath)
+	}
+}
+
+func TestLibraryLoopEndedEventClearsActiveStateWhenReplayFails(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	fakeOBS.playErr = errors.New("obs unavailable")
+	if err := svc.handleLibraryOBSEvent(ctx, obs.Event{Type: obs.EventMediaEnded, InputName: svc.cfg.OBSLoopSourceName}); err == nil {
+		t.Fatalf("expected loop replay failure")
+	}
+	if svc.activeLoopID != "" || svc.activeLoopPath != "" || !svc.activeLoopEndsAt.IsZero() {
+		t.Fatalf("active loop state should be cleared after failed ended-event replay: id=%q path=%q ends=%s", svc.activeLoopID, svc.activeLoopPath, svc.activeLoopEndsAt)
+	}
+
+	fakeOBS.playErr = nil
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("retry library playback: %v", err)
+	}
+	if svc.activeLoopID == "" || svc.activeLoopPath == "" {
+		t.Fatalf("expected retry to restore active loop state")
+	}
+}
+
+func TestLibraryMusicEndedEventClearsActiveStateWhenReplayFails(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_beta.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	fakeOBS.playErr = errors.New("obs unavailable")
+	if err := svc.handleLibraryOBSEvent(ctx, obs.Event{Type: obs.EventMediaEnded, InputName: svc.cfg.OBSMusicSourceName}); err == nil {
+		t.Fatalf("expected music replay failure")
+	}
+	if svc.activeMusicID != "" || svc.activeMusicPath != "" {
+		t.Fatalf("active music state should be cleared after failed ended-event replay: id=%q path=%q", svc.activeMusicID, svc.activeMusicPath)
+	}
+
+	fakeOBS.playErr = nil
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("retry library playback: %v", err)
+	}
+	if svc.activeMusicID == "" || svc.activeMusicPath == "" {
+		t.Fatalf("expected retry to restore active music state")
 	}
 }
 
@@ -1401,11 +1500,12 @@ var (
 )
 
 type fakeOBS struct {
-	state        obs.State
-	lastPlayed   string
-	lastSource   string
-	sourcePlayed map[string]string
-	playErr      error
+	state           obs.State
+	lastPlayed      string
+	lastSource      string
+	sourcePlayed    map[string]string
+	sourcePlayCount map[string]int
+	playErr         error
 }
 
 func (f *fakeOBS) Connect(context.Context) error { return nil }
@@ -1426,7 +1526,11 @@ func (f *fakeOBS) PlaySourceFile(_ context.Context, sourceName string, path stri
 	if f.sourcePlayed == nil {
 		f.sourcePlayed = make(map[string]string)
 	}
+	if f.sourcePlayCount == nil {
+		f.sourcePlayCount = make(map[string]int)
+	}
 	f.sourcePlayed[sourceName] = path
+	f.sourcePlayCount[sourceName]++
 	f.lastPlayed = path
 	f.lastSource = sourceName
 	return nil
