@@ -1043,6 +1043,7 @@ func TestUploadAcceptsAudioAndVideoDocuments(t *testing.T) {
 		filePath string
 		wantName string
 		wantMIME string
+		wantKind UploadKind
 	}{
 		{
 			name:     "audio mime",
@@ -1050,6 +1051,7 @@ func TestUploadAcceptsAudioAndVideoDocuments(t *testing.T) {
 			filePath: "/tmp/song.mp3",
 			wantName: "song.bin",
 			wantMIME: "audio/mpeg",
+			wantKind: UploadKindDocument,
 		},
 		{
 			name:     "video extension",
@@ -1057,6 +1059,15 @@ func TestUploadAcceptsAudioAndVideoDocuments(t *testing.T) {
 			filePath: "/tmp/clip.mkv",
 			wantName: "clip.mkv",
 			wantMIME: "application/octet-stream",
+			wantKind: UploadKindDocument,
+		},
+		{
+			name:     "telegram audio",
+			message:  audioMessage("file-id", "unique-id", "music_lofi.mp3", "audio/mpeg", 12),
+			filePath: "/tmp/music_lofi.mp3",
+			wantName: "music_lofi.mp3",
+			wantMIME: "audio/mpeg",
+			wantKind: UploadKindAudio,
 		},
 	}
 	for _, tt := range tests {
@@ -1082,8 +1093,8 @@ func TestUploadAcceptsAudioAndVideoDocuments(t *testing.T) {
 			if response.text != "imported" {
 				t.Fatalf("response = %q, want imported", response.text)
 			}
-			if got.Kind != UploadKindDocument {
-				t.Fatalf("kind = %q, want %q", got.Kind, UploadKindDocument)
+			if got.Kind != tt.wantKind {
+				t.Fatalf("kind = %q, want %q", got.Kind, tt.wantKind)
 			}
 			if got.FileName != tt.wantName {
 				t.Fatalf("file name = %q, want %q", got.FileName, tt.wantName)
@@ -1095,6 +1106,55 @@ func TestUploadAcceptsAudioAndVideoDocuments(t *testing.T) {
 				t.Fatalf("local path = %q, want %q", got.LocalPath, tt.filePath)
 			}
 		})
+	}
+}
+
+func TestHandleMessageRoutesAudioUploads(t *testing.T) {
+	bot := &fakeBotAPI{
+		file: tgbotapi.File{
+			FilePath: "/tmp/music_lofi.mp3",
+			FileSize: 12,
+		},
+	}
+	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
+	var got Upload
+	svc.hooks.EnqueueUpload = func(_ context.Context, upload Upload) (string, error) {
+		got = upload
+		return "imported", nil
+	}
+
+	svc.handleMessage(context.Background(), audioMessage("file-id", "unique-id", "music_lofi.mp3", "audio/mpeg", 12))
+
+	if got.Kind != UploadKindAudio {
+		t.Fatalf("kind = %q, want %q", got.Kind, UploadKindAudio)
+	}
+	if got.LocalPath != "/tmp/music_lofi.mp3" {
+		t.Fatalf("local path = %q, want /tmp/music_lofi.mp3", got.LocalPath)
+	}
+	if bot.sendCount != 1 {
+		t.Fatalf("send calls = %d, want 1", bot.sendCount)
+	}
+}
+
+func TestQueueModeRejectsAudioUploadsBeforeGetFile(t *testing.T) {
+	bot := &fakeBotAPI{
+		file: tgbotapi.File{FilePath: "/tmp/music_lofi.mp3"},
+	}
+	svc := newTestService(t, bot)
+	svc.cfg.PlayerMode = "queue"
+	cacheAdmin(svc, 42)
+	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("enqueue hook should not be called")
+		return "", nil
+	}
+
+	_, err := svc.handleUpload(context.Background(), audioMessage("file-id", "unique-id", "music_lofi.mp3", "audio/mpeg", 12))
+	if !errors.Is(err, errUnsupportedUpload) {
+		t.Fatalf("err = %v, want %v", err, errUnsupportedUpload)
+	}
+	if bot.fileCallCount != 0 {
+		t.Fatalf("getFile calls = %d, want 0", bot.fileCallCount)
 	}
 }
 
@@ -1323,6 +1383,20 @@ func documentMessage(fileID string, uniqueID string, name string, mimeType strin
 		Chat: &tgbotapi.Chat{ID: testChatID},
 		From: &tgbotapi.User{ID: 42},
 		Document: &tgbotapi.Document{
+			FileID:       fileID,
+			FileUniqueID: uniqueID,
+			FileName:     name,
+			MimeType:     mimeType,
+			FileSize:     size,
+		},
+	}
+}
+
+func audioMessage(fileID string, uniqueID string, name string, mimeType string, size int) *tgbotapi.Message {
+	return &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: testChatID},
+		From: &tgbotapi.User{ID: 42},
+		Audio: &tgbotapi.Audio{
 			FileID:       fileID,
 			FileUniqueID: uniqueID,
 			FileName:     name,

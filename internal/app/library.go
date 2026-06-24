@@ -197,6 +197,9 @@ func (s *Service) playNextMusicLocked(ctx context.Context, force bool) error {
 		return nil
 	}
 	if len(s.librarySnapshot.Music) == 0 {
+		if force {
+			return publicError("媒體庫沒有可播放的音樂。")
+		}
 		return nil
 	}
 	previousID := s.activeMusicID
@@ -207,7 +210,7 @@ func (s *Service) playNextMusicLocked(ctx context.Context, force bool) error {
 	}
 	music, err := s.librarySnapshot.ChooseMusic(previousID, s.rng)
 	if err != nil {
-		return nil
+		return err
 	}
 	looping := false
 	mute := false
@@ -265,7 +268,7 @@ func (s *Service) loopForTimeLocked(ctx context.Context, t time.Time, force bool
 	}
 	if plan, ok, err := s.libDB.PeriodPlan(ctx, date, info.Period); err != nil {
 		return medialib.Loop{}, info, "", err
-	} else if ok && !force && !expiredPreviousOverride && (override.Theme == "" || override.Theme == plan.Theme) {
+	} else if ok && !force && !expiredPreviousOverride && s.canReusePeriodPlan(info.Period, override.Theme, plan.Theme) {
 		if loop, found := s.findLoopByID(plan.LoopID); found {
 			return loop, info, "", nil
 		}
@@ -287,6 +290,18 @@ func (s *Service) loopForTimeLocked(ctx context.Context, t time.Time, force bool
 		return medialib.Loop{}, info, "", err
 	}
 	return loop, info, reason, nil
+}
+
+func (s *Service) canReusePeriodPlan(period medialib.Period, overrideTheme string, planTheme string) bool {
+	if overrideTheme == "" || overrideTheme == planTheme {
+		return true
+	}
+	for _, loop := range s.librarySnapshot.Loops {
+		if loop.Period == period && loop.Theme == overrideTheme {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) previewLoopLocked(ctx context.Context) (medialib.Loop, medialib.PeriodInfo, string, error) {

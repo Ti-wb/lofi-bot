@@ -50,6 +50,7 @@ func (s *Service) ScanLibraryText(ctx context.Context) (string, error) {
 	scanErr := s.libraryScanErr
 	s.playbackMu.Unlock()
 	if err != nil {
+		//nolint:nilerr // A partial scan is a successful command response with a user-visible warning.
 		return fmt.Sprintf("已掃描媒體庫：Loop %d / Music %d\n提醒：%s", loops, music, scanErr), nil
 	}
 	return fmt.Sprintf("已掃描媒體庫：Loop %d / Music %d", loops, music), nil
@@ -158,7 +159,10 @@ func (s *Service) SetThemeText(ctx context.Context, theme string) (string, error
 			s.setLastErr(err)
 			return "", err
 		}
-		_ = s.ensureLibraryPlayback(ctx, true)
+		if err := s.ensureLibraryPlayback(ctx, true); err != nil {
+			s.setLastErr(err)
+			return "", err
+		}
 		return "已切回隨機主題。", nil
 	}
 	theme = strings.TrimSpace(theme)
@@ -173,7 +177,10 @@ func (s *Service) SetThemeText(ctx context.Context, theme string) (string, error
 		s.setLastErr(err)
 		return "", err
 	}
-	_ = s.ensureLibraryPlayback(ctx, true)
+	if err := s.ensureLibraryPlayback(ctx, true); err != nil {
+		s.setLastErr(err)
+		return "", err
+	}
 	return fmt.Sprintf("今日主題已指定為：%s", theme), nil
 }
 
@@ -187,7 +194,10 @@ func (s *Service) SelectLoopText(ctx context.Context, assetID string) (string, e
 			s.setLastErr(err)
 			return "", err
 		}
-		_ = s.ensureLibraryPlayback(ctx, true)
+		if err := s.ensureLibraryPlayback(ctx, true); err != nil {
+			s.setLastErr(err)
+			return "", err
+		}
 		return "已清除指定影片。", nil
 	}
 	s.playbackMu.Lock()
@@ -200,7 +210,10 @@ func (s *Service) SelectLoopText(ctx context.Context, assetID string) (string, e
 		s.setLastErr(err)
 		return "", err
 	}
-	_ = s.ensureLibraryPlayback(ctx, true)
+	if err := s.ensureLibraryPlayback(ctx, true); err != nil {
+		s.setLastErr(err)
+		return "", err
+	}
 	return fmt.Sprintf("今日指定影片：%s（%s / %s）", loop.Filename, periodLabel(loop.Period), loop.Theme), nil
 }
 

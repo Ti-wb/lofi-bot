@@ -257,6 +257,112 @@ func TestLibraryThemeOverrideAndDirectSelect(t *testing.T) {
 	}
 }
 
+func TestLibraryMissingThemeOverrideReusesFallbackPlan(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.libDB.SetThemeOverride(ctx, "2026-06-24", "study"); err != nil {
+		t.Fatalf("set theme override: %v", err)
+	}
+	fallback := svc.librarySnapshot.Loops[0]
+	if err := svc.libDB.SavePeriodPlan(ctx, medialib.PeriodPlan{
+		Date:   "2026-06-24",
+		Period: medialib.PeriodDay,
+		Theme:  fallback.Theme,
+		LoopID: fallback.ID,
+	}); err != nil {
+		t.Fatalf("save fallback plan: %v", err)
+	}
+
+	svc.playbackMu.Lock()
+	loop, _, reason, err := svc.loopForTimeLocked(ctx, svc.now(), false)
+	svc.playbackMu.Unlock()
+	if err != nil {
+		t.Fatalf("loop for time: %v", err)
+	}
+	if loop.ID != fallback.ID {
+		t.Fatalf("loop id = %s, want persisted fallback %s", loop.ID, fallback.ID)
+	}
+	if reason != "" {
+		t.Fatalf("reason = %q, want empty when reusing fallback plan", reason)
+	}
+}
+
+func TestLibraryThemeAndSelectPropagatePlaybackErrors(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T) (*Service, *fakeOBS, string) {
+		t.Helper()
+		svc, fakeOBS := newLibraryTestService(t)
+		writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+		writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_study_001.mp4")
+		svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+		if err := svc.ScanLibrary(ctx); err != nil {
+			t.Fatalf("scan library: %v", err)
+		}
+		var cafeID string
+		for _, loop := range svc.librarySnapshot.Loops {
+			if loop.Theme == "cafe" {
+				cafeID = loop.ID
+			}
+		}
+		if cafeID == "" {
+			t.Fatal("missing cafe loop id")
+		}
+		fakeOBS.playErr = errors.New("obs unavailable")
+		return svc, fakeOBS, cafeID
+	}
+
+	tests := []struct {
+		name string
+		run  func(*testing.T, *Service, string) (string, error)
+	}{
+		{
+			name: "set theme",
+			run: func(t *testing.T, svc *Service, _ string) (string, error) {
+				return svc.SetThemeText(ctx, "study")
+			},
+		},
+		{
+			name: "clear theme",
+			run: func(t *testing.T, svc *Service, _ string) (string, error) {
+				return svc.SetThemeText(ctx, "random")
+			},
+		},
+		{
+			name: "select loop",
+			run: func(t *testing.T, svc *Service, cafeID string) (string, error) {
+				return svc.SelectLoopText(ctx, cafeID)
+			},
+		},
+		{
+			name: "clear selected loop",
+			run: func(t *testing.T, svc *Service, cafeID string) (string, error) {
+				if err := svc.libDB.SetDirectLoopOverride(ctx, overrideDateKey(svc.now()), cafeID); err != nil {
+					t.Fatalf("set direct override: %v", err)
+				}
+				return svc.SelectLoopText(ctx, "clear")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, _, cafeID := setup(t)
+			text, err := tt.run(t, svc, cafeID)
+			if err == nil {
+				t.Fatalf("expected playback error, text=%q", text)
+			}
+			if got := svc.lastError(); !strings.Contains(got, "obs unavailable") {
+				t.Fatalf("last error = %q, want obs unavailable", got)
+			}
+		})
+	}
+}
+
 func TestLibraryThemeOverrideExpiresAtMidnightDuringNightPeriod(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := newLibraryTestService(t)
@@ -352,6 +458,19 @@ func TestLibraryMusicSkipAvoidsImmediateRepeat(t *testing.T) {
 	second := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]
 	if second == "" || second == first {
 		t.Fatalf("music should switch without immediate repeat: first=%q second=%q", first, second)
+	}
+}
+
+func TestLibraryMusicSkipReportsMissingMusic(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newLibraryTestService(t)
+
+	_, err := svc.SkipMusicText(ctx)
+	if err == nil {
+		t.Fatal("expected missing music error")
+	}
+	if !strings.Contains(err.Error(), "媒體庫沒有可播放的音樂") {
+		t.Fatalf("err = %v, want missing music message", err)
 	}
 }
 

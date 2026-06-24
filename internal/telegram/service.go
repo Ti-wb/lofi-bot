@@ -104,6 +104,7 @@ type UploadKind string
 const (
 	UploadKindVideo    UploadKind = "video"
 	UploadKindDocument UploadKind = "document"
+	UploadKindAudio    UploadKind = "audio"
 )
 
 type Option func(*Service)
@@ -289,7 +290,7 @@ func (s *Service) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		return
 	}
 
-	if msg.Video != nil || msg.Document != nil {
+	if msg.Video != nil || msg.Document != nil || msg.Audio != nil {
 		response, err := s.handleUpload(ctx, msg)
 		s.reply(ctx, msg.Chat.ID, response, err)
 	}
@@ -575,6 +576,20 @@ func uploadFromMessage(msg *tgbotapi.Message) (Upload, error) {
 		}
 		if !looksLikeMediaDocument(upload.FileName, upload.MimeType) {
 			return Upload{}, errUnsupportedUpload
+		}
+		return upload, nil
+	}
+
+	if msg.Audio != nil {
+		upload.Kind = UploadKindAudio
+		upload.FileID = msg.Audio.FileID
+		upload.FileUniqueID = msg.Audio.FileUniqueID
+		upload.FileName = strings.TrimSpace(msg.Audio.FileName)
+		upload.MimeType = strings.TrimSpace(msg.Audio.MimeType)
+		upload.SizeBytes = int64(msg.Audio.FileSize)
+		upload.DurationSeconds = msg.Audio.Duration
+		if upload.FileName == "" {
+			upload.FileName = defaultUploadName(upload.FileUniqueID, ".mp3")
 		}
 		return upload, nil
 	}
@@ -1140,10 +1155,6 @@ func nowKeyboardForMode(admin bool, libraryMode bool) *tgbotapi.InlineKeyboardMa
 	return inlineKeyboard(rows...)
 }
 
-func statusKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
-	return statusKeyboardForMode(admin, true)
-}
-
 func statusKeyboardForMode(admin bool, libraryMode bool) *tgbotapi.InlineKeyboardMarkup {
 	if !libraryMode {
 		rows := [][]tgbotapi.InlineKeyboardButton{
@@ -1180,10 +1191,6 @@ func statusKeyboardForMode(admin bool, libraryMode bool) *tgbotapi.InlineKeyboar
 	return inlineKeyboard(rows...)
 }
 
-func historyKeyboard(admin bool) *tgbotapi.InlineKeyboardMarkup {
-	return historyKeyboardForMode(admin, true)
-}
-
 func historyKeyboardForMode(admin bool, libraryMode bool) *tgbotapi.InlineKeyboardMarkup {
 	if !libraryMode {
 		rows := [][]tgbotapi.InlineKeyboardButton{
@@ -1210,10 +1217,6 @@ func historyKeyboardForMode(admin bool, libraryMode bool) *tgbotapi.InlineKeyboa
 		))
 	}
 	return inlineKeyboard(rows...)
-}
-
-func uploadAcceptedKeyboard() *tgbotapi.InlineKeyboardMarkup {
-	return uploadAcceptedKeyboardForMode(true)
 }
 
 func uploadAcceptedKeyboardForMode(libraryMode bool) *tgbotapi.InlineKeyboardMarkup {
