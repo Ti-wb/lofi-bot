@@ -23,7 +23,7 @@ func TestLoadReadsDotEnvAndDefaults(t *testing.T) {
 	}
 
 	body := []byte(`
-ENV_SCHEMA_VERSION=3
+ENV_SCHEMA_VERSION=4
 TELEGRAM_BOT_TOKEN=token
 TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
 ALLOWED_CHAT_ID=-1001
@@ -55,6 +55,21 @@ OBS_MEDIA_SOURCE_NAME=player
 	}
 	if cfg.FallbackMode != "random_played" {
 		t.Fatalf("unexpected fallback mode: %q", cfg.FallbackMode)
+	}
+	if cfg.PlayerMode != "library" {
+		t.Fatalf("unexpected player mode: %q", cfg.PlayerMode)
+	}
+	if cfg.OBSLoopSourceName != "tg_loop_player" {
+		t.Fatalf("unexpected loop source: %q", cfg.OBSLoopSourceName)
+	}
+	if cfg.OBSMusicSourceName != "tg_music_player" {
+		t.Fatalf("unexpected music source: %q", cfg.OBSMusicSourceName)
+	}
+	if cfg.LoopMediaDir != filepath.Join("state", "media", "loops") {
+		t.Fatalf("unexpected loop media dir: %q", cfg.LoopMediaDir)
+	}
+	if cfg.MusicMediaDir != filepath.Join("state", "media", "music") {
+		t.Fatalf("unexpected music media dir: %q", cfg.MusicMediaDir)
 	}
 	if cfg.TelegramBotAPIDir != "./data/telegram-bot-api" {
 		t.Fatalf("unexpected telegram bot api dir: %q", cfg.TelegramBotAPIDir)
@@ -138,7 +153,7 @@ func TestLoadRejectsInvalidFallbackMode(t *testing.T) {
 	}
 
 	body := []byte(`
-ENV_SCHEMA_VERSION=3
+ENV_SCHEMA_VERSION=4
 TELEGRAM_BOT_TOKEN=token
 TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
 ALLOWED_CHAT_ID=-1001
@@ -150,6 +165,18 @@ FALLBACK_MODE=surprise
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected invalid fallback mode error")
+	}
+}
+
+func TestLoadRejectsInvalidPlayerMode(t *testing.T) {
+	clearConfigEnv(t)
+	chdirTemp(t)
+	setValidConfigEnv(t)
+	t.Setenv("PLAYER_MODE", "surprise")
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "PLAYER_MODE must be one of library, queue") {
+		t.Fatalf("err = %v, want invalid player mode error", err)
 	}
 }
 
@@ -271,6 +298,30 @@ func TestLoadRejectsBlankMediaSourceName(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsBlankLibrarySourceNames(t *testing.T) {
+	tests := []struct {
+		key     string
+		wantErr string
+	}{
+		{key: "OBS_LOOP_SOURCE_NAME", wantErr: "OBS_LOOP_SOURCE_NAME is required"},
+		{key: "OBS_MUSIC_SOURCE_NAME", wantErr: "OBS_MUSIC_SOURCE_NAME is required"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			clearConfigEnv(t)
+			chdirTemp(t)
+			setValidConfigEnv(t)
+			t.Setenv(tt.key, " \t ")
+
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestLoadMigratesOldDotEnv(t *testing.T) {
 	clearConfigEnv(t)
 	dir := chdirTemp(t)
@@ -288,7 +339,7 @@ OBS_MEDIA_SOURCE_NAME=player
 		t.Fatalf("migrate env: %v", err)
 	}
 	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=3")
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=4")
 	assertContains(t, migrated, "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081")
 	assertContains(t, migrated, "MAX_VIDEO_SIZE_MB=2000")
 	assertContains(t, migrated, "TELEGRAM_API_ID=replace-with-telegram-api-id")
@@ -298,6 +349,11 @@ OBS_MEDIA_SOURCE_NAME=player
 	assertContains(t, migrated, "TELEGRAM_BOT_API_PORT=8081")
 	assertContains(t, migrated, "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api")
 	assertContains(t, migrated, "RETENTION_DELETE_LOCAL_FILES=false")
+	assertContains(t, migrated, "PLAYER_MODE=library")
+	assertContains(t, migrated, "OBS_LOOP_SOURCE_NAME=tg_loop_player")
+	assertContains(t, migrated, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
+	assertContains(t, migrated, "LOOP_MEDIA_DIR=./data/media/loops")
+	assertContains(t, migrated, "MUSIC_MEDIA_DIR=./data/media/music")
 	if backups := backupFiles(t, dir); len(backups) != 1 {
 		t.Fatalf("backups = %v, want 1 backup", backups)
 	}
@@ -322,7 +378,7 @@ MAX_VIDEO_SIZE_MB=2000
 		t.Fatalf("migrate env: %v", err)
 	}
 	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=3")
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=4")
 	assertContains(t, migrated, "TELEGRAM_API_ID=replace-with-telegram-api-id")
 	assertContains(t, migrated, "TELEGRAM_API_HASH=replace-with-telegram-api-hash")
 	assertContains(t, migrated, "TELEGRAM_BOT_API_BIN=telegram-bot-api")
@@ -330,6 +386,11 @@ MAX_VIDEO_SIZE_MB=2000
 	assertContains(t, migrated, "TELEGRAM_BOT_API_PORT=8081")
 	assertContains(t, migrated, "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api")
 	assertContains(t, migrated, "RETENTION_DELETE_LOCAL_FILES=false")
+	assertContains(t, migrated, "PLAYER_MODE=library")
+	assertContains(t, migrated, "OBS_LOOP_SOURCE_NAME=tg_loop_player")
+	assertContains(t, migrated, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
+	assertContains(t, migrated, "LOOP_MEDIA_DIR=./data/media/loops")
+	assertContains(t, migrated, "MUSIC_MEDIA_DIR=./data/media/music")
 	if backups := backupFiles(t, dir); len(backups) != 1 {
 		t.Fatalf("backups = %v, want 1 backup", backups)
 	}
@@ -355,7 +416,7 @@ MAX_VIDEO_SIZE_MB=123
 		t.Fatalf("migrate env: %v", err)
 	}
 	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=3")
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=4")
 	if countSubstring(migrated, "TELEGRAM_API_BASE_URL=") != 1 {
 		t.Fatalf("telegram api base url should not be duplicated:\n%s", migrated)
 	}
@@ -371,6 +432,11 @@ MAX_VIDEO_SIZE_MB=123
 		t.Fatalf("max video size should not be duplicated:\n%s", migrated)
 	}
 	assertContains(t, migrated, "RETENTION_DELETE_LOCAL_FILES=false")
+	assertContains(t, migrated, "PLAYER_MODE=library")
+	assertContains(t, migrated, "OBS_LOOP_SOURCE_NAME=tg_loop_player")
+	assertContains(t, migrated, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
+	assertContains(t, migrated, "LOOP_MEDIA_DIR=./data/media/loops")
+	assertContains(t, migrated, "MUSIC_MEDIA_DIR=./data/media/music")
 }
 
 func TestLoadMigrationUpdatesExplicitOldVersion(t *testing.T) {
@@ -393,10 +459,15 @@ ALLOWED_CHAT_ID=-1001
 	if countSubstring(migrated, "ENV_SCHEMA_VERSION=") != 1 {
 		t.Fatalf("schema version should not be duplicated:\n%s", migrated)
 	}
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=3")
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=4")
 	assertContains(t, migrated, "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081")
 	assertContains(t, migrated, "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api")
 	assertContains(t, migrated, "RETENTION_DELETE_LOCAL_FILES=false")
+	assertContains(t, migrated, "PLAYER_MODE=library")
+	assertContains(t, migrated, "OBS_LOOP_SOURCE_NAME=tg_loop_player")
+	assertContains(t, migrated, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
+	assertContains(t, migrated, "LOOP_MEDIA_DIR=./data/media/loops")
+	assertContains(t, migrated, "MUSIC_MEDIA_DIR=./data/media/music")
 }
 
 func TestLoadDoesNotRemigrateCurrentDotEnv(t *testing.T) {
@@ -404,7 +475,7 @@ func TestLoadDoesNotRemigrateCurrentDotEnv(t *testing.T) {
 	dir := chdirTemp(t)
 	envPath := filepath.Join(dir, ".env")
 	body := []byte(`
-ENV_SCHEMA_VERSION=3
+ENV_SCHEMA_VERSION=4
 TELEGRAM_BOT_TOKEN=token
 TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
 TELEGRAM_API_ID=replace-with-telegram-api-id
@@ -414,6 +485,11 @@ TELEGRAM_BOT_API_HOST=127.0.0.1
 TELEGRAM_BOT_API_PORT=8081
 TELEGRAM_BOT_API_DIR=./data/telegram-bot-api
 RETENTION_DELETE_LOCAL_FILES=false
+PLAYER_MODE=library
+OBS_LOOP_SOURCE_NAME=tg_loop_player
+OBS_MUSIC_SOURCE_NAME=tg_music_player
+LOOP_MEDIA_DIR=./data/media/loops
+MUSIC_MEDIA_DIR=./data/media/music
 ALLOWED_CHAT_ID=-1001
 `)
 	if err := os.WriteFile(envPath, body, 0o600); err != nil {
@@ -468,10 +544,15 @@ func clearConfigEnv(t *testing.T) {
 		"OBS_PORT",
 		"OBS_PASSWORD",
 		"OBS_MEDIA_SOURCE_NAME",
+		"OBS_LOOP_SOURCE_NAME",
+		"OBS_MUSIC_SOURCE_NAME",
 		"OBS_FALLBACK_FILE",
 		"FALLBACK_MODE",
+		"PLAYER_MODE",
 		"DATA_DIR",
 		"MEDIA_DIR",
+		"LOOP_MEDIA_DIR",
+		"MUSIC_MEDIA_DIR",
 		"DATABASE_PATH",
 		"MAX_VIDEO_SIZE_MB",
 		"MAX_VIDEO_DURATION_SECONDS",

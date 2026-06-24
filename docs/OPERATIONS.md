@@ -20,11 +20,12 @@
 
    - enable OBS WebSocket;
    - use port `4455` unless changed in `.env`;
-   - create a Media Source named `tg_queue_player`;
-   - add that source to the Program scene used for playback;
-   - disable looping on that source.
+   - create a Media Source named `tg_loop_player`;
+   - create a Media Source named `tg_music_player`;
+   - add both sources to the Program scene used for playback;
+   - leave OBS source looping disabled; the app controls looping over WebSocket.
 
-   The app attempts to center this source in the current Program scene before each playback restart. It does not change scale, bounds, or crop, so oversized videos may extend beyond the canvas while staying centered.
+   The app mutes the loop source, plays Lo-Fi tracks through the music source, and attempts to center the loop source before playback restarts. It does not change scale, bounds, or crop, so oversized videos may extend beyond the canvas while staying centered.
 
 4. Configure Telegram group access:
 
@@ -49,6 +50,33 @@
    ```
 
 The Go backend, Telegram Local Bot API Server, and OBS should run on the same machine. If they do not, their media paths must be on shared storage and readable at the same absolute paths by the backend and OBS.
+
+## Media Library
+
+`PLAYER_MODE=library` is the default runtime mode. Store loop videos in `LOOP_MEDIA_DIR` and music files in `MUSIC_MEDIA_DIR`; defaults are `./data/media/loops` and `./data/media/music`.
+
+Loop files must be named `loop_<period>_<theme>_<variant>.<ext>`, where `period` is one of `morning`, `day`, `evening`, or `night`. Example:
+
+```text
+loop_morning_xiaozhu-cafe_001.mp4
+```
+
+Music files must be named `music_<track>.<ext>`, for example:
+
+```text
+music_lofi-chill-001.mp3
+```
+
+The app scans these folders non-recursively. Telegram admin uploads that match the schema are copied into the corresponding library folder so Telegram Local Bot API cache cleanup does not remove production assets.
+
+The daily schedule uses local time:
+
+- morning: 06:00-10:59
+- day: 11:00-16:59
+- evening: 17:00-20:59
+- night: 21:00-05:59
+
+Without an override, each period randomly chooses one playable theme and one matching loop file, then keeps that loop until the period ends. `/preview` materializes the next period pick and stores it, so repeated previews and the actual next period stay consistent unless the asset is removed before playback.
 
 ## Production Config Upgrades
 
@@ -127,29 +155,37 @@ Telegram group admins can use these management commands. Anonymous admins should
 
 The bot registers Telegram's command menu on startup. Most responses also include inline buttons for common actions:
 
-- queue/status/now/history navigation;
+- library/status/now/preview navigation;
 - refresh buttons that update the current message;
-- admin-only skip, remove, and move buttons where applicable.
+- admin-only scan, theme, select, and skip actions where applicable.
 
-- `/queue`: show current and upcoming videos.
-- `/now`: show the current video.
-- `/status`: show OBS status, queue counts, media size, disk space, and last error.
-- `/history`: show recent played, canceled, or failed items.
-- `/remove <id>`: cancel a queued item.
-- `/move <id> <position>`: move a ready item.
-- `/skip`: skip current playback.
+- `/library`: show loop/music library counts and useful asset IDs.
+- `/now`: show current period, loop, theme, period end, and music.
+- `/preview`: show the next period's planned theme and loop under the current algorithm.
+- `/status`: show OBS status, library status, overrides, disk space, next period preview, and last error.
+- `/scan`: rescan the media library.
+- `/theme <theme|random>`: set today's theme override or return to random.
+- `/select <asset_id|clear>`: force today's loop asset or clear the direct override.
+- `/skip loop`: redraw the current period loop and restart it.
+- `/skip music`: skip to another Lo-Fi track.
+- `/skip`: alias for `/skip loop`.
 
 ## Storage And Retention
 
-`RETENTION_DAYS` and `RETENTION_MAX_FILES` are both active. A played queue row can be removed from SQLite when it is older than the age limit or when the played history exceeds the file count limit. If both are set to `0`, retention cleanup is disabled and skips history scans.
+In library mode, imported media is copied into `LOOP_MEDIA_DIR` or `MUSIC_MEDIA_DIR` and is not deleted by retention cleanup. Remove obsolete library assets manually during a maintenance window, then run `/scan`.
+
+`RETENTION_DAYS` and `RETENTION_MAX_FILES` are legacy queue-mode limits. A played queue row can be removed from SQLite when it is older than the age limit or when the played history exceeds the file count limit. If both are set to `0`, retention cleanup is disabled and skips history scans.
 
 When `FALLBACK_MODE=random_played`, the currently playing random fallback row is protected from retention cleanup. Uploaded video files remain owned by Telegram Local Bot API Server and are not deleted by default. App retention removes SQLite rows only unless `RETENTION_DELETE_LOCAL_FILES=true`; even then, it skips deleting a local file while another queue/history row still references the same path.
 
-`/status` reports both `MEDIA_DIR` disk and `TELEGRAM_BOT_API_DIR` disk. Monitor `TELEGRAM_BOT_API_DIR` as the upload storage source of truth. If `TELEGRAM_BOT_API_DIR` is relative, run `du -sh "$TELEGRAM_BOT_API_DIR"` from the repository root, or use the absolute resolved path. If manual cleanup is needed, first stop the stack or confirm the files are not referenced by queued, currently playing, or fallback history rows. Never delete paths that may still be queued, current, or used as random fallback candidates.
+`/status` reports library disk and `TELEGRAM_BOT_API_DIR` disk. Monitor `LOOP_MEDIA_DIR`, `MUSIC_MEDIA_DIR`, and `TELEGRAM_BOT_API_DIR`. If paths are relative, inspect them from the repository root, or use the absolute resolved paths shown by `./run.sh doctor`.
 
 Set conservative values on the MacBook first, for example:
 
 ```env
+PLAYER_MODE=library
+LOOP_MEDIA_DIR=./data/media/loops
+MUSIC_MEDIA_DIR=./data/media/music
 FALLBACK_MODE=random_played
 RETENTION_DAYS=7
 RETENTION_MAX_FILES=100
@@ -181,9 +217,15 @@ If uploads fail after acceptance:
 
 If videos do not visually change in OBS:
 
-- confirm the Media Source name exactly matches `OBS_MEDIA_SOURCE_NAME`;
+- confirm the Media Source name exactly matches `OBS_LOOP_SOURCE_NAME`;
 - confirm the source supports local files;
 - confirm the source is visible in the active scene.
+
+If music does not change in OBS:
+
+- confirm the Media Source name exactly matches `OBS_MUSIC_SOURCE_NAME`;
+- confirm the source supports the music file type;
+- confirm the source is not muted in OBS unless you intentionally mute it outside the app.
 
 ## Portable Shell Supervisor
 

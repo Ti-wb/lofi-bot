@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,10 +16,274 @@ import (
 	"time"
 
 	"github.com/tiwb/tg-obs-bot/internal/config"
+	medialib "github.com/tiwb/tg-obs-bot/internal/library"
 	"github.com/tiwb/tg-obs-bot/internal/media"
 	"github.com/tiwb/tg-obs-bot/internal/obs"
 	"github.com/tiwb/tg-obs-bot/internal/queue"
 )
+
+func TestLibraryPreviewMaterializesNextPeriodPlan(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_morning_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_study_001.mp4")
+	svc.now = fixedNow("2026-06-24T10:30:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	first, err := svc.PreviewText(ctx)
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	second, err := svc.PreviewText(ctx)
+	if err != nil {
+		t.Fatalf("preview again: %v", err)
+	}
+	if first != second {
+		t.Fatalf("preview should be stable after materializing plan:\nfirst=%s\nsecond=%s", first, second)
+	}
+	for _, want := range []string{"下一時段預告", "時段：白天", "ID：loop_"} {
+		if !strings.Contains(first, want) {
+			t.Fatalf("preview text = %q, want %q", first, want)
+		}
+	}
+
+	plan, ok, err := svc.libDB.PeriodPlan(ctx, "2026-06-24", medialib.PeriodDay)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	if !ok || plan.LoopID == "" {
+		t.Fatalf("expected persisted day plan, got ok=%v plan=%#v", ok, plan)
+	}
+}
+
+func TestLibraryPlaybackKeepsLoopUntilPeriodEnds(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_study_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	firstLoop := fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]
+	if firstLoop == "" {
+		t.Fatalf("expected loop source playback")
+	}
+
+	svc.rng = rand.New(rand.NewSource(99))
+	svc.now = fixedNow("2026-06-24T16:30:00+08:00")
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback again: %v", err)
+	}
+	if got := fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]; got != firstLoop {
+		t.Fatalf("loop changed within same period: got %q want %q", got, firstLoop)
+	}
+}
+
+func TestLibraryLoopEndedEventDoesNotRedrawCurrentPeriodPlan(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_002.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	firstPath := fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]
+	planBefore, ok, err := svc.libDB.PeriodPlan(ctx, "2026-06-24", medialib.PeriodDay)
+	if err != nil || !ok {
+		t.Fatalf("plan before ok=%v err=%v", ok, err)
+	}
+
+	svc.rng = rand.New(rand.NewSource(42))
+	if err := svc.handleLibraryOBSEvent(ctx, obs.Event{Type: obs.EventMediaEnded, InputName: svc.cfg.OBSLoopSourceName, Path: firstPath}); err != nil {
+		t.Fatalf("handle loop ended event: %v", err)
+	}
+	planAfter, ok, err := svc.libDB.PeriodPlan(ctx, "2026-06-24", medialib.PeriodDay)
+	if err != nil || !ok {
+		t.Fatalf("plan after ok=%v err=%v", ok, err)
+	}
+	if planAfter.LoopID != planBefore.LoopID {
+		t.Fatalf("loop ended event redrew plan: before=%s after=%s", planBefore.LoopID, planAfter.LoopID)
+	}
+	if got := fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]; got != firstPath {
+		t.Fatalf("loop ended event restarted %q, want existing plan path %q", got, firstPath)
+	}
+}
+
+func TestLibraryThemeOverrideAndDirectSelect(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_evening_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_evening_study_001.mp4")
+	svc.now = fixedNow("2026-06-24T18:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if text, err := svc.SetThemeText(ctx, "study"); err != nil || !strings.Contains(text, "study") {
+		t.Fatalf("set theme text=%q err=%v", text, err)
+	}
+	if got := filepath.Base(fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]); got != "loop_evening_study_001.mp4" {
+		t.Fatalf("theme playback = %q, want study loop", got)
+	}
+
+	var cafeID string
+	for _, loop := range svc.librarySnapshot.Loops {
+		if loop.Theme == "cafe" {
+			cafeID = loop.ID
+		}
+	}
+	if cafeID == "" {
+		t.Fatal("missing cafe loop id")
+	}
+	if text, err := svc.SelectLoopText(ctx, cafeID); err != nil || !strings.Contains(text, "loop_evening_cafe_001.mp4") {
+		t.Fatalf("select text=%q err=%v", text, err)
+	}
+	if got := filepath.Base(fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]); got != "loop_evening_cafe_001.mp4" {
+		t.Fatalf("direct select playback = %q, want cafe loop", got)
+	}
+}
+
+func TestLibraryThemeOverrideExpiresAtMidnightDuringNightPeriod(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_night_study_001.mp4")
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_night_cafe_001.mp4")
+	svc.now = fixedNow("2026-06-24T23:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if _, err := svc.SetThemeText(ctx, "study"); err != nil {
+		t.Fatalf("set theme: %v", err)
+	}
+	previous, err := svc.libDB.Override(ctx, "2026-06-24")
+	if err != nil || previous.Theme != "study" {
+		t.Fatalf("previous override = %#v err=%v, want study", previous, err)
+	}
+
+	svc.now = fixedNow("2026-06-25T00:30:00+08:00")
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure after midnight: %v", err)
+	}
+	cleared, err := svc.libDB.Override(ctx, "2026-06-24")
+	if err != nil {
+		t.Fatalf("read cleared override: %v", err)
+	}
+	if cleared.Theme != "" || cleared.DirectLoopID != "" {
+		t.Fatalf("previous-day override should be cleared after midnight, got %#v", cleared)
+	}
+}
+
+func TestLibraryDirectOverrideExpiresAtMidnightDuringNightPeriod(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_night_study_001.mp4")
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_night_cafe_001.mp4")
+	svc.now = fixedNow("2026-06-24T23:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	var studyID string
+	for _, loop := range svc.librarySnapshot.Loops {
+		if loop.Theme == "study" {
+			studyID = loop.ID
+		}
+	}
+	if studyID == "" {
+		t.Fatal("missing study loop id")
+	}
+	if _, err := svc.SelectLoopText(ctx, studyID); err != nil {
+		t.Fatalf("select direct loop: %v", err)
+	}
+	previous, err := svc.libDB.Override(ctx, "2026-06-24")
+	if err != nil || previous.DirectLoopID != studyID {
+		t.Fatalf("previous direct override = %#v err=%v, want %s", previous, err, studyID)
+	}
+
+	svc.now = fixedNow("2026-06-25T00:30:00+08:00")
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure after midnight: %v", err)
+	}
+	cleared, err := svc.libDB.Override(ctx, "2026-06-24")
+	if err != nil {
+		t.Fatalf("read cleared override: %v", err)
+	}
+	if cleared.Theme != "" || cleared.DirectLoopID != "" {
+		t.Fatalf("previous-day direct override should be cleared after midnight, got %#v", cleared)
+	}
+}
+
+func TestLibraryMusicSkipAvoidsImmediateRepeat(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_beta.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	first := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]
+	if first == "" {
+		t.Fatalf("expected music playback")
+	}
+	if _, err := svc.SkipMusicText(ctx); err != nil {
+		t.Fatalf("skip music: %v", err)
+	}
+	second := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]
+	if second == "" || second == first {
+		t.Fatalf("music should switch without immediate repeat: first=%q second=%q", first, second)
+	}
+}
+
+func TestLibraryImportCopiesValidAssetsAndRejectsDuplicates(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newLibraryTestService(t)
+	source := writeBotAPIFile(t, svc, "loop_morning_cafe_001.mp4")
+
+	text, err := svc.ImportLibraryUpload(ctx, UploadRequest{
+		LocalPath: source,
+		FileName:  "loop_morning_cafe_001.mp4",
+		SizeBytes: 5,
+	})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if !strings.Contains(text, "已匯入素材") {
+		t.Fatalf("import text = %q", text)
+	}
+	dest := filepath.Join(svc.cfg.LoopMediaDir, "loop_morning_cafe_001.mp4")
+	if !fileExists(dest) {
+		t.Fatalf("expected imported file at %s", dest)
+	}
+	if _, err := svc.ImportLibraryUpload(ctx, UploadRequest{
+		LocalPath: source,
+		FileName:  "loop_morning_cafe_001.mp4",
+		SizeBytes: 5,
+	}); err == nil {
+		t.Fatalf("expected duplicate import rejection")
+	}
+}
 
 func TestRandomFallbackStartsAndNotifiesOnce(t *testing.T) {
 	ctx := context.Background()
@@ -931,6 +1196,64 @@ func newLocalUploadTestService(t *testing.T, cfg config.Config) (*Service, *fake
 	return svc, fakeOBS, fakeBot
 }
 
+func newLibraryTestService(t *testing.T) (*Service, *fakeOBS) {
+	t.Helper()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "library.db")
+	store, err := queue.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open queue store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+	libDB, err := medialib.OpenState(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open library state: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = libDB.Close()
+	})
+	mediaDir := t.TempDir()
+	botAPIDir := t.TempDir()
+	cfg := config.Config{
+		PlayerMode:              "library",
+		MediaDir:                mediaDir,
+		LoopMediaDir:            filepath.Join(mediaDir, "loops"),
+		MusicMediaDir:           filepath.Join(mediaDir, "music"),
+		TelegramBotAPIDir:       botAPIDir,
+		OBSLoopSourceName:       "loop_source",
+		OBSMusicSourceName:      "music_source",
+		OBSMediaSourceName:      "queue_source",
+		MaxVideoSizeBytes:       1024 * 1024,
+		MaxVideoDurationSeconds: 120,
+		AllowedChatID:           -100123,
+	}
+	if err := os.MkdirAll(cfg.LoopMediaDir, 0o755); err != nil {
+		t.Fatalf("create loop dir: %v", err)
+	}
+	if err := os.MkdirAll(cfg.MusicMediaDir, 0o755); err != nil {
+		t.Fatalf("create music dir: %v", err)
+	}
+	manager, err := media.NewManager(mediaDir, fakeFFProbe(t, 30))
+	if err != nil {
+		t.Fatalf("new media manager: %v", err)
+	}
+	fakeOBS := &fakeOBS{state: obs.StateConnected, sourcePlayed: make(map[string]string)}
+	return &Service{
+		cfg:      cfg,
+		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:    store,
+		libDB:    libDB,
+		media:    manager,
+		obs:      fakeOBS,
+		bot:      &fakeBot{},
+		now:      time.Now,
+		rng:      rand.New(rand.NewSource(1)),
+		playback: playbackIdle,
+	}, fakeOBS
+}
+
 func addReadyVideo(t *testing.T, ctx context.Context, svc *Service, name string) queue.Video {
 	t.Helper()
 	return addReadyVideoWithDuration(t, ctx, svc, name, 60)
@@ -1021,6 +1344,23 @@ func writeBotAPIFile(t *testing.T, svc *Service, name string) string {
 	return path
 }
 
+func writeLibraryFile(t *testing.T, dir string, name string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	writeTestFile(t, path)
+	return path
+}
+
+func fixedNow(raw string) func() time.Time {
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		panic(err)
+	}
+	return func() time.Time {
+		return parsed
+	}
+}
+
 func fakeFFProbe(t *testing.T, duration int) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "ffprobe")
@@ -1061,9 +1401,11 @@ var (
 )
 
 type fakeOBS struct {
-	state      obs.State
-	lastPlayed string
-	playErr    error
+	state        obs.State
+	lastPlayed   string
+	lastSource   string
+	sourcePlayed map[string]string
+	playErr      error
 }
 
 func (f *fakeOBS) Connect(context.Context) error { return nil }
@@ -1074,10 +1416,32 @@ func (f *fakeOBS) PlayFile(_ context.Context, path string) error {
 		return f.playErr
 	}
 	f.lastPlayed = path
+	f.lastSource = ""
+	return nil
+}
+func (f *fakeOBS) PlaySourceFile(_ context.Context, sourceName string, path string, _ obs.PlaySourceOptions) error {
+	if f.playErr != nil {
+		return f.playErr
+	}
+	if f.sourcePlayed == nil {
+		f.sourcePlayed = make(map[string]string)
+	}
+	f.sourcePlayed[sourceName] = path
+	f.lastPlayed = path
+	f.lastSource = sourceName
 	return nil
 }
 func (f *fakeOBS) StopCurrent(context.Context) error {
 	f.lastPlayed = ""
+	return nil
+}
+func (f *fakeOBS) StopSource(_ context.Context, sourceName string) error {
+	if f.sourcePlayed != nil {
+		delete(f.sourcePlayed, sourceName)
+	}
+	if f.lastSource == sourceName {
+		f.lastPlayed = ""
+	}
 	return nil
 }
 func (f *fakeOBS) Status() obs.Status { return obs.Status{State: f.state} }

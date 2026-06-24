@@ -8,7 +8,7 @@ BOT_API_HEALTH="$REPO_ROOT/deploy/telegram-bot-api/healthcheck.sh"
 BOT_API_LOGOUT="$REPO_ROOT/deploy/telegram-bot-api/logout-public.sh"
 GO_CACHE_DIR="$REPO_ROOT/.cache/go-build"
 GO_MOD_CACHE_DIR="$REPO_ROOT/.cache/go-mod"
-CURRENT_ENV_SCHEMA_VERSION=3
+CURRENT_ENV_SCHEMA_VERSION=4
 DEFAULT_APP_BIN="$REPO_ROOT/dist/tg-obs-bot"
 MAX_RESTART_DELAY_SECONDS=86400
 
@@ -202,6 +202,20 @@ migrate_env() {
       add_env_migration_line "RETENTION_DELETE_LOCAL_FILES=false"
     fi
   fi
+  if [ "$version" -lt 4 ]; then
+    for line in \
+      "PLAYER_MODE=library" \
+      "OBS_LOOP_SOURCE_NAME=tg_loop_player" \
+      "OBS_MUSIC_SOURCE_NAME=tg_music_player" \
+      "LOOP_MEDIA_DIR=./data/media/loops" \
+      "MUSIC_MEDIA_DIR=./data/media/music"
+    do
+      key=${line%%=*}
+      if ! dotenv_has_key "$key"; then
+        add_env_migration_line "$line"
+      fi
+    done
+  fi
 
   if [ "$update_schema_version" -eq 0 ] && [ -z "$ENV_MIGRATION_ADDITIONS" ]; then
     return 0
@@ -260,6 +274,12 @@ load_env() {
   : "${TELEGRAM_BOT_API_PORT:=8081}"
   : "${FFPROBE_PATH:=ffprobe}"
   : "${GO:=go}"
+  : "${PLAYER_MODE:=library}"
+  : "${OBS_LOOP_SOURCE_NAME:=tg_loop_player}"
+  : "${OBS_MUSIC_SOURCE_NAME:=tg_music_player}"
+  : "${MEDIA_DIR:=./data/media}"
+  : "${LOOP_MEDIA_DIR:=./data/media/loops}"
+  : "${MUSIC_MEDIA_DIR:=./data/media/music}"
 }
 
 require_value() {
@@ -383,6 +403,15 @@ bot_api_dir_abs() {
   case "${TELEGRAM_BOT_API_DIR:-}" in
     /*) printf '%s' "$TELEGRAM_BOT_API_DIR" ;;
     *) printf '%s/%s' "$REPO_ROOT" "$TELEGRAM_BOT_API_DIR" ;;
+  esac
+}
+
+media_dir_default() {
+  case "$1" in
+    MEDIA_DIR) printf './data/media' ;;
+    LOOP_MEDIA_DIR) printf './data/media/loops' ;;
+    MUSIC_MEDIA_DIR) printf './data/media/music' ;;
+    *) printf '' ;;
   esac
 }
 
@@ -603,6 +632,24 @@ doctor() {
   if ! check_bool_env RETENTION_DELETE_LOCAL_FILES false; then
     failures=$((failures + 1))
   fi
+  case "${PLAYER_MODE:-library}" in
+    library|queue)
+      printf 'ok   PLAYER_MODE: %s\n' "${PLAYER_MODE:-library}"
+      ;;
+    *)
+      printf 'fail PLAYER_MODE must be library or queue\n'
+      failures=$((failures + 1))
+      ;;
+  esac
+  for key in OBS_MEDIA_SOURCE_NAME OBS_LOOP_SOURCE_NAME OBS_MUSIC_SOURCE_NAME; do
+    eval "value=\${$key:-}"
+    if [ -n "$value" ]; then
+      printf 'ok   %s\n' "$key"
+    else
+      printf 'fail %s is required\n' "$key"
+      failures=$((failures + 1))
+    fi
+  done
   for item in \
     "OBS_PORT:4455:1:65535" \
     "TELEGRAM_BOT_API_PORT:8081:1:65535" \
@@ -644,6 +691,21 @@ doctor() {
     failures=$((failures + 1))
   fi
 
+  for key in MEDIA_DIR LOOP_MEDIA_DIR MUSIC_MEDIA_DIR; do
+    eval "raw_dir=\${$key:-}"
+    [ -n "$raw_dir" ] || raw_dir=$(media_dir_default "$key")
+    case "$raw_dir" in
+      /*) dir=$raw_dir ;;
+      *) dir="$REPO_ROOT/$raw_dir" ;;
+    esac
+    if mkdir -p "$dir" 2>/dev/null; then
+      printf 'ok   %s: %s\n' "$key" "$dir"
+    else
+      printf 'fail %s is not writable\n' "$key"
+      failures=$((failures + 1))
+    fi
+  done
+
   check_port
   check_obs_port
 
@@ -668,8 +730,13 @@ print_env() {
   printf 'OBS_PORT=%s\n' "${OBS_PORT:-4455}"
   printf 'OBS_PASSWORD=%s\n' "$(masked_state "${OBS_PASSWORD:-}")"
   printf 'OBS_MEDIA_SOURCE_NAME=%s\n' "${OBS_MEDIA_SOURCE_NAME:-tg_queue_player}"
+  printf 'OBS_LOOP_SOURCE_NAME=%s\n' "${OBS_LOOP_SOURCE_NAME:-tg_loop_player}"
+  printf 'OBS_MUSIC_SOURCE_NAME=%s\n' "${OBS_MUSIC_SOURCE_NAME:-tg_music_player}"
+  printf 'PLAYER_MODE=%s\n' "${PLAYER_MODE:-library}"
   printf 'DATA_DIR=%s\n' "${DATA_DIR:-./data}"
   printf 'MEDIA_DIR=%s\n' "${MEDIA_DIR:-./data/media}"
+  printf 'LOOP_MEDIA_DIR=%s\n' "${LOOP_MEDIA_DIR:-./data/media/loops}"
+  printf 'MUSIC_MEDIA_DIR=%s\n' "${MUSIC_MEDIA_DIR:-./data/media/music}"
   printf 'DATABASE_PATH=%s\n' "${DATABASE_PATH:-./data/queue.db}"
   printf 'RETENTION_DELETE_LOCAL_FILES=%s\n' "${RETENTION_DELETE_LOCAL_FILES:-false}"
   printf 'FFPROBE_PATH=%s\n' "${FFPROBE_PATH:-ffprobe}"

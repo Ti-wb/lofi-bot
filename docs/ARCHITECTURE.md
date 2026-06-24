@@ -1,29 +1,30 @@
 # Architecture
 
-`tg-obs-bot` is a single-process Go service for running a Telegram-submitted video queue through OBS. It requires Telegram Local Bot API Server; the public Telegram Bot API is intentionally unsupported for uploads.
+`tg-obs-bot` is a single-process Go service for running a local time-of-day loop animation library and independent Lo-Fi music through OBS. It requires Telegram Local Bot API Server for admin controls and media imports; the public Telegram Bot API is intentionally unsupported for uploads.
 
 ## Components
 
 - `cmd/tg-obs-bot`: process entrypoint, config loading, signal handling.
 - `internal/config`: `.env` and environment variable parsing.
-- `internal/app`: orchestration between Telegram, queue, media storage, and OBS.
-- `internal/telegram`: Telegram update loop, uploads, commands, and live group admin checks.
-- `internal/obs`: OBS WebSocket v5 client, auth handshake, media source control, playback-ended events.
-- `internal/queue`: SQLite-backed queue state and ordering.
-- `internal/media`: local Telegram file probing, `ffprobe` metadata, disk usage.
+- `internal/app`: orchestration between Telegram, library scheduling, media storage, and OBS.
+- `internal/telegram`: Telegram update loop, uploads/imports, commands, and live group admin checks.
+- `internal/obs`: OBS WebSocket v5 client, auth handshake, multi-source media control, playback-ended events.
+- `internal/queue`: SQLite-backed legacy queue state and ordering.
+- `internal/media`: local Telegram file probing/import support, `ffprobe` metadata, disk usage.
+- `internal/library`: media filename parsing, library scanning, period helpers, and selection primitives.
 - Telegram Local Bot API Server: local Bot API endpoint configured by `TELEGRAM_API_BASE_URL`.
 
 ## Runtime Flow
 
-1. A user sends a video in the configured Telegram group.
-2. Telegram service validates group membership and upload type.
-3. Telegram service resolves the file through Local Bot API `getFile`; the server must be running with `--local` so the response includes an absolute local file path.
-4. App service checks queue length and file size, records a `downloading` row, then probes the local file path.
-5. Media service probes duration and validates configured limits.
-6. Queue store marks the item `ready` and assigns a queue position.
-7. If OBS is connected and idle, app service starts playback immediately.
-8. OBS client updates the configured Media Source and triggers restart.
-9. OBS playback-ended events cause app service to mark the current item played and advance to the next ready item.
+1. At startup the app scans `LOOP_MEDIA_DIR` and `MUSIC_MEDIA_DIR`.
+2. The scheduler determines the current local period: morning, day, evening, or night.
+3. Direct loop override wins first; today's theme override wins next; otherwise the scheduler uses the stored random pick for the period or creates one.
+4. OBS loop source is pointed at the chosen loop, muted, set to loop, centered, and restarted.
+5. OBS music source is pointed at a random music asset and restarted without looping.
+6. Music-ended events choose another music asset while avoiding immediate repeats when possible.
+7. Period changes cause the next stored or newly selected loop plan to start.
+8. `/preview` materializes the next period's planned loop so the preview matches the later playback unless the asset is removed.
+9. Telegram admin uploads that match the library filename schema are copied into the library folder and become available after scan/import.
 
 ## Management Authorization
 
@@ -31,9 +32,24 @@ The service uses Telegram's live group administrator list for management permiss
 
 ## Telegram Interaction UX
 
-Text commands remain supported, but the bot also registers Telegram command menu entries at startup and attaches inline keyboards to queue, status, now-playing, history, and upload-accepted messages. Callback buttons reuse the same authorization and hook paths as text commands.
+Text commands remain supported, but the bot also registers Telegram command menu entries at startup and attaches inline keyboards to library, status, now-playing, preview, and upload-accepted messages. Callback buttons reuse the same authorization and hook paths as text commands.
+
+## Library Scheduling
+
+Loop filenames use `loop_<period>_<theme>_<variant>.<ext>`. Music filenames use `music_<track>.<ext>`. Library scans are non-recursive and ignore unsupported files with structured scan errors for `/status`.
+
+The four periods are based on local process time:
+
+- `morning`: 06:00-10:59
+- `day`: 11:00-16:59
+- `evening`: 17:00-20:59
+- `night`: 21:00-05:59
+
+Without an override, each period randomly chooses one theme with at least one matching loop and one loop asset for that theme. That period plan is persisted in SQLite so restarts and repeated previews do not redraw it. Today's direct loop or theme overrides expire at local midnight.
 
 ## Queue States
+
+Queue states apply to `PLAYER_MODE=queue`, the legacy Telegram-submitted video mode.
 
 - `downloading`: accepted by Telegram and being probed from the Local Bot API file path.
 - `ready`: local file path validated and waiting for OBS.
@@ -68,7 +84,7 @@ On restart:
 
 ## Fallback Playback
 
-When the normal queue is empty, `FALLBACK_MODE=random_played` randomly selects a previously played video whose local file still exists. The bot announces when it enters random fallback mode, then keeps rotating through history until a new ready queue item is available. `FALLBACK_MODE=file` uses `OBS_FALLBACK_FILE`, and `FALLBACK_MODE=off` leaves OBS idle when the queue is empty.
+When the legacy normal queue is empty, `FALLBACK_MODE=random_played` randomly selects a previously played video whose local file still exists. The bot announces when it enters random fallback mode, then keeps rotating through history until a new ready queue item is available. `FALLBACK_MODE=file` uses `OBS_FALLBACK_FILE`, and `FALLBACK_MODE=off` leaves OBS idle when the queue is empty.
 
 ## Intentional MVP Constraints
 

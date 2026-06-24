@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tiwb/tg-obs-bot/internal/config"
+	medialib "github.com/tiwb/tg-obs-bot/internal/library"
 	"github.com/tiwb/tg-obs-bot/internal/media"
 	"github.com/tiwb/tg-obs-bot/internal/obs"
 	"github.com/tiwb/tg-obs-bot/internal/queue"
@@ -24,10 +25,12 @@ type Service struct {
 	cfg    config.Config
 	logger *slog.Logger
 	store  *queue.Store
+	libDB  *medialib.StateStore
 	media  *media.Manager
 	obs    obsController
 	bot    telegramMessenger
 	now    func() time.Time
+	rng    *rand.Rand
 
 	mu                   sync.Mutex
 	playbackMu           sync.Mutex
@@ -36,6 +39,15 @@ type Service struct {
 	randomFallbackID     int64
 	randomFallbackPath   string
 	randomFallbackNotice bool
+	librarySnapshot      medialib.Library
+	libraryScanErr       string
+	activeLoopID         string
+	activeLoopPath       string
+	activeLoopTheme      string
+	activeLoopPeriod     medialib.Period
+	activeLoopEndsAt     time.Time
+	activeMusicID        string
+	activeMusicPath      string
 	shutdown             []func() error
 }
 
@@ -44,7 +56,9 @@ type obsController interface {
 	Close() error
 	Events() <-chan obs.Event
 	PlayFile(context.Context, string) error
+	PlaySourceFile(context.Context, string, string, obs.PlaySourceOptions) error
 	StopCurrent(context.Context) error
+	StopSource(context.Context, string) error
 	Status() obs.Status
 }
 
@@ -106,6 +120,22 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 		_ = store.Close()
 		return nil, err
 	}
+	var libDB *medialib.StateStore
+	if cfg.PlayerMode == "library" {
+		if err := os.MkdirAll(cfg.LoopMediaDir, 0o755); err != nil {
+			_ = store.Close()
+			return nil, err
+		}
+		if err := os.MkdirAll(cfg.MusicMediaDir, 0o755); err != nil {
+			_ = store.Close()
+			return nil, err
+		}
+		libDB, err = medialib.OpenState(context.Background(), cfg.DatabasePath)
+		if err != nil {
+			_ = store.Close()
+			return nil, err
+		}
+	}
 	obsClient, err := obs.NewClient(obs.Options{
 		URL:             cfg.OBSURL(),
 		Password:        cfg.OBSPassword,
@@ -114,6 +144,9 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 		Logger:          logger.With("component", "obs"),
 	})
 	if err != nil {
+		if libDB != nil {
+			_ = libDB.Close()
+		}
 		_ = store.Close()
 		return nil, err
 	}
@@ -122,11 +155,16 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 		cfg:      cfg,
 		logger:   logger,
 		store:    store,
+		libDB:    libDB,
 		media:    manager,
 		obs:      obsClient,
 		now:      time.Now,
+		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
 		playback: playbackIdle,
 		shutdown: []func() error{obsClient.Close, store.Close},
+	}
+	if libDB != nil {
+		service.shutdown = append(service.shutdown, libDB.Close)
 	}
 
 	bot, err := telegram.New(telegram.Config{
@@ -134,6 +172,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 		APIBaseURL:         cfg.TelegramAPIBaseURL,
 		AllowedChatID:      cfg.AllowedChatID,
 		MaxUploadSizeBytes: cfg.MaxVideoSizeBytes,
+		PlayerMode:         cfg.PlayerMode,
 	}, service.telegramHooks(), logger.With("component", "telegram"))
 	if err != nil {
 		service.Close()
@@ -152,7 +191,7 @@ func (s *Service) Close() {
 }
 
 func (s *Service) Run(ctx context.Context) error {
-	s.logger.Info("tg-obs-bot starting", "database", s.redactString(s.cfg.DatabasePath), "media_dir", s.redactString(s.cfg.MediaDir))
+	s.logger.Info("tg-obs-bot starting", "database", s.redactString(s.cfg.DatabasePath), "media_dir", s.redactString(s.cfg.MediaDir), "player_mode", s.cfg.PlayerMode)
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	defer func() {
@@ -183,7 +222,14 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	startLoop(s.obsReconnectLoop)
 	startLoop(s.obsEventLoop)
-	startLoop(s.playbackWatchdogLoop)
+	if s.libraryMode() {
+		if err := s.ScanLibrary(ctx); err != nil {
+			s.logger.Warn("initial media library scan found issues", "error", s.redactError(err))
+		}
+		startLoop(s.librarySchedulerLoop)
+	} else {
+		startLoop(s.playbackWatchdogLoop)
+	}
 
 	cleanupTicker := time.NewTicker(10 * time.Minute)
 	defer cleanupTicker.Stop()
@@ -202,6 +248,9 @@ func (s *Service) Run(ctx context.Context) error {
 			cancel()
 			return err
 		case <-cleanupTicker.C:
+			if s.libraryMode() {
+				continue
+			}
 			if err := s.CleanupRetention(ctx); err != nil {
 				s.setLastErr(err)
 				s.logger.Warn("retention cleanup failed", "error", s.redactError(err))
@@ -382,6 +431,10 @@ func (s *Service) playIfIdleLocked(ctx context.Context) error {
 }
 
 func (s *Service) recoverPlaybackAfterOBSConnect(ctx context.Context) error {
+	if s.libraryMode() {
+		return s.recoverLibraryPlaybackAfterOBSConnect(ctx)
+	}
+
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
 
@@ -547,6 +600,9 @@ func (s *Service) QueueText(ctx context.Context) (string, error) {
 }
 
 func (s *Service) NowText(ctx context.Context) (string, error) {
+	if s.libraryMode() {
+		return s.LibraryNowText(ctx)
+	}
 	video, err := s.store.Current(ctx)
 	if err != nil {
 		return "", err
@@ -573,6 +629,9 @@ func (s *Service) HistoryText(ctx context.Context) (string, error) {
 }
 
 func (s *Service) StatusText(ctx context.Context, obsConnected bool) (string, error) {
+	if s.libraryMode() {
+		return s.LibraryStatusText(ctx, obsConnected)
+	}
 	stats, err := s.store.Stats(ctx)
 	if err != nil {
 		return "", err
@@ -608,6 +667,20 @@ func (s *Service) StatusText(ctx context.Context, obsConnected bool) (string, er
 func (s *Service) telegramHooks() telegram.Hooks {
 	return telegram.Hooks{
 		EnqueueUpload: func(ctx context.Context, upload telegram.Upload) (string, error) {
+			if s.libraryMode() {
+				return s.ImportLibraryUpload(ctx, UploadRequest{
+					LocalPath:        upload.LocalPath,
+					TelegramFileID:   upload.FileID,
+					TelegramUniqueID: upload.FileUniqueID,
+					SubmitterID:      upload.SubmitterID,
+					SubmitterName:    upload.SubmitterName,
+					ChatID:           upload.ChatID,
+					MessageID:        upload.MessageID,
+					FileName:         upload.FileName,
+					MimeType:         upload.MimeType,
+					SizeBytes:        upload.SizeBytes,
+				})
+			}
 			video, err := s.EnqueueUpload(ctx, UploadRequest{
 				LocalPath:        upload.LocalPath,
 				TelegramFileID:   upload.FileID,
@@ -625,9 +698,26 @@ func (s *Service) telegramHooks() telegram.Hooks {
 			}
 			return fmt.Sprintf("已加入佇列：#%d %s，第 %d 位。", video.ID, video.FileName, video.QueuePosition), nil
 		},
-		ListQueue: s.QueueText,
-		Now:       s.NowText,
-		History:   s.HistoryText,
+		Library:    s.LibraryText,
+		Scan:       s.ScanLibraryText,
+		Preview:    s.PreviewText,
+		SetTheme:   s.SetThemeText,
+		SelectLoop: s.SelectLoopText,
+		SkipLoop:   s.SkipLoopText,
+		SkipMusic:  s.SkipMusicText,
+		ListQueue: func(ctx context.Context) (string, error) {
+			if s.libraryMode() {
+				return s.LibraryText(ctx)
+			}
+			return s.QueueText(ctx)
+		},
+		Now: s.NowText,
+		History: func(ctx context.Context) (string, error) {
+			if s.libraryMode() {
+				return "Library mode 沒有 queue history；請使用 /library 查看素材。", nil
+			}
+			return s.HistoryText(ctx)
+		},
 		Status: func(ctx context.Context) (string, error) {
 			return s.StatusText(ctx, s.obs.Status().State == obs.StateConnected)
 		},
@@ -643,7 +733,12 @@ func (s *Service) telegramHooks() telegram.Hooks {
 			}
 			return fmt.Sprintf("已將 #%d 移到第 %d 位。", id, position), nil
 		},
-		Skip: s.skipCurrent,
+		Skip: func(ctx context.Context) (string, error) {
+			if s.libraryMode() {
+				return s.SkipLoopText(ctx)
+			}
+			return s.skipCurrent(ctx)
+		},
 	}
 }
 
@@ -747,6 +842,12 @@ func (s *Service) obsEventLoop(ctx context.Context) {
 				return
 			}
 			if event.Type != obs.EventMediaEnded {
+				continue
+			}
+			if s.libraryMode() {
+				if err := s.handleLibraryOBSEvent(ctx, event); err != nil {
+					s.logger.Warn("advance library playback after OBS event failed", "error", s.redactError(err))
+				}
 				continue
 			}
 			video, err := s.advancePlaybackForEndedEvent(ctx, event)

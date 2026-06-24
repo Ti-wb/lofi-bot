@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const currentEnvSchemaVersion = 3
+const currentEnvSchemaVersion = 4
 
 type Config struct {
 	TelegramBotToken   string
@@ -24,12 +24,17 @@ type Config struct {
 	OBSPort            int
 	OBSPassword        string
 	OBSMediaSourceName string
+	OBSLoopSourceName  string
+	OBSMusicSourceName string
 	OBSFallbackFile    string
 	FallbackMode       string
 
 	DataDir                   string
 	MediaDir                  string
+	LoopMediaDir              string
+	MusicMediaDir             string
 	DatabasePath              string
+	PlayerMode                string
 	MaxVideoSizeBytes         int64
 	MaxVideoDurationSeconds   int
 	MaxQueueLength            int
@@ -86,8 +91,11 @@ func Load() (Config, error) {
 		OBSPort:                   obsPort,
 		OBSPassword:               getenv("OBS_PASSWORD", ""),
 		OBSMediaSourceName:        strings.TrimSpace(getenv("OBS_MEDIA_SOURCE_NAME", "tg_queue_player")),
+		OBSLoopSourceName:         strings.TrimSpace(getenv("OBS_LOOP_SOURCE_NAME", "tg_loop_player")),
+		OBSMusicSourceName:        strings.TrimSpace(getenv("OBS_MUSIC_SOURCE_NAME", "tg_music_player")),
 		OBSFallbackFile:           strings.TrimSpace(getenv("OBS_FALLBACK_FILE", "")),
 		FallbackMode:              strings.TrimSpace(getenv("FALLBACK_MODE", "random_played")),
+		PlayerMode:                strings.TrimSpace(getenv("PLAYER_MODE", "library")),
 		DataDir:                   strings.TrimSpace(getenv("DATA_DIR", "./data")),
 		MaxVideoSizeBytes:         int64(maxVideoSizeMB) * 1024 * 1024,
 		MaxVideoDurationSeconds:   maxVideoDurationSeconds,
@@ -99,6 +107,8 @@ func Load() (Config, error) {
 		LogLevel:                  parseLogLevel(strings.TrimSpace(getenv("LOG_LEVEL", "info"))),
 	}
 	cfg.MediaDir = strings.TrimSpace(getenv("MEDIA_DIR", filepath.Join(cfg.DataDir, "media")))
+	cfg.LoopMediaDir = strings.TrimSpace(getenv("LOOP_MEDIA_DIR", filepath.Join(cfg.MediaDir, "loops")))
+	cfg.MusicMediaDir = strings.TrimSpace(getenv("MUSIC_MEDIA_DIR", filepath.Join(cfg.MediaDir, "music")))
 	cfg.DatabasePath = strings.TrimSpace(getenv("DATABASE_PATH", filepath.Join(cfg.DataDir, "queue.db")))
 
 	if cfg.TelegramBotToken == "" {
@@ -122,8 +132,17 @@ func Load() (Config, error) {
 	if cfg.OBSMediaSourceName == "" {
 		return cfg, errors.New("OBS_MEDIA_SOURCE_NAME is required")
 	}
+	if cfg.OBSLoopSourceName == "" {
+		return cfg, errors.New("OBS_LOOP_SOURCE_NAME is required")
+	}
+	if cfg.OBSMusicSourceName == "" {
+		return cfg, errors.New("OBS_MUSIC_SOURCE_NAME is required")
+	}
 	if !validFallbackMode(cfg.FallbackMode) {
 		return cfg, fmt.Errorf("FALLBACK_MODE must be one of random_played, file, off")
+	}
+	if !validPlayerMode(cfg.PlayerMode) {
+		return cfg, fmt.Errorf("PLAYER_MODE must be one of library, queue")
 	}
 	if cfg.MaxVideoSizeBytes <= 0 {
 		return cfg, errors.New("MAX_VIDEO_SIZE_MB must be positive")
@@ -270,6 +289,23 @@ func envMigrationAdditions(version int, values map[string]string) []string {
 			additions = append(additions, "RETENTION_DELETE_LOCAL_FILES=false")
 		}
 	}
+	if version < 4 {
+		if _, ok := values["PLAYER_MODE"]; !ok {
+			additions = append(additions, "PLAYER_MODE=library")
+		}
+		if _, ok := values["OBS_LOOP_SOURCE_NAME"]; !ok {
+			additions = append(additions, "OBS_LOOP_SOURCE_NAME=tg_loop_player")
+		}
+		if _, ok := values["OBS_MUSIC_SOURCE_NAME"]; !ok {
+			additions = append(additions, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
+		}
+		if _, ok := values["LOOP_MEDIA_DIR"]; !ok {
+			additions = append(additions, "LOOP_MEDIA_DIR=./data/media/loops")
+		}
+		if _, ok := values["MUSIC_MEDIA_DIR"]; !ok {
+			additions = append(additions, "MUSIC_MEDIA_DIR=./data/media/music")
+		}
+	}
 	return additions
 }
 
@@ -296,6 +332,15 @@ func parseDotEnv(body []byte) map[string]string {
 func validFallbackMode(mode string) bool {
 	switch mode {
 	case "random_played", "file", "off":
+		return true
+	default:
+		return false
+	}
+}
+
+func validPlayerMode(mode string) bool {
+	switch mode {
+	case "library", "queue":
 		return true
 	default:
 		return false
