@@ -29,6 +29,21 @@ func TestBuildIdentifyAllowsEmptyPasswordWhenAuthenticationDisabled(t *testing.T
 	}
 }
 
+func TestBuildIdentifyRejectsConfiguredPasswordWithoutAuthentication(t *testing.T) {
+	const password = "configured-password"
+
+	_, err := buildIdentify(helloData{RPCVersion: 1}, password)
+	if err == nil {
+		t.Fatal("expected configured OBS authentication to be required")
+	}
+	if !strings.Contains(err.Error(), "OBS authentication required but server did not offer it") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Fatalf("authentication error leaked OBS password: %v", err)
+	}
+}
+
 func TestBuildIdentifyFailsWhenAuthenticationRequiresEmptyPassword(t *testing.T) {
 	_, err := buildIdentify(helloData{
 		RPCVersion: 1,
@@ -42,6 +57,26 @@ func TestBuildIdentifyFailsWhenAuthenticationRequiresEmptyPassword(t *testing.T)
 	}
 	if !strings.Contains(err.Error(), "OBS authentication required but password is empty") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBuildIdentifyAuthenticatesWhenServerRequiresIt(t *testing.T) {
+	identify, err := buildIdentify(helloData{
+		RPCVersion: 1,
+		Authentication: &authenticationData{
+			Challenge: "challenge",
+			Salt:      "salt",
+		},
+	}, "configured-password")
+	if err != nil {
+		t.Fatalf("build authenticated identify: %v", err)
+	}
+	if identify.RPCVersion != 1 {
+		t.Fatalf("rpc version = %d, want 1", identify.RPCVersion)
+	}
+	const want = "IC+CckPMyp9jOz74iVmxn7TWxInldEvbuJvqFtkHaYU="
+	if identify.Authentication != want {
+		t.Fatalf("authentication = %q, want %q", identify.Authentication, want)
 	}
 }
 
@@ -137,6 +172,58 @@ func TestClientConnectHandshakeSuccess(t *testing.T) {
 	}
 	if got := client.Status().State; got != StateConnected {
 		t.Fatalf("state = %s, want %s", got, StateConnected)
+	}
+}
+
+func TestClientConnectRejectsConfiguredPasswordWithoutAuthentication(t *testing.T) {
+	identifyReceived := make(chan bool, 1)
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			return fmt.Errorf("set identify deadline: %w", err)
+		}
+		var identify envelope
+		if err := conn.ReadJSON(&identify); err != nil {
+			identifyReceived <- false
+			return nil
+		}
+		identifyReceived <- true
+		return writeEnvelope(conn, envelope{Op: opIdentified})
+	})
+	defer server.Close()
+
+	const password = "configured-password"
+	client, err := NewClient(Options{
+		URL:             server.URL,
+		Password:        password,
+		MediaSourceName: "media",
+		RequestTimeout:  time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = client.Connect(ctx)
+	if err == nil {
+		t.Fatal("expected authentication-free OBS handshake to fail")
+	}
+	if !strings.Contains(err.Error(), "OBS authentication required but server did not offer it") {
+		t.Fatalf("Connect error = %v", err)
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Fatalf("Connect error leaked OBS password: %v", err)
+	}
+	if received := <-identifyReceived; received {
+		t.Fatal("client sent Identify before rejecting authentication-free OBS hello")
+	}
+	status := client.Status()
+	if status.State != StateDisconnected {
+		t.Fatalf("state = %s, want %s", status.State, StateDisconnected)
+	}
+	if strings.Contains(status.LastError, password) {
+		t.Fatalf("status error leaked OBS password: %q", status.LastError)
 	}
 }
 

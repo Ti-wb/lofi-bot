@@ -786,6 +786,9 @@ func interruptConnectionOnDone(ctx context.Context, closeConn func() error) func
 func buildIdentify(data helloData, password string) (identifyData, error) {
 	identify := identifyData{RPCVersion: data.RPCVersion}
 	if data.Authentication == nil {
+		if password != "" {
+			return identifyData{}, errors.New("OBS authentication required but server did not offer it")
+		}
 		return identify, nil
 	}
 	auth, err := buildAuthentication(password, data.Authentication.Salt, data.Authentication.Challenge)
