@@ -572,6 +572,38 @@ grep -q 'could not record Telegram Local Bot API Server child process group' "$s
   fail "state-write failure was not reported"
 printf 'ok - state-write failure drains the verified child group and fails closed\n'
 
+new_fixture singleton_contention
+singleton_fixture=$FIXTURE
+cat >"$singleton_fixture/singleton-app" <<'EOF'
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+printf '%s\n' "$$" >>"$root/singleton-app.pids"
+exit 73
+EOF
+chmod +x "$singleton_fixture/singleton-app"
+printf '%s\n' 'APP_BIN=./singleton-app' >>"$singleton_fixture/.env"
+start_fixture "$singleton_fixture"
+singleton_root_pid=$ACTIVE_ROOT_PID
+wait_for_root "$singleton_root_pid" 6
+[ "$ROOT_STATUS" -eq 73 ] ||
+  fail "singleton contention produced root status $ROOT_STATUS instead of 73"
+[ "$(wc -l <"$singleton_fixture/singleton-app.pids" | tr -d '[:space:]')" -eq 1 ] ||
+  fail "singleton contention restarted the app"
+grep -q 'database or Telegram bot is already owned; not restarting' "$singleton_fixture/run.log" ||
+  fail "singleton contention did not report the non-retryable ownership failure"
+if grep -q 'tg-obs-bot exited with status 73; restarting' "$singleton_fixture/run.log"; then
+  fail "singleton contention entered restart backoff"
+fi
+sleep 0.1
+singleton_processes=$(fixture_command_processes "$singleton_fixture")
+[ -z "$singleton_processes" ] ||
+  fail "singleton contention leaked fixture process(es): $singleton_processes"
+singleton_groups=$(fixture_process_groups_alive "$singleton_fixture")
+[ -z "$singleton_groups" ] ||
+  fail "singleton contention leaked process group(s): $singleton_groups"
+printf 'ok - singleton contention stops the stack without restart churn\n'
+
 new_fixture launch_race
 race_fixture=$FIXTURE
 : >"$race_fixture/fast-exit"

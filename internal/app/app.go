@@ -20,21 +20,23 @@ import (
 	"github.com/tiwb/tg-obs-bot/internal/obs"
 	"github.com/tiwb/tg-obs-bot/internal/queue"
 	"github.com/tiwb/tg-obs-bot/internal/secret"
+	"github.com/tiwb/tg-obs-bot/internal/singleton"
 	"github.com/tiwb/tg-obs-bot/internal/telegram"
 )
 
 type Service struct {
-	cfg        config.Config
-	logger     *slog.Logger
-	store      *queue.Store
-	libDB      *medialib.StateStore
-	media      *media.Manager
-	obs        obsController
-	bot        telegramMessenger
-	now        func() time.Time
-	rng        *rand.Rand
-	removeFile func(string) error
-	diskUsage  func(string) (media.DiskUsage, error)
+	cfg          config.Config
+	logger       *slog.Logger
+	instanceLock *singleton.Lock
+	store        *queue.Store
+	libDB        *medialib.StateStore
+	media        *media.Manager
+	obs          obsController
+	bot          telegramMessenger
+	now          func() time.Time
+	rng          *rand.Rand
+	removeFile   func(string) error
+	diskUsage    func(string) (media.DiskUsage, error)
 
 	mu                    sync.Mutex
 	playbackMu            sync.Mutex
@@ -149,6 +151,21 @@ func (e publicError) PublicMessage() string {
 }
 
 func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
+	instanceLock, err := singleton.Acquire(cfg.DatabasePath, cfg.TelegramBotToken)
+	if err != nil {
+		return nil, fmt.Errorf("acquire backend singleton: %w", err)
+	}
+	releaseUnownedLock := true
+	defer func() {
+		if releaseUnownedLock {
+			_ = instanceLock.Close()
+		}
+	}()
+	// Open SQLite through the exact canonical location that defines the lock
+	// identity. Relative paths and symlink aliases therefore cannot split the
+	// runtime lock from the database it protects.
+	cfg.DatabasePath = instanceLock.DatabasePath()
+
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -195,6 +212,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 	service := &Service{
 		cfg:                 cfg,
 		logger:              logger,
+		instanceLock:        instanceLock,
 		store:               store,
 		libDB:               libDB,
 		media:               manager,
@@ -206,8 +224,9 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 		playback:            playbackIdle,
 		workerStopGrace:     defaultWorkerStopGrace,
 		maintenanceInterval: defaultMaintenancePeriod,
-		shutdown:            []func() error{obsClient.Close, store.Close},
+		shutdown:            []func() error{instanceLock.Close, obsClient.Close, store.Close},
 	}
+	releaseUnownedLock = false
 	if libDB != nil {
 		service.shutdown = append(service.shutdown, libDB.Close)
 	}

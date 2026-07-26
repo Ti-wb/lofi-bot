@@ -9,7 +9,7 @@ Go backend for a 24h Lo-Fi Music channel workflow:
 
 ## Requirements
 
-- macOS with OBS Studio
+- macOS or Linux with OBS Studio
 - OBS WebSocket enabled, usually port `4455`
 - Go 1.22+
 - `ffmpeg` / `ffprobe`
@@ -29,7 +29,7 @@ brew install go ffmpeg
 4. Create a Media Source named `tg_music_player` for Lo-Fi music.
 5. Add both sources to the Program scene used for playback.
 6. Keep looping disabled in OBS; the app sets loop/music behavior through OBS WebSocket.
-7. Keep the backend running on the same Mac.
+7. Keep the backend running on the same host.
 
 The app mutes the loop source, plays music through the music source, and centers the loop source in the current Program scene without changing scale, bounds, or crop. The legacy queue source name is still configured by `OBS_MEDIA_SOURCE_NAME`.
 
@@ -84,7 +84,7 @@ For unattended use with the portable shell environment, build first and keep `./
 ./run.sh up
 ```
 
-`./run.sh up` supervises the Telegram Local Bot API Server and `tg-obs-bot` separately. It never supervises `go run`: when `dist/tg-obs-bot` is missing or older than the Go sources, startup first builds a temporary binary and atomically installs it; a build or process-group isolation failure aborts startup. Each service generation runs in its own process group, and the supervisor drains that complete group before starting a replacement, so descendants cannot accumulate across crashes. The root process also tracks each active generation in private runtime state; if either service supervisor dies unexpectedly, it drains both trees and exits non-zero. `HUP`, `Ctrl-C`/`INT`, and `TERM` use a bounded `TERM`-then-`KILL` shutdown.
+`./run.sh up` supervises the Telegram Local Bot API Server and `tg-obs-bot` separately. It never supervises `go run`: when `dist/tg-obs-bot` is missing or older than the Go sources, startup first builds a temporary binary and atomically installs it; a build or process-group isolation failure aborts startup. Each service generation runs in its own process group, and the supervisor drains that complete group before starting a replacement, so descendants cannot accumulate across crashes. The root process also tracks each active generation in private runtime state; if either service supervisor dies unexpectedly, it drains both trees and exits non-zero. Singleton contention is a non-retryable startup failure: the stack stops and propagates exit code `73` instead of looping. `HUP`, `Ctrl-C`/`INT`, and `TERM` use a bounded `TERM`-then-`KILL` shutdown.
 
 Set `APP_BIN` to use a different executable. The optional supervisor controls are `RESTART_MIN_DELAY_SECONDS` (default `2`), `RESTART_MAX_DELAY_SECONDS` (default `60`), `RESTART_RESET_AFTER_SECONDS` (default `300`, resets exponential backoff after a stable run), and `SHUTDOWN_GRACE_SECONDS` (default `15`). These values must be positive integers no larger than 86400 seconds.
 

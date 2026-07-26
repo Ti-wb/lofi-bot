@@ -12,6 +12,7 @@ CURRENT_ENV_SCHEMA_VERSION=5
 DEFAULT_APP_BIN="$REPO_ROOT/dist/tg-obs-bot"
 MAX_RESTART_DELAY_SECONDS=86400
 ROOT_SHUTDOWN_BUFFER_SECONDS=2
+APP_INSTANCE_CONTENTION_EXIT_CODE=73
 
 die() {
   printf '%s\n' "error: $1" >&2
@@ -474,6 +475,15 @@ build_default_app_binary() {
   set +m
   build_launching=false
   if ! is_process_group_leader "$build_pid"; then
+    if process_has_exited "$build_pid"; then
+      build_status=0
+      wait "$build_pid" 2>/dev/null || build_status=$?
+      if ! process_group_alive "$build_pid"; then
+        trap - HUP INT TERM
+        return "$build_status"
+      fi
+      stop_child_process_group "$build_pid" "tg-obs-bot build" || true
+    fi
     kill -TERM "$build_pid" 2>/dev/null || true
     wait "$build_pid" 2>/dev/null || true
     die "could not isolate tg-obs-bot build process group"
@@ -764,6 +774,10 @@ supervise_service() {
     fi
     clear_child_group
     child_pid=
+    if [ "$service_kind" = app ] && [ "$status" -eq "$APP_INSTANCE_CONTENTION_EXIT_CODE" ]; then
+      info "$service_name refused startup because its database or Telegram bot is already owned; not restarting."
+      return "$status"
+    fi
     ended_at=$(date +%s)
     runtime=$((ended_at - started_at))
     if [ "$runtime" -ge "$RESTART_RESET_AFTER_SECONDS" ]; then
@@ -990,8 +1004,15 @@ run_up() {
       cleanup
     fi
     if process_has_exited "$app_supervisor_pid"; then
-      info "tg-obs-bot supervisor exited unexpectedly; shutting down the stack."
-      shutdown_status=1
+      app_supervisor_status=0
+      wait "$app_supervisor_pid" 2>/dev/null || app_supervisor_status=$?
+      if [ "$app_supervisor_status" -eq "$APP_INSTANCE_CONTENTION_EXIT_CODE" ]; then
+        info "tg-obs-bot singleton contention is not retryable; shutting down the stack with status $app_supervisor_status."
+        shutdown_status=$app_supervisor_status
+      else
+        info "tg-obs-bot supervisor exited unexpectedly; shutting down the stack."
+        shutdown_status=1
+      fi
       cleanup
     fi
     sleep 1

@@ -11,10 +11,15 @@ import (
 	"github.com/tiwb/tg-obs-bot/internal/app"
 	"github.com/tiwb/tg-obs-bot/internal/config"
 	"github.com/tiwb/tg-obs-bot/internal/secret"
+	"github.com/tiwb/tg-obs-bot/internal/singleton"
 	"github.com/tiwb/tg-obs-bot/internal/telegram"
 )
 
-const internalStallExitCode = 70
+const (
+	internalStallExitCode        = 70
+	instanceContentionExitCode   = 73
+	genericInitializationFailure = 1
+)
 
 func main() {
 	cfg, err := config.Load()
@@ -34,7 +39,7 @@ func main() {
 	service, err := app.New(cfg, logger)
 	if err != nil {
 		logger.Error("initialize service", "error", secret.RedactError(err, cfg.SensitiveValues()...))
-		os.Exit(1)
+		os.Exit(initializationExitCode(err))
 	}
 	defer service.Close()
 
@@ -46,8 +51,16 @@ func main() {
 	logger.Error("service stopped", "error", secret.RedactError(err, cfg.SensitiveValues()...))
 	// os.Exit intentionally bypasses deferred Close on fatal failures. A stuck
 	// handler or worker may still own a dependency lock; the process supervisor
-	// is the hard isolation boundary for that state.
+	// is the hard isolation boundary for that state. Kernel teardown still
+	// closes both singleton descriptors before a replacement can acquire them.
 	os.Exit(exitCode)
+}
+
+func initializationExitCode(err error) int {
+	if errors.Is(err, singleton.ErrAlreadyRunning) {
+		return instanceContentionExitCode
+	}
+	return genericInitializationFailure
 }
 
 func serviceExitCode(err error, parentErr error) int {

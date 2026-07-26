@@ -10,21 +10,23 @@
 - `internal/telegram`: Telegram update loop, uploads/imports, commands, and live group admin checks.
 - `internal/obs`: OBS WebSocket v5 client, auth handshake, multi-source media control, playback-ended events.
 - `internal/queue`: SQLite-backed legacy queue state and ordering.
+- `internal/singleton`: canonical database and hashed Telegram identities with process-lifetime kernel locks.
 - `internal/media`: local Telegram file probing/import support, `ffprobe` metadata, disk usage.
 - `internal/library`: media filename parsing, library scanning, period helpers, and selection primitives.
 - Telegram Local Bot API Server: local Bot API endpoint configured by `TELEGRAM_API_BASE_URL`.
 
 ## Runtime Flow
 
-1. At startup the app scans `LOOP_MEDIA_DIR` and `MUSIC_MEDIA_DIR`.
-2. The scheduler determines the current local period: morning, day, evening, or night.
-3. Direct loop override wins first; today's theme override wins next; otherwise the scheduler uses the stored random pick for the period or creates one.
-4. OBS loop source is pointed at the chosen loop, muted, set to loop, centered, and restarted.
-5. OBS music source is pointed at a random music asset and restarted without looping.
-6. Music-ended events choose another music asset while avoiding immediate repeats when possible.
-7. Period changes cause the next stored or newly selected loop plan to start.
-8. `/preview` materializes the next period's planned loop so the preview matches the later playback unless the asset is removed.
-9. Telegram admin uploads that match the library filename schema pass an actual-size destination-filesystem admission check, are copied and validated inside an app-owned staging subdirectory, then become visible through an atomic rename before scan/import.
+1. Before SQLite, OBS, Telegram, or worker initialization, the app canonicalizes `DATABASE_PATH` and obtains nonblocking OS-held database and Telegram-identity locks.
+2. At startup the app scans `LOOP_MEDIA_DIR` and `MUSIC_MEDIA_DIR`.
+3. The scheduler determines the current local period: morning, day, evening, or night.
+4. Direct loop override wins first; today's theme override wins next; otherwise the scheduler uses the stored random pick for the period or creates one.
+5. OBS loop source is pointed at the chosen loop, muted, set to loop, centered, and restarted.
+6. OBS music source is pointed at a random music asset and restarted without looping.
+7. Music-ended events choose another music asset while avoiding immediate repeats when possible.
+8. Period changes cause the next stored or newly selected loop plan to start.
+9. `/preview` materializes the next period's planned loop so the preview matches the later playback unless the asset is removed.
+10. Telegram admin uploads that match the library filename schema pass an actual-size destination-filesystem admission check, are copied and validated inside an app-owned staging subdirectory, then become visible through an atomic rename before scan/import.
 
 ## Management Authorization
 
@@ -62,6 +64,8 @@ Queue states apply to `PLAYER_MODE=queue`, the legacy Telegram-submitted video m
 
 SQLite persists all queue metadata under `DATABASE_PATH`, including the absolute local file path returned by Telegram Local Bot API Server. New uploads are not copied into `MEDIA_DIR`; their file lifecycle is owned by Telegram Local Bot API Server. The app resolves upload paths and requires them to be regular files under `TELEGRAM_BOT_API_DIR` before probing or handing them to OBS.
 
+The backend opens SQLite through the same canonical path that defines `<canonical DATABASE_PATH>.tg-obs-bot.lock`. It also hashes the Telegram token with SHA-256 and locks `telegram-bot-<digest>.lock` inside a shared per-effective-UID application lock directory. The directory is rooted at `/private/tmp/tg-obs-bot-<uid>/locks` on macOS or `/tmp/tg-obs-bot-<uid>/locks` on Linux; it does not depend on `HOME`, `XDG_CONFIG_HOME`, `TMPDIR`, the checkout, or the runtime data root. Startup traverses the fixed base without following symlinks, verifies that the UID root and lock directory are real directories owned by the effective UID, and enforces mode `0700`. The raw token is neither retained in the lock object nor written to paths or errors. macOS and Linux hold both mode-`0600` files with exclusive nonblocking kernel locks for the complete service lifetime, always acquiring database identity before bot identity and releasing a partial acquisition on failure. Relative paths, `..`, and symlink aliases resolve to the same database identity; different database roots remain independent only when they also use different bot identities. Descriptors are close-on-exec, clean shutdown releases them last, and a crash or forced exit releases both through OS descriptor teardown. Persistent lock files are not PID files and are never used as evidence of ownership.
+
 The Go backend, Local Bot API Server, and OBS are expected to run on the same host. A multi-host setup must provide shared storage where the Local Bot API absolute file paths and OBS media paths are readable by the relevant processes.
 
 On restart:
@@ -83,7 +87,7 @@ On restart:
 - Terminal update journal pruning is confirmation-gated: only update IDs below `confirmed_offset` are eligible. Confirmed `done` rows are bounded to the newest 10,000 and 30 days; confirmed `dead` rows are bounded to the newest 1,000 and 90 days. Unconfirmed terminal rows are retained even when those limits are exceeded. Confirmation and periodic maintenance each remove at most 256 rows per terminal status, so a large idle backlog converges over maintenance ticks without making a poll perform an unbounded delete.
 - When Telegram confirms a higher offset after a long gap, replayable non-terminal rows strictly below it are reconciled to abandoned `dead` rows in batches of at most 256; rows with an active lease and rows at or above `confirmed_offset` remain untouched.
 - Telegram polling, OBS reconnect, OBS events, periodic maintenance, and the active library scheduler or queue watchdog are mandatory workers. An unexpected worker return is fatal. Maintenance runs outside the coordinator so a stuck cleanup cannot hide another worker's failure. After any fatal result or process cancellation, sibling workers receive cancellation and have ten seconds to drain. This outer budget reserves the Telegram handler's five-second stop grace, up to four seconds for independent journal finalization, and a scheduling cushion; failure to drain is reported as an internal stall instead of blocking shutdown indefinitely.
-- The phase-7 wall-clock lease is crash/replay accounting, not a fence around command side effects. Its current operating assumption is one host with bounded wall-clock movement and a supervisor that fully stops the old process generation before starting its replacement. A forward clock jump or overlapping application instances can reclaim a lease while old domain work is still running. An OS-held single-instance lock is required in the next stage before this assumption becomes an enforced production boundary.
+- The process-lifetime database and Telegram-identity kernel locks prevent two cooperating backend generations from executing domain side effects against either the same canonical database or the same bot. Telegram's wall-clock attempt lease remains crash/replay accounting rather than an independent side-effect fence. External writers, binaries that do not honor these locks, hard-link aliases, runtime-symlink mutation after startup, and containers or mount namespaces that do not share the per-user lock directory remain outside that guarantee.
 - OBS connection loss does not delete queue state.
 - OBS heartbeat and input reconciliation preserve matching healthy playback, replay an unhealthy persisted current item, and leave queue advancement to authoritative post-reconnect playback reconciliation.
 - OBS playback failure leaves the next `ready` item in the queue instead of marking it played.

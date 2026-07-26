@@ -20,8 +20,147 @@ import (
 	"github.com/tiwb/tg-obs-bot/internal/media"
 	"github.com/tiwb/tg-obs-bot/internal/obs"
 	"github.com/tiwb/tg-obs-bot/internal/queue"
+	"github.com/tiwb/tg-obs-bot/internal/singleton"
 	"github.com/tiwb/tg-obs-bot/internal/telegram"
 )
+
+func TestNewFailsBeforeSQLiteWhenBackendLockIsHeld(t *testing.T) {
+	isolateSingletonUserDirectory(t)
+	root := t.TempDir()
+	databasePath := filepath.Join(root, "runtime", "queue.db")
+	const token = "123456789:app-lock-test"
+	lock, err := singleton.Acquire(databasePath, token)
+	if err != nil {
+		t.Fatalf("hold backend lock: %v", err)
+	}
+	defer lock.Close()
+
+	started := time.Now()
+	service, err := New(config.Config{
+		TelegramBotToken: token,
+		DataDir:          filepath.Join(root, "data"),
+		DatabasePath:     databasePath,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if service != nil {
+		service.Close()
+		t.Fatal("New returned a service while the backend lock was held")
+	}
+	if !errors.Is(err, singleton.ErrAlreadyRunning) {
+		t.Fatalf("New error = %v, want singleton contention", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("contended startup waited for %s", elapsed)
+	}
+	if _, err := os.Stat(databasePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("SQLite was opened before singleton fencing: %v", err)
+	}
+}
+
+func TestNewFencesTelegramIdentityAcrossDifferentRuntimeRoots(t *testing.T) {
+	isolateSingletonUserDirectory(t)
+	root := t.TempDir()
+	firstDatabase := filepath.Join(root, "first-runtime", "queue.db")
+	secondDatabase := filepath.Join(root, "second-runtime", "queue.db")
+	const token = "123456789:cross-runtime-secret"
+	lock, err := singleton.Acquire(firstDatabase, token)
+	if err != nil {
+		t.Fatalf("hold first backend resource locks: %v", err)
+	}
+	defer lock.Close()
+
+	service, err := New(config.Config{
+		TelegramBotToken: token,
+		DataDir:          filepath.Join(root, "second-data"),
+		DatabasePath:     secondDatabase,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if service != nil {
+		service.Close()
+		t.Fatal("New returned a second service for the same Telegram bot")
+	}
+	if !errors.Is(err, singleton.ErrAlreadyRunning) {
+		t.Fatalf("New error = %v, want Telegram identity contention", err)
+	}
+	if strings.Contains(err.Error(), token) ||
+		strings.Contains(err.Error(), "cross-runtime-secret") {
+		t.Fatalf("contention error leaked Telegram token: %v", err)
+	}
+	if _, err := os.Stat(secondDatabase); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("second SQLite database was opened before bot fencing: %v", err)
+	}
+
+	// Bot-lock failure occurs after deterministic database-lock acquisition.
+	// A different bot must be able to claim that second database immediately,
+	// proving the partial database lock was released.
+	replacement, err := singleton.Acquire(secondDatabase, "987654321:independent-bot")
+	if err != nil {
+		t.Fatalf("partial database lock leaked after bot contention: %v", err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatalf("close partial-acquisition probe: %v", err)
+	}
+}
+
+func TestNewReleasesBackendLockAfterEarlyInitializationFailure(t *testing.T) {
+	isolateSingletonUserDirectory(t)
+	root := t.TempDir()
+	databasePath := filepath.Join(root, "runtime", "queue.db")
+	const token = "123456789:app-init-failure"
+	dataPath := filepath.Join(root, "data-is-a-file")
+	if err := os.WriteFile(dataPath, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("create invalid data path: %v", err)
+	}
+
+	service, err := New(config.Config{
+		TelegramBotToken: token,
+		DataDir:          dataPath,
+		DatabasePath:     databasePath,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if service != nil {
+		service.Close()
+		t.Fatal("New returned a service for an invalid data directory")
+	}
+	if err == nil {
+		t.Fatal("New succeeded with an invalid data directory")
+	}
+	replacement, err := singleton.Acquire(databasePath, token)
+	if err != nil {
+		t.Fatalf("initialization failure leaked backend lock: %v", err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatalf("close replacement lock: %v", err)
+	}
+}
+
+func TestServiceCloseReleasesBackendLock(t *testing.T) {
+	isolateSingletonUserDirectory(t)
+	databasePath := filepath.Join(t.TempDir(), "queue.db")
+	const token = "123456789:service-close"
+	lock, err := singleton.Acquire(databasePath, token)
+	if err != nil {
+		t.Fatalf("acquire service lock: %v", err)
+	}
+	service := &Service{
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		instanceLock: lock,
+		shutdown:     []func() error{lock.Close},
+	}
+	service.Close()
+
+	replacement, err := singleton.Acquire(databasePath, token)
+	if err != nil {
+		t.Fatalf("Service.Close did not release backend lock: %v", err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatalf("close replacement lock: %v", err)
+	}
+}
+
+func isolateSingletonUserDirectory(t *testing.T) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+}
 
 func TestLibraryPreviewMaterializesNextPeriodPlan(t *testing.T) {
 	ctx := context.Background()
