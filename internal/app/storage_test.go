@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"github.com/tiwb/tg-obs-bot/internal/config"
+	medialib "github.com/tiwb/tg-obs-bot/internal/library"
 	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/media"
+	"github.com/tiwb/tg-obs-bot/internal/queue"
 	"github.com/tiwb/tg-obs-bot/internal/telegram"
 )
 
@@ -54,6 +56,27 @@ func TestQueueUploadPreflightRejectsFullQueueBeforeDiskAdmission(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "佇列已滿") {
 		t.Fatalf("preflight error = %v, want queue-full rejection", err)
+	}
+}
+
+func TestQueueVideoCapacityPreflightRejectsBeforeDiskAdmission(t *testing.T) {
+	svc, _, _ := newLocalUploadTestService(t, config.Config{})
+	svc.diskUsage = func(string) (media.DiskUsage, error) {
+		t.Fatal("video row capacity should fail before disk admission")
+		return media.DiskUsage{}, nil
+	}
+	checks := 0
+	err := svc.preflightQueueUpload(context.Background(), 5, func(context.Context) error {
+		checks++
+		return queue.ErrVideoCapacity
+	})
+	if err == nil ||
+		!strings.Contains(err.Error(), "10000") ||
+		!strings.Contains(err.Error(), "清理") {
+		t.Fatalf("preflight error = %v, want actionable video capacity rejection", err)
+	}
+	if checks != 1 {
+		t.Fatalf("capacity checks = %d, want 1", checks)
 	}
 }
 
@@ -134,6 +157,123 @@ func TestLibraryUploadPreflightCombinesCacheAndCopyHeadroomOnSharedFilesystem(t 
 	available = 110
 	if err := preflight(context.Background(), upload); err != nil {
 		t.Fatalf("admissible library metadata rejected: %v", err)
+	}
+}
+
+func TestLibraryUploadCapacityPreflightUsesBoundedLimit(t *testing.T) {
+	svc, _ := newLibraryTestService(t)
+	diskCalls := 0
+	svc.diskUsage = func(string) (media.DiskUsage, error) {
+		diskCalls++
+		return media.DiskUsage{AvailableBytes: math.MaxUint64}, nil
+	}
+	const limit = 2
+	const incoming = "loop_morning_cafe_capacity.mp4"
+
+	if err := svc.preflightLibraryUploadWithLimit(
+		context.Background(),
+		incoming,
+		5,
+		limit,
+	); err != nil {
+		t.Fatalf("preflight with room for staging and destination: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(svc.cfg.LoopMediaDir, libraryStagingDirName), 0o700); err != nil {
+		t.Fatalf("create existing staging directory: %v", err)
+	}
+	if err := svc.preflightLibraryUploadWithLimit(
+		context.Background(),
+		incoming,
+		5,
+		limit,
+	); err != nil {
+		t.Fatalf("preflight at limit with existing staging plus destination: %v", err)
+	}
+	callsBeforeFull := diskCalls
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "unrelated.txt")
+	err := svc.preflightLibraryUploadWithLimit(
+		context.Background(),
+		incoming,
+		5,
+		limit,
+	)
+	if err == nil || !strings.Contains(err.Error(), "移除") {
+		t.Fatalf("full-directory preflight error = %v, want actionable capacity rejection", err)
+	}
+	if diskCalls != callsBeforeFull {
+		t.Fatal("full directory reached filesystem admission after capacity rejection")
+	}
+}
+
+func TestLibraryImportCapacityRecheckCreatesNoStagingOrDestination(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newLibraryTestService(t)
+	source := writeBotAPIFile(t, svc, "loop_morning_cafe_source.mp4")
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "unrelated.txt")
+	dest := filepath.Join(svc.cfg.LoopMediaDir, "loop_morning_cafe_new.mp4")
+	staging := filepath.Join(svc.cfg.LoopMediaDir, libraryStagingDirName)
+	svc.media = nil
+
+	err := svc.storeLibraryUploadWithLimit(
+		ctx,
+		medialib.KindLoop,
+		dest,
+		source,
+		2,
+	)
+	if err == nil || !strings.Contains(err.Error(), "移除") {
+		t.Fatalf("import capacity error = %v, want actionable rejection", err)
+	}
+	if fileExists(staging) {
+		t.Fatal("capacity rejection created a staging directory")
+	}
+	if fileExists(dest) {
+		t.Fatal("capacity rejection created a destination file")
+	}
+}
+
+func TestOverCapacityScanRetainsSnapshotButOrdinaryIssuesRemainPartial(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newLibraryTestService(t)
+	original := medialib.Library{
+		Loops: []medialib.Loop{{ID: "last-known-good"}},
+	}
+	svc.librarySnapshot = original
+
+	capacityErr := fmt.Errorf("external writer exceeded limit: %w", medialib.ErrDirectoryCapacity)
+	err := svc.scanLibraryLockedWith(ctx, func(string, string) (medialib.Library, error) {
+		return medialib.Library{
+			Loops: []medialib.Loop{{ID: "incomplete-over-capacity"}},
+		}, capacityErr
+	})
+	if !errors.Is(err, medialib.ErrDirectoryCapacity) {
+		t.Fatalf("scan error = %v, want capacity sentinel", err)
+	}
+	if len(svc.librarySnapshot.Loops) != 1 ||
+		svc.librarySnapshot.Loops[0].ID != "last-known-good" {
+		t.Fatalf("over-capacity scan replaced snapshot: %#v", svc.librarySnapshot)
+	}
+	if !strings.Contains(svc.libraryScanErr, medialib.ErrDirectoryCapacity.Error()) {
+		t.Fatalf("library scan error = %q, want recorded capacity error", svc.libraryScanErr)
+	}
+
+	partial := medialib.Library{
+		Loops: []medialib.Loop{{ID: "valid-partial"}},
+	}
+	ordinaryErr := &medialib.ScanError{Issues: []*medialib.Error{{
+		Code: medialib.ErrorInvalidFilename,
+		Kind: medialib.KindLoop,
+		Err:  errors.New("bad filename"),
+	}}}
+	err = svc.scanLibraryLockedWith(ctx, func(string, string) (medialib.Library, error) {
+		return partial, ordinaryErr
+	})
+	if !errors.Is(err, ordinaryErr) {
+		t.Fatalf("ordinary scan error = %v", err)
+	}
+	if len(svc.librarySnapshot.Loops) != 1 ||
+		svc.librarySnapshot.Loops[0].ID != "valid-partial" {
+		t.Fatalf("ordinary scan issue did not publish partial snapshot: %#v", svc.librarySnapshot)
 	}
 }
 

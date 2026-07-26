@@ -100,6 +100,8 @@ Before deploying a new build, back up the production `.env`. You can run `./run.
 
 Numeric config values must be valid integers; malformed values fail startup instead of silently falling back to defaults. `OBS_PORT` must be `1..65535`; `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` must be positive; `MAX_VIDEO_DURATION_SECONDS`, `MIN_FREE_DISK_MB`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES` may be `0` to disable that limit where supported. `MIN_FREE_DISK_MB` defaults to `512`; uploads require a positive declared size and enough configured cache/destination headroom before Local Bot API `getFile`, followed by authoritative checks against the actual local file. Setting it to `0` disables only the additional reserve—the actual-size filesystem admission and `MAX_VIDEO_SIZE_MB` limit remain enforced. `RETENTION_DELETE_LOCAL_FILES` defaults to `false`, so retention removes old SQLite rows without deleting Telegram Local Bot API media files unless you explicitly opt in.
 
+Persistent media state also has fixed, non-configurable ceilings: 10,000 entries in each loop/music directory and 10,000 total rows in the `videos` table. Uploads that would exceed either ceiling are rejected before Local Bot API `getFile` and rechecked at the authoritative write boundary; the app never auto-deletes library assets or Telegram-owned cache files to make room.
+
 The stack helpers run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing supported schema defaults. The Go app itself only reads config at startup; it does not rewrite `.env`.
 
 Build a local binary:

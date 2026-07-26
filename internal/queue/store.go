@@ -22,9 +22,14 @@ const (
 	// MaxFallbackCandidates bounds both the SQLite result set and the in-memory
 	// work performed for one fallback attempt.
 	MaxFallbackCandidates = 256
+	// MaxVideoRows bounds all persisted video states, including terminal rows.
+	MaxVideoRows          = 10_000
 	maxHistoryRows        = 256
 	maxRetentionBatchRows = 256
 )
+
+// ErrVideoCapacity is returned when a video insert would exceed MaxVideoRows.
+var ErrVideoCapacity = errors.New("video row capacity reached")
 
 const videoColumns = `
 	id, telegram_file_id, telegram_unique_id, submitter_id, submitter_name,
@@ -180,6 +185,13 @@ func (s *Store) nowUTC() time.Time {
 }
 
 func (s *Store) AddDownloading(ctx context.Context, v Video) (Video, error) {
+	return s.addDownloadingWithLimit(ctx, v, MaxVideoRows)
+}
+
+func (s *Store) addDownloadingWithLimit(ctx context.Context, v Video, limit int) (Video, error) {
+	if limit <= 0 {
+		return v, errors.New("video row limit must be positive")
+	}
 	now := time.Now().UTC()
 	v.CreatedAt = now
 	v.UpdatedAt = now
@@ -190,15 +202,44 @@ INSERT INTO videos (
 	telegram_file_id, telegram_unique_id, submitter_id, submitter_name, chat_id, message_id,
 	file_name, local_path, mime_type, size_bytes, duration_seconds, queue_position, status,
 	error, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', ?, ?)
+) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', ?, ?
+WHERE NOT EXISTS (
+	SELECT 1 FROM videos LIMIT 1 OFFSET ?
+)
 RETURNING id
 `, v.TelegramFileID, v.TelegramUniqueID, v.SubmitterID, v.SubmitterName, v.ChatID, v.MessageID,
 		v.FileName, v.LocalPath, v.MimeType, v.SizeBytes, v.DurationSeconds, string(v.Status),
-		formatTime(v.CreatedAt), formatTime(v.UpdatedAt)).Scan(&v.ID)
+		formatTime(v.CreatedAt), formatTime(v.UpdatedAt), limit-1).Scan(&v.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return v, ErrVideoCapacity
+	}
 	if err != nil {
 		return v, err
 	}
 	return v, nil
+}
+
+func (s *Store) CheckVideoCapacity(ctx context.Context) error {
+	return s.checkVideoCapacityWithLimit(ctx, MaxVideoRows)
+}
+
+func (s *Store) checkVideoCapacityWithLimit(ctx context.Context, limit int) error {
+	if limit <= 0 {
+		return errors.New("video row limit must be positive")
+	}
+	var atCapacity int
+	err := s.db.QueryRowContext(ctx, `
+SELECT EXISTS (
+	SELECT 1 FROM videos LIMIT 1 OFFSET ?
+)
+`, limit-1).Scan(&atCapacity)
+	if err != nil {
+		return err
+	}
+	if atCapacity != 0 {
+		return ErrVideoCapacity
+	}
+	return nil
 }
 
 func (s *Store) MarkReady(ctx context.Context, id int64, localPath string, sizeBytes int64, durationSeconds int) (Video, error) {

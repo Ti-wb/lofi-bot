@@ -186,6 +186,55 @@ func TestScanMissingDirectoriesIsEmptyLibrary(t *testing.T) {
 	}
 }
 
+func TestScanDirectoryCapacityBoundaries(t *testing.T) {
+	t.Run("below and equal limit", func(t *testing.T) {
+		root := t.TempDir()
+		loopDir := filepath.Join(root, "loops")
+		musicDir := filepath.Join(root, "music")
+		mkdir(t, loopDir)
+		mkdir(t, musicDir)
+		writeFile(t, filepath.Join(loopDir, "loop_morning_calm_a.mp4"))
+
+		lib, err := scanDirsWithLimit(loopDir, musicDir, 2)
+		if err != nil || len(lib.Loops) != 1 {
+			t.Fatalf("below-limit scan = %#v, err=%v", lib, err)
+		}
+		writeFile(t, filepath.Join(loopDir, "loop_day_focus_b.mp4"))
+		lib, err = scanDirsWithLimit(loopDir, musicDir, 2)
+		if err != nil || len(lib.Loops) != 2 {
+			t.Fatalf("equal-limit scan = %#v, err=%v", lib, err)
+		}
+	})
+
+	t.Run("over limit returns one recognizable issue", func(t *testing.T) {
+		root := t.TempDir()
+		loopDir := filepath.Join(root, "loops")
+		musicDir := filepath.Join(root, "music")
+		mkdir(t, loopDir)
+		mkdir(t, musicDir)
+		writeFile(t, filepath.Join(loopDir, "loop_morning_calm_a.mp4"))
+		writeFile(t, filepath.Join(loopDir, "bad-one.mp4"))
+		writeFile(t, filepath.Join(loopDir, "bad-two.mp4"))
+		writeFile(t, filepath.Join(musicDir, "music_still-visible.mp3"))
+
+		lib, err := scanDirsWithLimit(loopDir, musicDir, 2)
+		if !errors.Is(err, ErrDirectoryCapacity) {
+			t.Fatalf("over-limit error = %v, want %v", err, ErrDirectoryCapacity)
+		}
+		if len(lib.Loops) != 0 || len(lib.Music) != 1 {
+			t.Fatalf("over-limit library = %#v, want bounded loop failure and normal music scan", lib)
+		}
+		var scanErr *ScanError
+		if !errors.As(err, &scanErr) || len(scanErr.Issues) != 1 {
+			t.Fatalf("over-limit issues = %#v, want exactly one", scanErr)
+		}
+		if scanErr.Issues[0].Code != ErrorDirectoryCapacity ||
+			scanErr.Issues[0].Kind != KindLoop {
+			t.Fatalf("capacity issue = %#v", scanErr.Issues[0])
+		}
+	})
+}
+
 func TestSummaryCounts(t *testing.T) {
 	lib := Library{
 		Loops: []Loop{

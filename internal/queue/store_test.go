@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -344,6 +345,114 @@ func TestQueueLengthIncludesDownloadingAndReady(t *testing.T) {
 	}
 	if length != 2 {
 		t.Fatalf("expected length 2, got %d", length)
+	}
+}
+
+func TestVideoCapacityBoundaryAndDeleteThenAdmit(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	const limit = 2
+
+	if err := store.checkVideoCapacityWithLimit(ctx, limit); err != nil {
+		t.Fatalf("empty capacity check: %v", err)
+	}
+	first, err := store.addDownloadingWithLimit(ctx, Video{
+		TelegramFileID:   "first",
+		TelegramUniqueID: "first",
+		FileName:         "first.mp4",
+	}, limit)
+	if err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	if err := store.checkVideoCapacityWithLimit(ctx, limit); err != nil {
+		t.Fatalf("below-limit capacity check: %v", err)
+	}
+	if _, err := store.addDownloadingWithLimit(ctx, Video{
+		TelegramFileID:   "second",
+		TelegramUniqueID: "second",
+		FileName:         "second.mp4",
+	}, limit); err != nil {
+		t.Fatalf("equal-limit insert: %v", err)
+	}
+	if err := store.checkVideoCapacityWithLimit(ctx, limit); !errors.Is(err, ErrVideoCapacity) {
+		t.Fatalf("equal-limit capacity check = %v, want %v", err, ErrVideoCapacity)
+	}
+	if _, err := store.addDownloadingWithLimit(ctx, Video{
+		TelegramFileID:   "over",
+		TelegramUniqueID: "over",
+		FileName:         "over.mp4",
+	}, limit); !errors.Is(err, ErrVideoCapacity) {
+		t.Fatalf("over-limit insert = %v, want %v", err, ErrVideoCapacity)
+	}
+
+	if changed, err := store.MarkFailed(ctx, first.ID, "done"); err != nil || !changed {
+		t.Fatalf("mark first failed: changed=%t err=%v", changed, err)
+	}
+	if err := store.checkVideoCapacityWithLimit(ctx, limit); !errors.Is(err, ErrVideoCapacity) {
+		t.Fatalf("terminal row stopped counting toward capacity: %v", err)
+	}
+	if deleted, err := store.DeleteTerminal(ctx, first.ID, StatusFailed); err != nil || !deleted {
+		t.Fatalf("delete first: deleted=%t err=%v", deleted, err)
+	}
+	if err := store.checkVideoCapacityWithLimit(ctx, limit); err != nil {
+		t.Fatalf("capacity after delete: %v", err)
+	}
+	if _, err := store.addDownloadingWithLimit(ctx, Video{
+		TelegramFileID:   "replacement",
+		TelegramUniqueID: "replacement",
+		FileName:         "replacement.mp4",
+	}, limit); err != nil {
+		t.Fatalf("insert after delete: %v", err)
+	}
+}
+
+func TestVideoCapacityAdmissionIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "queue.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func(index int) {
+			<-start
+			_, err := store.addDownloadingWithLimit(ctx, Video{
+				TelegramFileID:   fmt.Sprintf("file-%d", index),
+				TelegramUniqueID: fmt.Sprintf("unique-%d", index),
+				FileName:         fmt.Sprintf("video-%d.mp4", index),
+			}, 1)
+			results <- err
+		}(i)
+	}
+	close(start)
+
+	var admitted, rejected int
+	for i := 0; i < 2; i++ {
+		switch err := <-results; {
+		case err == nil:
+			admitted++
+		case errors.Is(err, ErrVideoCapacity):
+			rejected++
+		default:
+			t.Fatalf("concurrent insert error = %v", err)
+		}
+	}
+	if admitted != 1 || rejected != 1 {
+		t.Fatalf("concurrent results admitted=%d rejected=%d, want 1/1", admitted, rejected)
+	}
+	var rows int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM videos`).Scan(&rows); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("video rows = %d, want exactly 1", rows)
 	}
 }
 

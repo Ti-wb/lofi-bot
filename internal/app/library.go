@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,6 +25,8 @@ type libraryUploadPlan struct {
 	label    string
 }
 
+type libraryScanFunc func(string, string) (medialib.Library, error)
+
 func (s *Service) libraryMode() bool {
 	return s.cfg.PlayerMode == "library"
 }
@@ -35,6 +38,10 @@ func (s *Service) ScanLibrary(ctx context.Context) error {
 }
 
 func (s *Service) scanLibraryLocked(ctx context.Context) error {
+	return s.scanLibraryLockedWith(ctx, medialib.ScanDirs)
+}
+
+func (s *Service) scanLibraryLockedWith(ctx context.Context, scan libraryScanFunc) error {
 	tracker := liveness.WorkerFromContext(ctx)
 	scanScope := tracker.Scope(liveness.PhaseLibraryScan)
 	defer scanScope.Close()
@@ -50,8 +57,10 @@ func (s *Service) scanLibraryLocked(ctx context.Context) error {
 		s.setLastErr(err)
 		return err
 	}
-	lib, err := medialib.ScanDirs(s.cfg.LoopMediaDir, s.cfg.MusicMediaDir)
-	s.librarySnapshot = lib
+	lib, err := scan(s.cfg.LoopMediaDir, s.cfg.MusicMediaDir)
+	if !errors.Is(err, medialib.ErrDirectoryCapacity) {
+		s.librarySnapshot = lib
+	}
 	if err != nil {
 		s.libraryScanErr = err.Error()
 		s.setLastErr(err)
@@ -534,6 +543,15 @@ func (s *Service) planLibraryUpload(rawFileName string) (libraryUploadPlan, erro
 }
 
 func (s *Service) preflightLibraryUpload(ctx context.Context, fileName string, declaredSize int64) error {
+	return s.preflightLibraryUploadWithLimit(ctx, fileName, declaredSize, medialib.MaxDirectoryEntries)
+}
+
+func (s *Service) preflightLibraryUploadWithLimit(
+	ctx context.Context,
+	fileName string,
+	declaredSize int64,
+	limit int,
+) error {
 	plan, err := s.planLibraryUpload(fileName)
 	if err != nil {
 		return err
@@ -548,6 +566,9 @@ func (s *Service) preflightLibraryUpload(ctx context.Context, fileName string, d
 	if _, err := os.Stat(destPath); err == nil {
 		return publicError("媒體庫已有同名素材，請換一個 variant 或 track 名稱。")
 	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := ensureLibraryImportCapacityWithLimit(plan.destDir, limit); err != nil {
 		return err
 	}
 	sharedFilesystem, err := pathsShareFilesystem(s.cfg.TelegramBotAPIDir, plan.destDir)
@@ -568,6 +589,22 @@ func (s *Service) preflightLibraryUpload(ctx context.Context, fileName string, d
 }
 
 func (s *Service) storeLibraryUpload(ctx context.Context, kind medialib.Kind, destPath, sourcePath string) error {
+	return s.storeLibraryUploadWithLimit(
+		ctx,
+		kind,
+		destPath,
+		sourcePath,
+		medialib.MaxDirectoryEntries,
+	)
+}
+
+func (s *Service) storeLibraryUploadWithLimit(
+	ctx context.Context,
+	kind medialib.Kind,
+	destPath string,
+	sourcePath string,
+	limit int,
+) error {
 	s.storageMu.Lock()
 	defer s.storageMu.Unlock()
 
@@ -577,6 +614,9 @@ func (s *Service) storeLibraryUpload(ctx context.Context, kind medialib.Kind, de
 	if _, err := os.Stat(destPath); err == nil {
 		return publicError("媒體庫已有同名素材，請換一個 variant 或 track 名稱。")
 	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := ensureLibraryImportCapacityWithLimit(filepath.Dir(destPath), limit); err != nil {
 		return err
 	}
 	var validator prePublishFunc
@@ -603,6 +643,40 @@ func (s *Service) storeLibraryUpload(ctx context.Context, kind medialib.Kind, de
 	)
 	if err != nil {
 		return err
+	}
+	return nil
+}
+
+func ensureLibraryImportCapacityWithLimit(destDir string, limit int) error {
+	if limit <= 0 {
+		return errors.New("media library directory limit must be positive")
+	}
+	additionalEntries := 1
+	stagingDir := filepath.Join(destDir, libraryStagingDirName)
+	if info, err := os.Lstat(stagingDir); err == nil {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("library staging path is not an owned directory: %s", stagingDir)
+		}
+	} else if errors.Is(err, os.ErrNotExist) {
+		additionalEntries++
+	} else {
+		return err
+	}
+
+	handle, err := os.Open(destDir)
+	if err != nil {
+		return err
+	}
+	defer handle.Close()
+	entries, err := handle.ReadDir(limit + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	if additionalEntries > limit || len(entries) > limit-additionalEntries {
+		return publicError(fmt.Sprintf(
+			"媒體庫目錄已達 %d 個項目上限，請先移除不需要的素材後再重試。",
+			limit,
+		))
 	}
 	return nil
 }

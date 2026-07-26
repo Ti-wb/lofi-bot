@@ -748,7 +748,7 @@ func (s *Service) addDownloadingUpload(ctx context.Context, req UploadRequest) (
 	if length >= s.cfg.MaxQueueLength {
 		return queue.Video{}, publicError(fmt.Sprintf("佇列已滿，目前上限是 %d 支", s.cfg.MaxQueueLength))
 	}
-	return s.store.AddDownloading(ctx, queue.Video{
+	video, err := s.store.AddDownloading(ctx, queue.Video{
 		TelegramFileID:   req.TelegramFileID,
 		TelegramUniqueID: req.TelegramUniqueID,
 		SubmitterID:      req.SubmitterID,
@@ -760,6 +760,10 @@ func (s *Service) addDownloadingUpload(ctx context.Context, req UploadRequest) (
 		MimeType:         req.MimeType,
 		SizeBytes:        actualSize,
 	})
+	if errors.Is(err, queue.ErrVideoCapacity) {
+		return queue.Video{}, videoCapacityPublicError()
+	}
+	return video, err
 }
 
 func (s *Service) advancePlayback(ctx context.Context) (*queue.Video, error) {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/media"
+	"github.com/tiwb/tg-obs-bot/internal/queue"
 )
 
 const (
@@ -49,10 +50,23 @@ func (s *Service) preflightUpload(ctx context.Context, fileName string, declared
 	if s.libraryMode() {
 		return s.preflightLibraryUpload(ctx, fileName, declaredSize)
 	}
+	return s.preflightQueueUpload(ctx, declaredSize, s.store.CheckVideoCapacity)
+}
 
+func (s *Service) preflightQueueUpload(
+	ctx context.Context,
+	declaredSize int64,
+	checkVideoCapacity func(context.Context) error,
+) error {
 	s.storageMu.Lock()
 	defer s.storageMu.Unlock()
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := checkVideoCapacity(ctx); err != nil {
+		if errors.Is(err, queue.ErrVideoCapacity) {
+			return videoCapacityPublicError()
+		}
 		return err
 	}
 	length, err := s.store.QueueLength(ctx)
@@ -63,6 +77,13 @@ func (s *Service) preflightUpload(ctx context.Context, fileName string, declared
 		return publicError(fmt.Sprintf("佇列已滿，目前上限是 %d 支", s.cfg.MaxQueueLength))
 	}
 	return s.ensureStorageHeadroom(s.cfg.TelegramBotAPIDir, declaredSize)
+}
+
+func videoCapacityPublicError() error {
+	return publicError(fmt.Sprintf(
+		"影片紀錄已達 %d 筆上限，請先清理已完成的歷史紀錄後再重試。",
+		queue.MaxVideoRows,
+	))
 }
 
 func (s *Service) ensureStorageHeadroom(path string, incomingBytes int64) error {
