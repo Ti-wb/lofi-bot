@@ -124,8 +124,8 @@ func TestDownloadLeavesFinalFileWhenProbeFailsAndCleansTempFile(t *testing.T) {
 	requireNoTmpFiles(t, manager.Dir())
 }
 
-func TestProbeRoundsDuration(t *testing.T) {
-	manager, err := NewManager(t.TempDir(), fakeFFProbe(t, "printf '%s\\n' '{\"format\":{\"duration\":\"1.6\"}}'\n"))
+func TestProbeRoundsDurationUp(t *testing.T) {
+	manager, err := NewManager(t.TempDir(), fakeFFProbe(t, "printf '%s\\n' '{\"format\":{\"duration\":\"1.01\"}}'\n"))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -139,7 +139,52 @@ func TestProbeRoundsDuration(t *testing.T) {
 		t.Fatalf("expected size 5, got %d", meta.SizeBytes)
 	}
 	if meta.DurationSeconds != 2 {
-		t.Fatalf("expected rounded duration 2, got %d", meta.DurationSeconds)
+		t.Fatalf("expected ceiling duration 2, got %d", meta.DurationSeconds)
+	}
+}
+
+func TestValidateFailsClosedForUnavailableOrInvalidDuration(t *testing.T) {
+	tests := []string{"", "not-a-number", "0", "-1", "NaN", "+Inf", "1e100"}
+	for _, raw := range tests {
+		t.Run(raw, func(t *testing.T) {
+			body := "printf '%s\\n' '{\"format\":{}}'\n"
+			if raw != "" {
+				body = "printf '%s\\n' '{\"format\":{\"duration\":\"" + raw + "\"}}'\n"
+			}
+			manager, err := NewManager(t.TempDir(), fakeFFProbe(t, body))
+			if err != nil {
+				t.Fatalf("new manager: %v", err)
+			}
+			path := writeMediaFile(t, manager.Dir(), "clip.mp4", "video")
+			meta, err := manager.Probe(context.Background(), path)
+			if err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+			if meta.DurationSeconds != 0 {
+				t.Fatalf("duration = %d, want unavailable", meta.DurationSeconds)
+			}
+			if err := manager.Validate(meta, 100, 10); err == nil || !strings.Contains(err.Error(), "duration is unavailable or invalid") {
+				t.Fatalf("validate error = %v, want fail-closed duration error", err)
+			}
+			if err := manager.Validate(meta, 100, 0); err != nil {
+				t.Fatalf("disabled duration limit should accept metadata: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateFailsClosedWhenFFProbeIsDisabledAndDurationLimitIsEnabled(t *testing.T) {
+	manager, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	path := writeMediaFile(t, manager.Dir(), "clip.mp4", "video")
+	meta, err := manager.Probe(context.Background(), path)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if err := manager.Validate(meta, 100, 10); err == nil || !strings.Contains(err.Error(), "duration is unavailable or invalid") {
+		t.Fatalf("validate error = %v, want fail-closed duration error", err)
 	}
 }
 

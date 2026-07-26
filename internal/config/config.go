@@ -12,7 +12,11 @@ import (
 	"time"
 )
 
-const currentEnvSchemaVersion = 4
+const (
+	currentEnvSchemaVersion = 5
+	bytesPerMiB             = int64(1024 * 1024)
+	maxStorageMiB           = int64(^uint64(0)>>1) / bytesPerMiB
+)
 
 type Config struct {
 	TelegramBotToken   string
@@ -37,6 +41,7 @@ type Config struct {
 	PlayerMode                string
 	MaxVideoSizeBytes         int64
 	MaxVideoDurationSeconds   int
+	MinFreeDiskBytes          int64
 	MaxQueueLength            int
 	RetentionDays             int
 	RetentionMaxFiles         int
@@ -57,11 +62,15 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	maxVideoSizeMB, err := getenvInt("MAX_VIDEO_SIZE_MB", 2000)
+	maxVideoSizeMB, err := getenvInt64("MAX_VIDEO_SIZE_MB", 2000)
 	if err != nil {
 		return Config{}, err
 	}
 	maxVideoDurationSeconds, err := getenvInt("MAX_VIDEO_DURATION_SECONDS", 7200)
+	if err != nil {
+		return Config{}, err
+	}
+	minFreeDiskMB, err := getenvInt64("MIN_FREE_DISK_MB", 512)
 	if err != nil {
 		return Config{}, err
 	}
@@ -81,6 +90,18 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	if maxVideoSizeMB <= 0 {
+		return Config{}, errors.New("MAX_VIDEO_SIZE_MB must be positive")
+	}
+	if maxVideoSizeMB > maxStorageMiB {
+		return Config{}, errors.New("MAX_VIDEO_SIZE_MB is too large")
+	}
+	if minFreeDiskMB < 0 {
+		return Config{}, errors.New("MIN_FREE_DISK_MB must be non-negative")
+	}
+	if minFreeDiskMB > maxStorageMiB {
+		return Config{}, errors.New("MIN_FREE_DISK_MB is too large")
+	}
 
 	cfg := Config{
 		TelegramBotToken:          strings.TrimSpace(getenv("TELEGRAM_BOT_TOKEN", "")),
@@ -97,8 +118,9 @@ func Load() (Config, error) {
 		FallbackMode:              strings.TrimSpace(getenv("FALLBACK_MODE", "random_played")),
 		PlayerMode:                strings.TrimSpace(getenv("PLAYER_MODE", "library")),
 		DataDir:                   strings.TrimSpace(getenv("DATA_DIR", "./data")),
-		MaxVideoSizeBytes:         int64(maxVideoSizeMB) * 1024 * 1024,
+		MaxVideoSizeBytes:         maxVideoSizeMB * bytesPerMiB,
 		MaxVideoDurationSeconds:   maxVideoDurationSeconds,
+		MinFreeDiskBytes:          minFreeDiskMB * bytesPerMiB,
 		MaxQueueLength:            maxQueueLength,
 		RetentionDays:             retentionDays,
 		RetentionMaxFiles:         retentionMaxFiles,
@@ -143,9 +165,6 @@ func Load() (Config, error) {
 	}
 	if !validPlayerMode(cfg.PlayerMode) {
 		return cfg, fmt.Errorf("PLAYER_MODE must be one of library, queue")
-	}
-	if cfg.MaxVideoSizeBytes <= 0 {
-		return cfg, errors.New("MAX_VIDEO_SIZE_MB must be positive")
 	}
 	if cfg.MaxVideoDurationSeconds < 0 {
 		return cfg, errors.New("MAX_VIDEO_DURATION_SECONDS must be non-negative")
@@ -304,6 +323,11 @@ func envMigrationAdditions(version int, values map[string]string) []string {
 		}
 		if _, ok := values["MUSIC_MEDIA_DIR"]; !ok {
 			additions = append(additions, "MUSIC_MEDIA_DIR=./data/media/music")
+		}
+	}
+	if version < 5 {
+		if _, ok := values["MIN_FREE_DISK_MB"]; !ok {
+			additions = append(additions, "MIN_FREE_DISK_MB=512")
 		}
 	}
 	return additions

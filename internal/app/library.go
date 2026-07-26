@@ -2,11 +2,8 @@ package app
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -427,11 +424,6 @@ func overrideDateKey(t time.Time) string {
 }
 
 func (s *Service) ImportLibraryUpload(ctx context.Context, req UploadRequest) (string, error) {
-	if req.SizeBytes > s.cfg.MaxVideoSizeBytes {
-		err := publicError(fmt.Sprintf("檔案太大，上限是 %s", formatBytes(s.cfg.MaxVideoSizeBytes)))
-		s.setLastErr(err)
-		return "", err
-	}
 	if strings.TrimSpace(req.LocalPath) == "" {
 		err := errors.New("local media path is required")
 		s.setLastErr(err)
@@ -446,17 +438,6 @@ func (s *Service) ImportLibraryUpload(ctx context.Context, req UploadRequest) (s
 		s.setLastErr(err)
 		return "", err
 	}
-	info, err := os.Stat(req.LocalPath)
-	if err != nil {
-		s.setLastErr(err)
-		return "", err
-	}
-	if info.Size() > s.cfg.MaxVideoSizeBytes {
-		err := publicError(fmt.Sprintf("檔案太大，上限是 %s", formatBytes(s.cfg.MaxVideoSizeBytes)))
-		s.setLastErr(err)
-		return "", err
-	}
-
 	fileName := CleanFileName(req.FileName)
 	if fileName == "" {
 		err := publicError("檔名不可為空，請使用新版素材命名規則。")
@@ -488,33 +469,9 @@ func (s *Service) ImportLibraryUpload(ctx context.Context, req UploadRequest) (s
 		return "", err
 	}
 	destPath := filepath.Join(destDir, fileName)
-	if _, err := os.Stat(destPath); err == nil {
-		err := publicError("媒體庫已有同名素材，請換一個 variant 或 track 名稱。")
+	if err := s.storeLibraryUpload(ctx, kind, destPath, req.LocalPath); err != nil {
 		s.setLastErr(err)
 		return "", err
-	} else if !errors.Is(err, os.ErrNotExist) {
-		s.setLastErr(err)
-		return "", err
-	}
-	if err := copyFile(destPath, req.LocalPath); err != nil {
-		s.setLastErr(err)
-		return "", err
-	}
-
-	if kind == medialib.KindLoop {
-		probeCtx, cancelProbe := context.WithTimeout(ctx, uploadProbeTimeout)
-		meta, err := s.media.Probe(probeCtx, destPath)
-		cancelProbe()
-		if err != nil {
-			_ = os.Remove(destPath)
-			s.setLastErr(err)
-			return "", err
-		}
-		if err := s.media.Validate(meta, s.cfg.MaxVideoSizeBytes, s.cfg.MaxVideoDurationSeconds); err != nil {
-			_ = os.Remove(destPath)
-			s.setLastErr(err)
-			return "", err
-		}
 	}
 
 	if err := s.ScanLibrary(ctx); err != nil {
@@ -523,35 +480,42 @@ func (s *Service) ImportLibraryUpload(ctx context.Context, req UploadRequest) (s
 	return fmt.Sprintf("已匯入素材：%s", label), nil
 }
 
-func copyFile(dst string, src string) error {
-	in, err := os.Open(src)
-	if err != nil {
+func (s *Service) storeLibraryUpload(ctx context.Context, kind medialib.Kind, destPath, sourcePath string) error {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	defer in.Close()
-	tmp := dst + ".tmp-" + shortHash(src+time.Now().String())
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
+	if _, err := os.Stat(destPath); err == nil {
+		return publicError("媒體庫已有同名素材，請換一個 variant 或 track 名稱。")
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	_, copyErr := io.Copy(out, in)
-	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(tmp)
-		return copyErr
+	var validator prePublishFunc
+	if kind == medialib.KindLoop {
+		validator = func(validationCtx context.Context, stagingPath string) error {
+			probeCtx, cancelProbe := context.WithTimeout(validationCtx, uploadProbeTimeout)
+			defer cancelProbe()
+			meta, err := s.media.Probe(probeCtx, stagingPath)
+			if err != nil {
+				return err
+			}
+			return s.media.Validate(meta, s.cfg.MaxVideoSizeBytes, s.cfg.MaxVideoDurationSeconds)
+		}
 	}
-	if closeErr != nil {
-		_ = os.Remove(tmp)
-		return closeErr
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
+	_, err := copyFileAtomic(
+		ctx,
+		destPath,
+		sourcePath,
+		s.cfg.MaxVideoSizeBytes,
+		func(actualSize int64) error {
+			return s.ensureStorageHeadroom(filepath.Dir(destPath), actualSize)
+		},
+		validator,
+	)
+	if err != nil {
 		return err
 	}
 	return nil
-}
-
-func shortHash(value string) string {
-	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:])[:8]
 }

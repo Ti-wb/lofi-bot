@@ -24,7 +24,7 @@
 6. Music-ended events choose another music asset while avoiding immediate repeats when possible.
 7. Period changes cause the next stored or newly selected loop plan to start.
 8. `/preview` materializes the next period's planned loop so the preview matches the later playback unless the asset is removed.
-9. Telegram admin uploads that match the library filename schema are copied into the library folder and become available after scan/import.
+9. Telegram admin uploads that match the library filename schema pass an actual-size destination-filesystem admission check, are copied and validated inside an app-owned staging subdirectory, then become visible through an atomic rename before scan/import.
 
 ## Management Authorization
 

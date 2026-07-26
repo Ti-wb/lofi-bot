@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,7 +24,7 @@ func TestLoadReadsDotEnvAndDefaults(t *testing.T) {
 	}
 
 	body := []byte(`
-ENV_SCHEMA_VERSION=4
+ENV_SCHEMA_VERSION=5
 TELEGRAM_BOT_TOKEN=token
 TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
 ALLOWED_CHAT_ID=-1001
@@ -76,6 +77,9 @@ OBS_MEDIA_SOURCE_NAME=player
 	}
 	if cfg.MaxVideoSizeBytes != 2000*1024*1024 {
 		t.Fatalf("unexpected max video size: %d", cfg.MaxVideoSizeBytes)
+	}
+	if cfg.MinFreeDiskBytes != 512*1024*1024 {
+		t.Fatalf("unexpected minimum free disk: %d", cfg.MinFreeDiskBytes)
 	}
 	if cfg.RetentionDeleteLocalFiles {
 		t.Fatalf("retention should keep local files by default")
@@ -153,7 +157,7 @@ func TestLoadRejectsInvalidFallbackMode(t *testing.T) {
 	}
 
 	body := []byte(`
-ENV_SCHEMA_VERSION=4
+ENV_SCHEMA_VERSION=5
 TELEGRAM_BOT_TOKEN=token
 TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
 ALLOWED_CHAT_ID=-1001
@@ -186,6 +190,7 @@ func TestLoadRejectsMalformedNumericEnv(t *testing.T) {
 		"OBS_PORT",
 		"MAX_VIDEO_SIZE_MB",
 		"MAX_VIDEO_DURATION_SECONDS",
+		"MIN_FREE_DISK_MB",
 		"MAX_QUEUE_LENGTH",
 		"RETENTION_DAYS",
 		"RETENTION_MAX_FILES",
@@ -242,7 +247,10 @@ func TestLoadRejectsInvalidNumericRanges(t *testing.T) {
 		{key: "OBS_PORT", value: "0", wantErr: "OBS_PORT must be between 1 and 65535"},
 		{key: "OBS_PORT", value: "65536", wantErr: "OBS_PORT must be between 1 and 65535"},
 		{key: "MAX_VIDEO_SIZE_MB", value: "0", wantErr: "MAX_VIDEO_SIZE_MB must be positive"},
+		{key: "MAX_VIDEO_SIZE_MB", value: "8796093022208", wantErr: "MAX_VIDEO_SIZE_MB is too large"},
 		{key: "MAX_VIDEO_DURATION_SECONDS", value: "-1", wantErr: "MAX_VIDEO_DURATION_SECONDS must be non-negative"},
+		{key: "MIN_FREE_DISK_MB", value: "-1", wantErr: "MIN_FREE_DISK_MB must be non-negative"},
+		{key: "MIN_FREE_DISK_MB", value: "8796093022208", wantErr: "MIN_FREE_DISK_MB is too large"},
 		{key: "MAX_QUEUE_LENGTH", value: "0", wantErr: "MAX_QUEUE_LENGTH must be positive"},
 		{key: "RETENTION_DAYS", value: "-1", wantErr: "RETENTION_DAYS must be non-negative"},
 		{key: "RETENTION_MAX_FILES", value: "-1", wantErr: "RETENTION_MAX_FILES must be non-negative"},
@@ -268,6 +276,7 @@ func TestLoadAllowsZeroDurationAndRetentionLimits(t *testing.T) {
 	chdirTemp(t)
 	setValidConfigEnv(t)
 	t.Setenv("MAX_VIDEO_DURATION_SECONDS", "0")
+	t.Setenv("MIN_FREE_DISK_MB", "0")
 	t.Setenv("RETENTION_DAYS", "0")
 	t.Setenv("RETENTION_MAX_FILES", "0")
 
@@ -278,11 +287,29 @@ func TestLoadAllowsZeroDurationAndRetentionLimits(t *testing.T) {
 	if cfg.MaxVideoDurationSeconds != 0 {
 		t.Fatalf("duration = %d, want 0", cfg.MaxVideoDurationSeconds)
 	}
+	if cfg.MinFreeDiskBytes != 0 {
+		t.Fatalf("minimum free disk = %d, want 0", cfg.MinFreeDiskBytes)
+	}
 	if cfg.RetentionDays != 0 {
 		t.Fatalf("retention days = %d, want 0", cfg.RetentionDays)
 	}
 	if cfg.RetentionMaxFiles != 0 {
 		t.Fatalf("retention max files = %d, want 0", cfg.RetentionMaxFiles)
+	}
+}
+
+func TestRunShDoctorStorageRangesMatchGoConfig(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "run.sh"))
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	for _, want := range []string{
+		fmt.Sprintf(`"MAX_VIDEO_SIZE_MB:2000:1:%d"`, maxStorageMiB),
+		fmt.Sprintf(`"MIN_FREE_DISK_MB:512:0:%d"`, maxStorageMiB),
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("run.sh doctor range does not match Go limit; missing %q", want)
+		}
 	}
 }
 
@@ -339,7 +366,7 @@ OBS_MEDIA_SOURCE_NAME=player
 		t.Fatalf("migrate env: %v", err)
 	}
 	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=4")
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=5")
 	assertContains(t, migrated, "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081")
 	assertContains(t, migrated, "MAX_VIDEO_SIZE_MB=2000")
 	assertContains(t, migrated, "TELEGRAM_API_ID=replace-with-telegram-api-id")
@@ -354,6 +381,7 @@ OBS_MEDIA_SOURCE_NAME=player
 	assertContains(t, migrated, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
 	assertContains(t, migrated, "LOOP_MEDIA_DIR=./data/media/loops")
 	assertContains(t, migrated, "MUSIC_MEDIA_DIR=./data/media/music")
+	assertContains(t, migrated, "MIN_FREE_DISK_MB=512")
 	if backups := backupFiles(t, dir); len(backups) != 1 {
 		t.Fatalf("backups = %v, want 1 backup", backups)
 	}
@@ -378,7 +406,7 @@ MAX_VIDEO_SIZE_MB=2000
 		t.Fatalf("migrate env: %v", err)
 	}
 	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=4")
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=5")
 	assertContains(t, migrated, "TELEGRAM_API_ID=replace-with-telegram-api-id")
 	assertContains(t, migrated, "TELEGRAM_API_HASH=replace-with-telegram-api-hash")
 	assertContains(t, migrated, "TELEGRAM_BOT_API_BIN=telegram-bot-api")
@@ -391,6 +419,7 @@ MAX_VIDEO_SIZE_MB=2000
 	assertContains(t, migrated, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
 	assertContains(t, migrated, "LOOP_MEDIA_DIR=./data/media/loops")
 	assertContains(t, migrated, "MUSIC_MEDIA_DIR=./data/media/music")
+	assertContains(t, migrated, "MIN_FREE_DISK_MB=512")
 	if backups := backupFiles(t, dir); len(backups) != 1 {
 		t.Fatalf("backups = %v, want 1 backup", backups)
 	}
@@ -416,7 +445,7 @@ MAX_VIDEO_SIZE_MB=123
 		t.Fatalf("migrate env: %v", err)
 	}
 	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=4")
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=5")
 	if countSubstring(migrated, "TELEGRAM_API_BASE_URL=") != 1 {
 		t.Fatalf("telegram api base url should not be duplicated:\n%s", migrated)
 	}
@@ -437,6 +466,32 @@ MAX_VIDEO_SIZE_MB=123
 	assertContains(t, migrated, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
 	assertContains(t, migrated, "LOOP_MEDIA_DIR=./data/media/loops")
 	assertContains(t, migrated, "MUSIC_MEDIA_DIR=./data/media/music")
+	assertContains(t, migrated, "MIN_FREE_DISK_MB=512")
+}
+
+func TestLoadMigratesVersionFourDotEnvWithDiskReserve(t *testing.T) {
+	clearConfigEnv(t)
+	dir := chdirTemp(t)
+	envPath := filepath.Join(dir, ".env")
+	body := []byte(`
+ENV_SCHEMA_VERSION=4
+TELEGRAM_BOT_TOKEN=token
+TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
+ALLOWED_CHAT_ID=-1001
+`)
+	if err := os.WriteFile(envPath, body, 0o600); err != nil {
+		t.Fatalf("write env: %v", err)
+	}
+
+	if err := migrateDotEnv(envPath); err != nil {
+		t.Fatalf("migrate env: %v", err)
+	}
+	migrated := readFile(t, envPath)
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=5")
+	assertContains(t, migrated, "MIN_FREE_DISK_MB=512")
+	if countSubstring(migrated, "MIN_FREE_DISK_MB=") != 1 {
+		t.Fatalf("minimum free disk should be added once:\n%s", migrated)
+	}
 }
 
 func TestLoadMigrationUpdatesExplicitOldVersion(t *testing.T) {
@@ -459,7 +514,7 @@ ALLOWED_CHAT_ID=-1001
 	if countSubstring(migrated, "ENV_SCHEMA_VERSION=") != 1 {
 		t.Fatalf("schema version should not be duplicated:\n%s", migrated)
 	}
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=4")
+	assertContains(t, migrated, "ENV_SCHEMA_VERSION=5")
 	assertContains(t, migrated, "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081")
 	assertContains(t, migrated, "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api")
 	assertContains(t, migrated, "RETENTION_DELETE_LOCAL_FILES=false")
@@ -468,6 +523,7 @@ ALLOWED_CHAT_ID=-1001
 	assertContains(t, migrated, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
 	assertContains(t, migrated, "LOOP_MEDIA_DIR=./data/media/loops")
 	assertContains(t, migrated, "MUSIC_MEDIA_DIR=./data/media/music")
+	assertContains(t, migrated, "MIN_FREE_DISK_MB=512")
 }
 
 func TestLoadDoesNotRemigrateCurrentDotEnv(t *testing.T) {
@@ -475,7 +531,7 @@ func TestLoadDoesNotRemigrateCurrentDotEnv(t *testing.T) {
 	dir := chdirTemp(t)
 	envPath := filepath.Join(dir, ".env")
 	body := []byte(`
-ENV_SCHEMA_VERSION=4
+ENV_SCHEMA_VERSION=5
 TELEGRAM_BOT_TOKEN=token
 TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
 TELEGRAM_API_ID=replace-with-telegram-api-id
@@ -490,6 +546,7 @@ OBS_LOOP_SOURCE_NAME=tg_loop_player
 OBS_MUSIC_SOURCE_NAME=tg_music_player
 LOOP_MEDIA_DIR=./data/media/loops
 MUSIC_MEDIA_DIR=./data/media/music
+MIN_FREE_DISK_MB=512
 ALLOWED_CHAT_ID=-1001
 `)
 	if err := os.WriteFile(envPath, body, 0o600); err != nil {
@@ -556,6 +613,7 @@ func clearConfigEnv(t *testing.T) {
 		"DATABASE_PATH",
 		"MAX_VIDEO_SIZE_MB",
 		"MAX_VIDEO_DURATION_SECONDS",
+		"MIN_FREE_DISK_MB",
 		"MAX_QUEUE_LENGTH",
 		"RETENTION_DAYS",
 		"RETENTION_MAX_FILES",

@@ -86,7 +86,7 @@ Before starting services, run `./run.sh migrate-env` to apply the stack helper's
 
 After migration, confirm the appended Telegram Local Bot API Server defaults are correct for production. If they are wrong, edit `.env` and restart the root `./run.sh up` supervisor so both child services inherit the same configuration.
 
-Numeric config values are strict in production: malformed integers fail startup instead of falling back to defaults. Keep `OBS_PORT` in `1..65535`, set `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` above `0`, and use non-negative values for `MAX_VIDEO_DURATION_SECONDS`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES`. A value of `0` remains valid for duration and retention limits where it means disabled. `RETENTION_DELETE_LOCAL_FILES` must be boolean and defaults to `false`.
+Numeric config values are strict in production: malformed integers fail startup instead of falling back to defaults. Keep `OBS_PORT` in `1..65535`, set `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` above `0`, and use non-negative values for `MAX_VIDEO_DURATION_SECONDS`, `MIN_FREE_DISK_MB`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES`. A value of `0` remains valid where it means disabled. `MIN_FREE_DISK_MB` defaults to `512`; setting it to `0` disables only the additional reserve, not actual-size filesystem admission or `MAX_VIDEO_SIZE_MB`. `RETENTION_DELETE_LOCAL_FILES` must be boolean and defaults to `false`.
 
 The stack helpers also run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing supported schema defaults. The Go app itself only reads config at startup; it does not rewrite `.env`.
 
@@ -182,6 +182,12 @@ When `FALLBACK_MODE=random_played`, the currently playing random fallback row is
 
 `/status` reports library disk and `TELEGRAM_BOT_API_DIR` disk. Monitor `LOOP_MEDIA_DIR`, `MUSIC_MEDIA_DIR`, and `TELEGRAM_BOT_API_DIR`. If paths are relative, inspect them from the repository root, or use the absolute resolved paths shown by `./run.sh doctor`.
 
+Storage admission uses the file's actual on-disk size, not Telegram's declared size. Queue mode checks the filesystem containing the Local Bot API file before creating a queue row. The Local Bot API has already cached that file by this point, so a rejection never deletes it. Library mode separately checks the destination filesystem and requires `actual size + MIN_FREE_DISK_MB` to remain available before copying.
+
+Library imports copy into the app-owned `.tg-obs-bot-staging` subdirectory on the destination filesystem, flush and close the staging file, validate loop media there, then publish it with an atomic rename. The staging and destination directories are both synchronized after publication. Cancellation, validation failure, write failure, and `ENOSPC` remove the staging file without exposing an invalid final asset. Startup and ten-minute maintenance inspect at most 256 entries per staging directory and remove only matching regular staging files older than six hours; later passes converge on larger backlogs while unrelated, non-regular, and newer files remain untouched.
+
+When `MAX_VIDEO_DURATION_SECONDS` is greater than `0`, `ffprobe` must return a finite positive duration. Missing, malformed, zero, negative, `NaN`, or infinite durations are rejected. Fractional durations are rounded up before enforcing the limit.
+
 Set conservative values on the MacBook first, for example:
 
 ```env
@@ -193,6 +199,7 @@ RETENTION_DAYS=7
 RETENTION_MAX_FILES=100
 RETENTION_DELETE_LOCAL_FILES=false
 MAX_VIDEO_SIZE_MB=2000
+MIN_FREE_DISK_MB=512
 MAX_QUEUE_LENGTH=50
 ```
 

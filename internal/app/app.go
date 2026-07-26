@@ -33,6 +33,7 @@ type Service struct {
 	now        func() time.Time
 	rng        *rand.Rand
 	removeFile func(string) error
+	diskUsage  func(string) (media.DiskUsage, error)
 
 	mu                    sync.Mutex
 	playbackMu            sync.Mutex
@@ -190,6 +191,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 		now:        time.Now,
 		rng:        rand.New(rand.NewSource(time.Now().UnixNano())),
 		removeFile: media.RemoveFile,
+		diskUsage:  media.DiskUsageForPath,
 		playback:   playbackIdle,
 		shutdown:   []func() error{obsClient.Close, store.Close},
 	}
@@ -287,11 +289,6 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 func (s *Service) EnqueueUpload(ctx context.Context, req UploadRequest) (queue.Video, error) {
-	if req.SizeBytes > s.cfg.MaxVideoSizeBytes {
-		err := publicError(fmt.Sprintf("檔案太大，上限是 %s", formatBytes(s.cfg.MaxVideoSizeBytes)))
-		s.setLastErr(err)
-		return queue.Video{}, err
-	}
 	if strings.TrimSpace(req.LocalPath) == "" {
 		err := errors.New("local video path is required")
 		s.setLastErr(err)
@@ -340,6 +337,23 @@ func (s *Service) addDownloadingUpload(ctx context.Context, req UploadRequest) (
 	if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, req.LocalPath); err != nil {
 		return queue.Video{}, err
 	}
+	info, err := os.Stat(req.LocalPath)
+	if err != nil {
+		return queue.Video{}, fmt.Errorf("stat local video path: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return queue.Video{}, fmt.Errorf("local video path is not a regular file: %s", req.LocalPath)
+	}
+	actualSize := info.Size()
+	if actualSize <= 0 {
+		return queue.Video{}, publicError("影片檔案不可為空。")
+	}
+	if actualSize > s.cfg.MaxVideoSizeBytes {
+		return queue.Video{}, publicError(fmt.Sprintf("檔案太大，上限是 %s", formatBytes(s.cfg.MaxVideoSizeBytes)))
+	}
+	if err := s.ensureStorageHeadroom(req.LocalPath, actualSize); err != nil {
+		return queue.Video{}, err
+	}
 	length, err := s.store.QueueLength(ctx)
 	if err != nil {
 		return queue.Video{}, err
@@ -357,7 +371,7 @@ func (s *Service) addDownloadingUpload(ctx context.Context, req UploadRequest) (
 		FileName:         CleanFileName(req.FileName),
 		LocalPath:        req.LocalPath,
 		MimeType:         req.MimeType,
-		SizeBytes:        req.SizeBytes,
+		SizeBytes:        actualSize,
 	})
 }
 
@@ -1310,13 +1324,16 @@ func (s *Service) queueEndedEventIsTooEarly(event obs.Event, current queue.Video
 }
 
 func (s *Service) recoverStartupState(ctx context.Context) error {
-	return s.failStaleDownloading(ctx, "startup recovery: stale downloading item")
+	staleErr := s.failStaleDownloading(ctx, "startup recovery: stale downloading item")
+	tempErr := s.sweepStaleLibraryImportTemps(ctx)
+	return errors.Join(staleErr, tempErr)
 }
 
 func (s *Service) performMaintenance(ctx context.Context) error {
 	staleErr := s.failStaleDownloading(ctx, "periodic recovery: stale downloading item")
 	retentionErr := s.CleanupRetention(ctx)
-	return errors.Join(staleErr, retentionErr)
+	tempErr := s.sweepStaleLibraryImportTemps(ctx)
+	return errors.Join(staleErr, retentionErr, tempErr)
 }
 
 func (s *Service) failStaleDownloading(ctx context.Context, cause string) error {

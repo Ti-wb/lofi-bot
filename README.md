@@ -96,7 +96,7 @@ After changing `.env`, restart the root `./run.sh up` process so both child serv
 
 Before deploying a new build, back up the production `.env`. You can run `./run.sh migrate-env` to apply the stack helper's lightweight `.env` repair without starting the Go app. It copies the original to `.env.backup.<unix_timestamp>`, updates older schema markers, and appends missing fields needed by the Local Bot API helper. If appended Local Bot API Server defaults are not correct for production, edit `.env` before starting the stack.
 
-Numeric config values must be valid integers; malformed values fail startup instead of silently falling back to defaults. `OBS_PORT` must be `1..65535`; `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` must be positive; `MAX_VIDEO_DURATION_SECONDS`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES` may be `0` to disable that limit where supported. `RETENTION_DELETE_LOCAL_FILES` defaults to `false`, so retention removes old SQLite rows without deleting Telegram Local Bot API media files unless you explicitly opt in.
+Numeric config values must be valid integers; malformed values fail startup instead of silently falling back to defaults. `OBS_PORT` must be `1..65535`; `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` must be positive; `MAX_VIDEO_DURATION_SECONDS`, `MIN_FREE_DISK_MB`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES` may be `0` to disable that limit where supported. `MIN_FREE_DISK_MB` defaults to `512`; uploads are rejected unless the relevant filesystem can hold the actual file size while retaining that reserve. Setting it to `0` disables only the additional reserve—the actual-size filesystem admission and `MAX_VIDEO_SIZE_MB` limit remain enforced. `RETENTION_DELETE_LOCAL_FILES` defaults to `false`, so retention removes old SQLite rows without deleting Telegram Local Bot API media files unless you explicitly opt in.
 
 The stack helpers run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing supported schema defaults. The Go app itself only reads config at startup; it does not rewrite `.env`.
 
@@ -143,6 +143,8 @@ Common runtime commands:
 
 - The MVP avoids transcoding to keep CPU use low on the MacBook.
 - Imported library media is copied into `LOOP_MEDIA_DIR` or `MUSIC_MEDIA_DIR`.
+- Library imports are validated in a dedicated staging directory on the destination filesystem before atomic publication; startup and periodic maintenance remove interrupted staging files older than six hours in bounded batches.
+- When `MAX_VIDEO_DURATION_SECONDS` is enabled, a missing or invalid `ffprobe` duration rejects the video instead of treating it as zero.
 - SQLite state is stored under `DATA_DIR` so today's overrides and period picks survive restarts.
 - `PLAYER_MODE=queue` enables the legacy queue player; `FALLBACK_MODE=random_played` only applies there.
 - `OBS_PASSWORD` can be left empty when OBS WebSocket authentication is disabled.

@@ -8,7 +8,7 @@ BOT_API_HEALTH="$REPO_ROOT/deploy/telegram-bot-api/healthcheck.sh"
 BOT_API_LOGOUT="$REPO_ROOT/deploy/telegram-bot-api/logout-public.sh"
 GO_CACHE_DIR="$REPO_ROOT/.cache/go-build"
 GO_MOD_CACHE_DIR="$REPO_ROOT/.cache/go-mod"
-CURRENT_ENV_SCHEMA_VERSION=4
+CURRENT_ENV_SCHEMA_VERSION=5
 DEFAULT_APP_BIN="$REPO_ROOT/dist/tg-obs-bot"
 MAX_RESTART_DELAY_SECONDS=86400
 ROOT_SHUTDOWN_BUFFER_SECONDS=2
@@ -217,6 +217,11 @@ migrate_env() {
       fi
     done
   fi
+  if [ "$version" -lt 5 ]; then
+    if ! dotenv_has_key MIN_FREE_DISK_MB; then
+      add_env_migration_line "MIN_FREE_DISK_MB=512"
+    fi
+  fi
 
   if [ "$update_schema_version" -eq 0 ] && [ -z "$ENV_MIGRATION_ADDITIONS" ]; then
     return 0
@@ -281,6 +286,7 @@ load_env() {
   : "${MEDIA_DIR:=./data/media}"
   : "${LOOP_MEDIA_DIR:=./data/media/loops}"
   : "${MUSIC_MEDIA_DIR:=./data/media/music}"
+  : "${MIN_FREE_DISK_MB:=512}"
 }
 
 require_value() {
@@ -1070,8 +1076,9 @@ doctor() {
   for item in \
     "OBS_PORT:4455:1:65535" \
     "TELEGRAM_BOT_API_PORT:8081:1:65535" \
-    "MAX_VIDEO_SIZE_MB:2000:1:2147483647" \
+    "MAX_VIDEO_SIZE_MB:2000:1:8796093022207" \
     "MAX_VIDEO_DURATION_SECONDS:7200:0:2147483647" \
+    "MIN_FREE_DISK_MB:512:0:8796093022207" \
     "MAX_QUEUE_LENGTH:50:1:2147483647" \
     "RETENTION_DAYS:7:0:2147483647" \
     "RETENTION_MAX_FILES:100:0:2147483647"
@@ -1155,6 +1162,7 @@ print_env() {
   printf 'LOOP_MEDIA_DIR=%s\n' "${LOOP_MEDIA_DIR:-./data/media/loops}"
   printf 'MUSIC_MEDIA_DIR=%s\n' "${MUSIC_MEDIA_DIR:-./data/media/music}"
   printf 'DATABASE_PATH=%s\n' "${DATABASE_PATH:-./data/queue.db}"
+  printf 'MIN_FREE_DISK_MB=%s\n' "${MIN_FREE_DISK_MB:-512}"
   printf 'RETENTION_DELETE_LOCAL_FILES=%s\n' "${RETENTION_DELETE_LOCAL_FILES:-false}"
   printf 'FFPROBE_PATH=%s\n' "${FFPROBE_PATH:-ffprobe}"
   printf 'LOG_LEVEL=%s\n' "${LOG_LEVEL:-info}"
