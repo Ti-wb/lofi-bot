@@ -214,6 +214,13 @@ func New(cfg config.Config, logger *slog.Logger, options ...Option) (*Service, e
 		}
 	}
 
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create data directory: %w", err)
+	}
+	if err := os.Chmod(cfg.DataDir, 0o700); err != nil {
+		return nil, fmt.Errorf("secure data directory: %w", err)
+	}
+
 	registry := liveness.NewRegistry(liveness.Options{})
 	var reporter requiredLivenessReporter
 	if settings.livenessSink != nil {
@@ -244,9 +251,6 @@ func New(cfg config.Config, logger *slog.Logger, options ...Option) (*Service, e
 	// runtime lock from the database it protects.
 	cfg.DatabasePath = instanceLock.DatabasePath()
 
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
-		return nil, err
-	}
 	store, err := queue.Open(context.Background(), cfg.DatabasePath)
 	if err != nil {
 		return nil, err

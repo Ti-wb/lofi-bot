@@ -594,9 +594,19 @@ ALLOWED_CHAT_ID=-1001
 	if err := os.WriteFile(envPath, body, 0o600); err != nil {
 		t.Fatalf("write env: %v", err)
 	}
+	if err := os.Chmod(envPath, 0o644); err != nil {
+		t.Fatalf("make env permissive: %v", err)
+	}
 
 	if _, err := Load(); err != nil {
 		t.Fatalf("load: %v", err)
+	}
+	info, err := os.Stat(envPath)
+	if err != nil {
+		t.Fatalf("stat env: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf(".env mode = %04o, want 0600", got)
 	}
 	if backups := backupFiles(t, dir); len(backups) != 0 {
 		t.Fatalf("backups = %v, want none", backups)

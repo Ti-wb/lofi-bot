@@ -82,6 +82,8 @@ Without an override, each period randomly chooses one playable theme and one mat
 
 Before deploying a new build, manually back up the production `.env`.
 
+Runtime entrypoints set `.env` to owner-only mode `0600` before reading it. Env migration also creates its backup and replacement temp files private from their first write, the backend creates or repairs `DATA_DIR` as owner-only mode `0700` before opening persistent state, and SQLite keeps its database plus WAL/SHM sidecars at mode `0600` even when `DATABASE_PATH` points elsewhere.
+
 Before starting services, run `./run.sh migrate-env` to apply the stack helper's lightweight `.env` repair without starting the Go app. The helper checks `.env` against the supported schema version, backs up the current file to `.env.backup.<unix_timestamp>`, updates older schema markers, and appends missing fields needed by the Local Bot API helper.
 
 After migration, confirm the appended Telegram Local Bot API Server defaults are correct for production. If they are wrong, edit `.env` and restart the root `./run.sh up` supervisor so both child services inherit the same configuration.

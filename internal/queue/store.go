@@ -42,6 +42,12 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if err := ensureParent(path); err != nil {
 		return nil, err
 	}
+	if err := prepareDatabaseFile(path); err != nil {
+		return nil, err
+	}
+	if err := secureDatabaseFiles(path); err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
@@ -50,6 +56,10 @@ func Open(ctx context.Context, path string) (*Store, error) {
 
 	store := &Store{db: db, now: time.Now}
 	if err := store.migrate(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := secureDatabaseFiles(path); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -62,6 +72,44 @@ func ensureParent(path string) error {
 		return nil
 	}
 	return os.MkdirAll(parent, 0o755)
+}
+
+func prepareDatabaseFile(path string) error {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("prepare SQLite database %q: %w", path, err)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("secure SQLite database %q: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close prepared SQLite database %q: %w", path, err)
+	}
+	return nil
+}
+
+func secureDatabaseFiles(path string) error {
+	for index, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		optional := index > 0
+		if err := os.Chmod(candidate, 0o600); err != nil {
+			if optional && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("secure SQLite file %q: %w", candidate, err)
+		}
+		info, err := os.Stat(candidate)
+		if err != nil {
+			if optional && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("verify SQLite file %q: %w", candidate, err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			return fmt.Errorf("verify SQLite file %q: mode is %04o, want 0600", candidate, got)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error {

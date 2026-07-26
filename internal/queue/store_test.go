@@ -5,11 +5,107 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
+
+func TestPreparedDatabaseKeepsSQLiteSidecarsPrivateWithOpenUmask(t *testing.T) {
+	ctx := context.Background()
+	directory := filepath.Join(t.TempDir(), "external-database")
+	if err := os.Mkdir(directory, 0o777); err != nil {
+		t.Fatalf("create external database directory: %v", err)
+	}
+	if err := os.Chmod(directory, 0o777); err != nil {
+		t.Fatalf("make external database directory permissive: %v", err)
+	}
+
+	oldUmask := syscall.Umask(0)
+	t.Cleanup(func() {
+		syscall.Umask(oldUmask)
+	})
+
+	databasePath := filepath.Join(directory, "queue.db")
+	if err := prepareDatabaseFile(databasePath); err != nil {
+		t.Fatalf("prepare database: %v", err)
+	}
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open prepared database: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	store := &Store{db: db, now: time.Now}
+	if err := store.migrate(ctx); err != nil {
+		t.Fatalf("migrate prepared database: %v", err)
+	}
+
+	assertMode(t, directory, 0o777)
+	for _, path := range []string{databasePath, databasePath + "-wal", databasePath + "-shm"} {
+		assertMode(t, path, 0o600)
+	}
+}
+
+func TestOpenSecuresExternalDatabaseFilesWithoutChangingParent(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "external-database")
+	if err := os.Mkdir(directory, 0o777); err != nil {
+		t.Fatalf("create external database directory: %v", err)
+	}
+	if err := os.Chmod(directory, 0o777); err != nil {
+		t.Fatalf("make external database directory permissive: %v", err)
+	}
+
+	oldUmask := syscall.Umask(0)
+	t.Cleanup(func() {
+		syscall.Umask(oldUmask)
+	})
+
+	databasePath := filepath.Join(directory, "queue.db")
+	store, err := Open(context.Background(), databasePath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	assertMode(t, directory, 0o777)
+	for _, path := range []string{databasePath, databasePath + "-wal", databasePath + "-shm"} {
+		assertMode(t, path, 0o600)
+	}
+}
+
+func TestSecureDatabaseFilesNormalizesPreexistingSidecars(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "queue.db")
+	for _, path := range []string{databasePath, databasePath + "-wal", databasePath + "-shm"} {
+		if err := os.WriteFile(path, []byte("existing"), 0o644); err != nil {
+			t.Fatalf("create permissive SQLite file %s: %v", path, err)
+		}
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatalf("make SQLite file permissive %s: %v", path, err)
+		}
+	}
+
+	if err := secureDatabaseFiles(databasePath); err != nil {
+		t.Fatalf("secure existing SQLite files: %v", err)
+	}
+	for _, path := range []string{databasePath, databasePath + "-wal", databasePath + "-shm"} {
+		assertMode(t, path, 0o600)
+	}
+}
+
+func assertMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("%s mode = %04o, want %04o", path, got, want)
+	}
+}
 
 func TestOpenConfiguresSQLitePragmasAndSequentialWritesPreservePositions(t *testing.T) {
 	ctx := context.Background()

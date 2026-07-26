@@ -3,7 +3,7 @@ GOMODCACHE_DIR := $(CURDIR)/.cache/go-mod
 GO ?= go
 GOENV := GOCACHE=$(GOCACHE_DIR) GOMODCACHE=$(GOMODCACHE_DIR)
 
-.PHONY: tidy test test-liveness-reader test-supervisor build run run-app run-bot-api doctor health
+.PHONY: tidy test test-permissions test-liveness-reader test-supervisor build run run-app run-bot-api doctor health
 
 tidy:
 	mkdir -p $(GOCACHE_DIR) $(GOMODCACHE_DIR)
@@ -12,8 +12,12 @@ tidy:
 test:
 	mkdir -p $(GOCACHE_DIR) $(GOMODCACHE_DIR)
 	$(GOENV) $(GO) test ./...
+	./tests/permissions_test.sh
 	./tests/liveness_reader_test.sh
 	./tests/supervisor_integration_test.sh
+
+test-permissions:
+	./tests/permissions_test.sh
 
 test-liveness-reader:
 	./tests/liveness_reader_test.sh

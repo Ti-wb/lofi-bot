@@ -202,7 +202,7 @@ func validateHTTPURL(key, raw string) error {
 }
 
 func migrateDotEnv(path string) error {
-	body, err := os.ReadFile(path)
+	body, err := readPrivateDotEnv(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -377,7 +377,7 @@ func validPlayerMode(mode string) bool {
 }
 
 func loadDotEnv(path string) error {
-	body, err := os.ReadFile(path)
+	body, err := readPrivateDotEnv(path)
 	if err != nil {
 		return err
 	}
@@ -397,6 +397,13 @@ func loadDotEnv(path string) error {
 		}
 	}
 	return nil
+}
+
+func readPrivateDotEnv(path string) ([]byte, error) {
+	if err := os.Chmod(path, 0o600); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(path)
 }
 
 func getenv(key, fallback string) string {

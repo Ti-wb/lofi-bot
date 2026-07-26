@@ -194,6 +194,60 @@ func TestNewReleasesBackendLockAfterEarlyInitializationFailure(t *testing.T) {
 	}
 }
 
+func TestNewSecuresDataDirBeforeStateAccess(t *testing.T) {
+	for _, preexisting := range []bool{false, true} {
+		name := "new"
+		if preexisting {
+			name = "preexisting"
+		}
+		t.Run(name, func(t *testing.T) {
+			isolateSingletonUserDirectory(t)
+			root := t.TempDir()
+			dataDir := filepath.Join(root, "data")
+			if preexisting {
+				if err := os.Mkdir(dataDir, 0o755); err != nil {
+					t.Fatalf("create permissive data dir: %v", err)
+				}
+				if err := os.Chmod(dataDir, 0o755); err != nil {
+					t.Fatalf("make data dir permissive: %v", err)
+				}
+			}
+
+			databasePath := filepath.Join(root, "runtime", "queue.db")
+			token := "123456789:data-dir-permission-" + name
+			lock, err := singleton.Acquire(databasePath, token)
+			if err != nil {
+				t.Fatalf("hold backend lock: %v", err)
+			}
+			defer lock.Close()
+
+			service, err := New(config.Config{
+				TelegramBotToken: token,
+				DataDir:          dataDir,
+				DatabasePath:     databasePath,
+			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if service != nil {
+				service.Close()
+				t.Fatal("New returned a service while the backend lock was held")
+			}
+			if !errors.Is(err, singleton.ErrAlreadyRunning) {
+				t.Fatalf("New error = %v, want singleton contention", err)
+			}
+			if strings.Contains(err.Error(), token) {
+				t.Fatalf("initialization error leaked Telegram token: %v", err)
+			}
+
+			info, err := os.Stat(dataDir)
+			if err != nil {
+				t.Fatalf("stat data dir: %v", err)
+			}
+			if got := info.Mode().Perm(); got != 0o700 {
+				t.Fatalf("data dir mode = %04o, want 0700", got)
+			}
+		})
+	}
+}
+
 func TestServiceCloseReleasesBackendLock(t *testing.T) {
 	isolateSingletonUserDirectory(t)
 	databasePath := filepath.Join(t.TempDir(), "queue.db")

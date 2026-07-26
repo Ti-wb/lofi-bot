@@ -36,6 +36,10 @@ disable_xtrace() {
   esac
 }
 
+secure_env_file() {
+  chmod 600 "$ENV_FILE" || die "could not secure .env"
+}
+
 reject_env_xtrace() {
   awk '
     {
@@ -160,6 +164,7 @@ add_env_migration_line() {
 
 migrate_env() {
   [ -f "$ENV_FILE" ] || die ".env is required at repo root"
+  secure_env_file
 
   raw_version=$(dotenv_value ENV_SCHEMA_VERSION)
   if [ -z "$raw_version" ]; then
@@ -237,32 +242,35 @@ migrate_env() {
 
   backup_path="$ENV_FILE.backup.$(date +%s)"
   tmp_path="$ENV_FILE.tmp.$$"
-  cp "$ENV_FILE" "$backup_path"
+  (umask 077 && cp "$ENV_FILE" "$backup_path")
   chmod 600 "$backup_path"
 
   if [ "$update_schema_version" -eq 1 ]; then
-    awk -v want="ENV_SCHEMA_VERSION" -v replacement="ENV_SCHEMA_VERSION=$CURRENT_ENV_SCHEMA_VERSION" '
-      {
-        line = $0
-        trimmed = line
-        sub(/^[[:space:]]+/, "", trimmed)
-        sub(/[[:space:]]+$/, "", trimmed)
-        pos = index(trimmed, "=")
-        if (!done && trimmed != "" && substr(trimmed, 1, 1) != "#" && pos > 0) {
-          rawKey = substr(trimmed, 1, pos - 1)
-          sub(/^[[:space:]]+/, "", rawKey)
-          sub(/[[:space:]]+$/, "", rawKey)
-          if (rawKey == want) {
-            print replacement
-            done = 1
-            next
+    (
+      umask 077
+      awk -v want="ENV_SCHEMA_VERSION" -v replacement="ENV_SCHEMA_VERSION=$CURRENT_ENV_SCHEMA_VERSION" '
+        {
+          line = $0
+          trimmed = line
+          sub(/^[[:space:]]+/, "", trimmed)
+          sub(/[[:space:]]+$/, "", trimmed)
+          pos = index(trimmed, "=")
+          if (!done && trimmed != "" && substr(trimmed, 1, 1) != "#" && pos > 0) {
+            rawKey = substr(trimmed, 1, pos - 1)
+            sub(/^[[:space:]]+/, "", rawKey)
+            sub(/[[:space:]]+$/, "", rawKey)
+            if (rawKey == want) {
+              print replacement
+              done = 1
+              next
+            }
           }
+          print line
         }
-        print line
-      }
-    ' "$ENV_FILE" > "$tmp_path"
+      ' "$ENV_FILE" > "$tmp_path"
+    )
   else
-    cp "$ENV_FILE" "$tmp_path"
+    (umask 077 && cp "$ENV_FILE" "$tmp_path")
   fi
 
   if [ -n "$ENV_MIGRATION_ADDITIONS" ]; then
