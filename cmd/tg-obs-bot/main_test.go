@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,16 +10,24 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tiwb/tg-obs-bot/internal/app"
+	"github.com/tiwb/tg-obs-bot/internal/asynclog"
 	"github.com/tiwb/tg-obs-bot/internal/config"
+	"github.com/tiwb/tg-obs-bot/internal/secret"
 	"github.com/tiwb/tg-obs-bot/internal/singleton"
 	"github.com/tiwb/tg-obs-bot/internal/telegram"
 )
 
-const initializationHelperEnabled = "TG_OBS_BOT_INITIALIZATION_HELPER"
+const (
+	initializationHelperEnabled = "TG_OBS_BOT_INITIALIZATION_HELPER"
+	asyncLogHelperEnabled       = "TG_OBS_BOT_ASYNC_LOG_HELPER"
+	asyncLogHelperExitCode      = "TG_OBS_BOT_ASYNC_LOG_EXIT_CODE"
+)
 
 func TestInitializationExitCodeDistinguishesInstanceContention(t *testing.T) {
 	if got := initializationExitCode(fmt.Errorf("wrapped: %w", singleton.ErrAlreadyRunning)); got != instanceContentionExitCode {
@@ -121,5 +130,124 @@ func TestServiceExitCode(t *testing.T) {
 				t.Fatalf("serviceExitCode(%v, %v) = %d, want %d", tt.err, tt.parentErr, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFatalExitCodesRemainBoundedWhenStdoutIsUnread(t *testing.T) {
+	for _, exitCode := range []int{
+		genericInitializationFailure,
+		internalStallExitCode,
+		instanceContentionExitCode,
+	} {
+		t.Run(strconv.Itoa(exitCode), func(t *testing.T) {
+			elapsed, err, stderr := runBlockedStdoutHelper(t, exitCode)
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("helper error = %v, want exit %d; stderr=%s", err, exitCode, stderr)
+			}
+			if got := exitErr.ExitCode(); got != exitCode {
+				t.Fatalf("helper exit = %d, want %d; stderr=%s", got, exitCode, stderr)
+			}
+			if elapsed > 3*time.Second {
+				t.Fatalf("blocked fatal exit %d took %v", exitCode, elapsed)
+			}
+		})
+	}
+}
+
+func TestNormalLogFlushDeadlineRemainsBoundedWhenStdoutIsUnread(t *testing.T) {
+	elapsed, err, stderr := runBlockedStdoutHelper(t, 0)
+	if err != nil {
+		t.Fatalf("normal helper error = %v; stderr=%s", err, stderr)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("normal blocked flush took %v", elapsed)
+	}
+}
+
+func TestAsyncLogExitHelperProcess(t *testing.T) {
+	if os.Getenv(asyncLogHelperEnabled) != "1" {
+		return
+	}
+
+	exitCode, err := strconv.Atoi(os.Getenv(asyncLogHelperExitCode))
+	if err != nil {
+		os.Exit(125)
+	}
+	logger, _, handler := newProcessLogger(os.Stdout)
+	payload := strings.Repeat("x", 16*1024)
+	for i := 0; i < asynclog.QueueCapacity*16; i++ {
+		logger.Error("fill stdout pipe", "sequence", i, "payload", payload)
+	}
+	logger.Error("fatal sentinel", "exit_code", exitCode)
+	if exitCode == 0 {
+		flushLogs(handler)
+		os.Exit(0)
+	}
+	exitWithLogFlush(handler, exitCode)
+}
+
+func TestProcessLoggerKeepsStartupSecretsRedacted(t *testing.T) {
+	const (
+		token    = "123456789:main-logger-token"
+		password = "main-logger-password"
+	)
+	var output bytes.Buffer
+	logger, _, handler := newProcessLogger(&output)
+	logger.Error(
+		"initialize service",
+		"error",
+		secret.RedactError(
+			fmt.Errorf("telegram %s OBS %s", token, password),
+			token,
+			password,
+		),
+	)
+	flushLogs(handler)
+
+	logged := output.String()
+	if strings.Contains(logged, token) ||
+		strings.Contains(logged, "main-logger-token") ||
+		strings.Contains(logged, password) {
+		t.Fatalf("process logger leaked startup secret: %q", logged)
+	}
+	if !strings.Contains(strings.ToLower(logged), "redacted") {
+		t.Fatalf("process logger output lacks redaction marker: %q", logged)
+	}
+}
+
+func runBlockedStdoutHelper(t *testing.T, exitCode int) (time.Duration, error, string) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAsyncLogExitHelperProcess$")
+	cmd.Env = append(
+		os.Environ(),
+		asyncLogHelperEnabled+"=1",
+		asyncLogHelperExitCode+"="+strconv.Itoa(exitCode),
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("helper stdout pipe: %v", err)
+	}
+	defer stdout.Close()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	start := time.Now()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start helper: %v", err)
+	}
+	wait := make(chan error, 1)
+	go func() {
+		wait <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-wait:
+		return time.Since(start), err, stderr.String()
+	case <-time.After(4 * time.Second):
+		_ = cmd.Process.Kill()
+		<-wait
+		t.Fatalf("helper exit %d blocked beyond deadline; stderr=%s", exitCode, stderr.String())
+		return 0, nil, ""
 	}
 }

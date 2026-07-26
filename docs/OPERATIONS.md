@@ -153,6 +153,16 @@ Kernel ownership of both locks disappears automatically after clean shutdown, cr
 
 Inside `tg-obs-bot`, Telegram polling, OBS reconnect, OBS events, periodic maintenance, and the active playback scheduler/watchdog are required workers. The coordinator does not run maintenance inline, so blocked cleanup cannot conceal another worker's failure. An unexpected worker exit stops the process. Telegram update handlers have a five-minute deadline plus a five-second cancellation grace; a non-cooperative handler causes exit status `70` so it cannot leave polling permanently stuck. Internal worker shutdown is bounded to ten seconds: five seconds for handler cancellation, up to four seconds for independent journal finalization, and a scheduling cushion. Normal `TERM` remains graceful when every worker cooperates.
 
+Stdout logging uses one writer goroutine behind a fixed 256-record queue. The
+queue is bounded by entries, not bytes: avoid logging large payloads or file
+contents because one record may still allocate or block a large write. When
+stdout cannot keep up, callers remain responsive and the newest records are
+dropped; the next record successfully written includes `log_dropped=N`.
+Shutdown drains records in order when stdout is writable. Fatal exits spend
+only about 500 milliseconds on a best-effort drain, so their final log line may
+be absent when stdout is blocked or the queue is full. Use process exit code
+`1`, `70`, or `73` and supervisor state as the authoritative failure signal.
+
 Telegram polling checkpoints and handler attempts live in the same SQLite database as the queue. The app resumes from durable `next_offset` after restart and separately records when Telegram has accepted that offset on a successful poll. Journal operations have a four-second bound; a database error while loading, beginning, confirming, or completing an attempt is fatal and leaves the update unacknowledged. A failed completion releases its still-owned claim so the immediate restart can replay rather than repeatedly returning `busy` for the full processing lease. Cooperative shutdown releases an attempt without counting a failure. Repeated deterministic failures are retried across restarts; the third failure quarantines the update as `dead`. A stuck or panicking third generation persists that transition but still exits, and only the next clean generation polls past it.
 
 There is an intentional at-least-once crash window in this stage: if a command changes application state and the process dies before its terminal journal transaction commits, the same Telegram update is replayed and the command may run twice. Operators should investigate repeated restarts or `dead` update log entries before manually changing polling state. Terminal journal cleanup never crosses the Telegram-confirmed checkpoint; safely confirmed `done` rows retain at most 10,000/30 days and `dead` rows at most 1,000/90 days, while unconfirmed rows remain for recovery. Confirmation and each ten-minute maintenance tick remove at most 256 rows per terminal status, allowing an idle backlog to converge without unbounded poll latency.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -41,6 +42,65 @@ func TestBuildIdentifyFailsWhenAuthenticationRequiresEmptyPassword(t *testing.T)
 	}
 	if !strings.Contains(err.Error(), "OBS authentication required but password is empty") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDroppedEventLoggingDoesNotBlockStatusOrCloseUnderClientMutex(t *testing.T) {
+	blocker := &blockingLogHandler{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	client, err := NewClient(Options{
+		URL:             "ws://unused.invalid",
+		MediaSourceName: "queue",
+		EventBuffer:     1,
+		Logger:          slog.New(blocker),
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	client.currentFiles["queue"] = "/tmp/current.mp4"
+	client.events <- Event{Type: EventMediaEnded}
+
+	handled := make(chan struct{})
+	go func() {
+		client.handleEvent(mediaEndedEvent("queue").D)
+		close(handled)
+	}()
+	select {
+	case <-blocker.started:
+	case <-time.After(time.Second):
+		t.Fatal("event-drop warning did not reach blocking logger")
+	}
+
+	statusDone := make(chan Status, 1)
+	go func() {
+		statusDone <- client.Status()
+	}()
+	select {
+	case <-statusDone:
+	case <-time.After(time.Second):
+		t.Fatal("Status blocked behind event-drop logging")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- client.Close()
+	}()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked behind event-drop logging")
+	}
+
+	close(blocker.release)
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("event handler did not return after logger unblocked")
 	}
 }
 
@@ -1538,4 +1598,30 @@ func mediaEndedEvent(inputName string) envelope {
 			"inputName": inputName,
 		},
 	})}
+}
+
+type blockingLogHandler struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (h *blockingLogHandler) Enabled(context.Context, slog.Level) bool {
+	return true
+}
+
+func (h *blockingLogHandler) Handle(context.Context, slog.Record) error {
+	h.once.Do(func() {
+		close(h.started)
+	})
+	<-h.release
+	return nil
+}
+
+func (h *blockingLogHandler) WithAttrs([]slog.Attr) slog.Handler {
+	return h
+}
+
+func (h *blockingLogHandler) WithGroup(string) slog.Handler {
+	return h
 }

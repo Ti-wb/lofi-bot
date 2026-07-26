@@ -81,6 +81,19 @@ On restart:
 
 ## Failure Handling
 
+- Process logging is isolated behind one stdout writer goroutine and a fixed
+  256-entry in-memory queue installed before configuration loading. Application
+  goroutines clone and enqueue records without waiting for stdout; a full queue
+  drops the newest record. The bound is by record count, not serialized bytes,
+  so unusually large attribute values can still consume memory and make one
+  stdout write slow. Total and pending drops, sink errors, queue depth, and
+  high-water depth are tracked; the next successfully emitted record carries
+  `log_dropped=N`. A sink failure does not clear that pending count.
+- Clean shutdown drains log records in FIFO order after `Service.Close`.
+  Explicit fatal exits wait at most about 500 milliseconds for the same drain,
+  then abort queued logging and preserve exit status `1`, `70`, or `73`.
+  Consequently fatal records are best effort when stdout is blocked or the
+  queue is full; the supervisor exit code remains the authoritative signal.
 - Telegram updates are handled one at a time. Each handler receives a five-minute processing deadline and then a bounded five-second cancellation grace. A cooperative timeout is logged and reaches a terminal outcome before polling continues; a handler that ignores cancellation makes the process fail fast so the external supervisor can replace the complete process generation. Each stuck generation records one failure. The third failure atomically marks the update `dead` and advances the durable checkpoint, but that potentially compromised generation still exits without another poll; only its clean replacement continues.
 - Telegram polling progress is durable in SQLite. `next_offset` advances in the same transaction that marks an update attempt `done` or `dead`; `confirmed_offset` advances only after a later `getUpdates` call using that offset succeeds. Every handler invocation first journals the update ID, coarse kind, inferred action, and Telegram actor/message metadata. Active attempts have an owner token and lease: a recent owner produces a fail-closed `busy` result, an expired running owner consumes one failure when reclaimed, and a cooperative shutdown releases its claim without consuming the poison budget. All polling-journal calls are bounded to four seconds. A failed terminal write releases a still-owned claim so the supervisor can replay immediately instead of waiting for the normal multi-minute processing lease.
 - Handler panics and other non-terminal failures do not advance the checkpoint. A deterministic failure is retried across process restarts and becomes a `dead` poison update on the third failed attempt, at which point the durable offset advances so later updates are not blocked. A recovered panic still stops the current process after that atomic transition because unrelated in-process state may be inconsistent.

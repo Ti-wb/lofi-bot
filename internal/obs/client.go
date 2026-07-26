@@ -631,12 +631,16 @@ func (c *Client) handleEvent(raw json.RawMessage) {
 	if inputName == c.opts.MediaSourceName {
 		c.currentFile = ""
 	}
+	dropped := false
 	select {
 	case c.events <- event:
 	default:
-		c.opts.Logger.Warn("drop OBS event because event channel is full", "event", event.Type)
+		dropped = true
 	}
 	c.mu.Unlock()
+	if dropped {
+		c.opts.Logger.Warn("drop OBS event because event channel is full", "event", event.Type)
+	}
 }
 
 func (c *Client) handleRequestResponse(raw json.RawMessage) {
