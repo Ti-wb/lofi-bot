@@ -19,6 +19,7 @@ import (
 	"github.com/tiwb/tg-obs-bot/internal/media"
 	"github.com/tiwb/tg-obs-bot/internal/obs"
 	"github.com/tiwb/tg-obs-bot/internal/queue"
+	retryloop "github.com/tiwb/tg-obs-bot/internal/retry"
 	"github.com/tiwb/tg-obs-bot/internal/secret"
 	"github.com/tiwb/tg-obs-bot/internal/singleton"
 	"github.com/tiwb/tg-obs-bot/internal/telegram"
@@ -61,6 +62,12 @@ type Service struct {
 	workerStopGrace       time.Duration
 	maintenanceInterval   time.Duration
 	maintenanceFn         func(context.Context) error
+	retryRandom           func() uint64
+	retrySleep            func(context.Context, time.Duration) error
+	retryNow              func() time.Time
+	playbackNotices       [playbackNoticeKinds]playbackNotice
+	libraryScanLogMu      sync.Mutex
+	libraryScanLog        *eventErrorSampler
 }
 
 type obsController interface {
@@ -404,26 +411,35 @@ func (s *Service) maintenanceLoop(ctx context.Context) error {
 	if interval <= 0 {
 		interval = defaultMaintenancePeriod
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	retries := newRecurringRetry(
+		interval,
+		maxRetryDelay(interval, maintenanceRetryMaxDelay),
+		s.retryRandom,
+	)
+	schedule := newRecurringSchedule(interval, false, s.retryClockNow)
+	delay := schedule.delay()
 
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			maintenance := s.maintenanceFn
-			if maintenance == nil {
-				maintenance = s.performMaintenance
-			}
-			if err := maintenance(ctx); err != nil {
-				if ctxErr := ctx.Err(); ctxErr != nil {
-					return ctxErr
-				}
-				s.setLastErr(err)
-				s.logger.Warn("periodic maintenance failed", "error", s.redactError(err))
-			}
+		if err := s.waitRecurring(ctx, delay); err != nil {
+			return err
 		}
+		schedule.beginCycle()
+		maintenance := s.maintenanceFn
+		if maintenance == nil {
+			maintenance = s.performMaintenance
+		}
+		if err := maintenance(ctx); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			s.setLastErr(err)
+			failure := retries.failure()
+			logRecurringFailure(s.logger, "periodic maintenance failed", s.redactError(err), failure)
+			delay = schedule.failureDelay(failure.attempt.Delay)
+			continue
+		}
+		logRecurringRecovery(s.logger, "periodic maintenance recovered", retries.recovery())
+		delay = schedule.delay()
 	}
 }
 
@@ -515,10 +531,15 @@ func (s *Service) addDownloadingUpload(ctx context.Context, req UploadRequest) (
 }
 
 func (s *Service) advancePlayback(ctx context.Context) (*queue.Video, error) {
-	s.playbackMu.Lock()
-	defer s.playbackMu.Unlock()
-
-	return s.advancePlaybackLocked(ctx)
+	var video *queue.Video
+	var err error
+	func() {
+		s.playbackMu.Lock()
+		defer s.playbackMu.Unlock()
+		video, err = s.advancePlaybackLocked(ctx)
+	}()
+	s.flushPlaybackNotices()
+	return video, err
 }
 
 func (s *Service) advancePlaybackLocked(ctx context.Context) (*queue.Video, error) {
@@ -580,7 +601,7 @@ func (s *Service) startNextQueuePlaybackLocked(ctx context.Context) (*queue.Vide
 				return nil, markErr
 			}
 			s.setLastErr(err)
-			s.logger.Warn("skip invalid ready video path", "video_id", video.ID, "path", s.redactString(video.LocalPath), "error", s.redactError(err))
+			s.recordPlaybackNotice(playbackNoticeInvalidReady, video.ID, video.LocalPath, err)
 			continue
 		}
 		if err := s.obs.PlayFile(ctx, video.LocalPath); err != nil {
@@ -632,9 +653,14 @@ func (s *Service) stopUncommittedQueuePlaybackLocked(primaryErr error) error {
 }
 
 func (s *Service) playIfIdle(ctx context.Context) error {
-	s.playbackMu.Lock()
-	defer s.playbackMu.Unlock()
-	return s.playIfIdleLocked(ctx)
+	var err error
+	func() {
+		s.playbackMu.Lock()
+		defer s.playbackMu.Unlock()
+		err = s.playIfIdleLocked(ctx)
+	}()
+	s.flushPlaybackNotices()
+	return err
 }
 
 func (s *Service) playIfIdleLocked(ctx context.Context) error {
@@ -672,44 +698,48 @@ func (s *Service) recoverPlaybackAfterOBSConnect(ctx context.Context) error {
 	}
 
 	s.playbackMu.Lock()
-	defer s.playbackMu.Unlock()
+	err := func() error {
+		defer s.playbackMu.Unlock()
 
-	current, err := s.store.Current(ctx)
-	if err != nil {
-		return err
-	}
-	if current == nil {
-		switch s.playbackState() {
-		case playbackRandom, playbackFile:
-			err := s.recoverFallbackPlaybackLocked(ctx)
+		current, err := s.store.Current(ctx)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			switch s.playbackState() {
+			case playbackRandom, playbackFile:
+				err := s.recoverFallbackPlaybackLocked(ctx)
+				if err != nil {
+					s.setPlaybackState(playbackIdle, 0, "")
+					return err
+				}
+				return nil
+			}
+			s.setPlaybackState(playbackIdle, 0, "")
+			return s.playIfIdleLocked(ctx)
+		}
+		if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, current.LocalPath); err != nil {
+			recoveryErr := fmt.Errorf("current video #%d media path is invalid: %w", current.ID, err)
+			if _, markErr := s.store.FailPlaying(ctx, current.ID, recoveryErr.Error()); markErr != nil {
+				return markErr
+			}
+			s.setLastErr(recoveryErr)
+			s.recordPlaybackNotice(playbackNoticeInvalidCurrent, current.ID, current.LocalPath, err)
+			s.setPlaybackState(playbackIdle, 0, "")
+			return s.playIfIdleLocked(ctx)
+		}
+		if s.playbackState() == playbackNormal {
+			err := s.recoverCurrentQueuePlaybackLocked(ctx, *current)
 			if err != nil {
 				s.setPlaybackState(playbackIdle, 0, "")
 				return err
 			}
 			return nil
 		}
-		s.setPlaybackState(playbackIdle, 0, "")
-		return s.playIfIdleLocked(ctx)
-	}
-	if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, current.LocalPath); err != nil {
-		recoveryErr := fmt.Errorf("current video #%d media path is invalid: %w", current.ID, err)
-		if _, markErr := s.store.FailPlaying(ctx, current.ID, recoveryErr.Error()); markErr != nil {
-			return markErr
-		}
-		s.setLastErr(recoveryErr)
-		s.logger.Warn("mark invalid current video failed", "video_id", current.ID, "path", s.redactString(current.LocalPath), "error", s.redactError(err))
-		s.setPlaybackState(playbackIdle, 0, "")
-		return s.playIfIdleLocked(ctx)
-	}
-	if s.playbackState() == playbackNormal {
-		err := s.recoverCurrentQueuePlaybackLocked(ctx, *current)
-		if err != nil {
-			s.setPlaybackState(playbackIdle, 0, "")
-			return err
-		}
-		return nil
-	}
-	return s.restartCurrentQueuePlaybackLocked(ctx, *current)
+		return s.restartCurrentQueuePlaybackLocked(ctx, *current)
+	}()
+	s.flushPlaybackNotices()
+	return err
 }
 
 // Reconnect recovery must not consume the queue. A terminal OBS state can
@@ -776,7 +806,7 @@ func (s *Service) restartCurrentQueuePlaybackLocked(ctx context.Context, current
 	}
 	s.resetMediaProgressLocked(s.cfg.OBSMediaSourceName, current.LocalPath)
 	s.setPlaybackState(playbackNormal, 0, "")
-	s.logger.Info("recovered OBS playback", "video_id", current.ID, "path", s.redactString(current.LocalPath))
+	s.recordPlaybackNotice(playbackNoticeRecovered, current.ID, current.LocalPath, nil)
 	return nil
 }
 
@@ -1000,35 +1030,39 @@ func (s *Service) clearMediaProgressLocked(inputName string) {
 
 func (s *Service) skipCurrent(ctx context.Context) (string, error) {
 	s.playbackMu.Lock()
-	defer s.playbackMu.Unlock()
+	message, err := func() (string, error) {
+		defer s.playbackMu.Unlock()
 
-	next, err := s.store.NextReady(ctx)
-	if err != nil {
-		return "", err
-	}
-	if next == nil {
-		if s.obs.Status().State == obs.StateConnected {
-			if err := s.obs.StopCurrent(ctx); err != nil {
+		next, err := s.store.NextReady(ctx)
+		if err != nil {
+			return "", err
+		}
+		if next == nil {
+			if s.obs.Status().State == obs.StateConnected {
+				if err := s.obs.StopCurrent(ctx); err != nil {
+					s.setLastErr(err)
+					return "", err
+				}
+			}
+			if err := s.store.FinishCurrent(ctx); err != nil {
 				s.setLastErr(err)
 				return "", err
 			}
+			s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
+			s.setPlaybackState(playbackIdle, 0, "")
+			return "已跳過，目前沒有下一支影片。", nil
 		}
-		if err := s.store.FinishCurrent(ctx); err != nil {
-			s.setLastErr(err)
+		video, err := s.advancePlaybackLocked(ctx)
+		if err != nil {
 			return "", err
 		}
-		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
-		s.setPlaybackState(playbackIdle, 0, "")
-		return "已跳過，目前沒有下一支影片。", nil
-	}
-	video, err := s.advancePlaybackLocked(ctx)
-	if err != nil {
-		return "", err
-	}
-	if video == nil {
-		return "已跳過，目前沒有下一支影片。", nil
-	}
-	return fmt.Sprintf("已跳到下一支：#%d %s", video.ID, video.FileName), nil
+		if video == nil {
+			return "已跳過，目前沒有下一支影片。", nil
+		}
+		return fmt.Sprintf("已跳到下一支：#%d %s", video.ID, video.FileName), nil
+	}()
+	s.flushPlaybackNotices()
+	return message, err
 }
 
 func (s *Service) advanceFallbackLocked(ctx context.Context) error {
@@ -1085,7 +1119,8 @@ func (s *Service) playRandomFallbackLocked(ctx context.Context) (*queue.Video, e
 				s.setLastErr(markErr)
 				return nil, markErr
 			}
-			s.logger.Warn("skip invalid random fallback file", "video_id", video.ID, "path", s.redactString(video.LocalPath), "error", s.redactError(err))
+			s.setLastErr(err)
+			s.recordPlaybackNotice(playbackNoticeInvalidRandom, video.ID, video.LocalPath, err)
 			continue
 		}
 		if err := s.obs.PlayFile(ctx, video.LocalPath); err != nil {
@@ -1283,24 +1318,34 @@ func (s *Service) telegramHooks() telegram.Hooks {
 }
 
 func (s *Service) obsReconnectLoop(ctx context.Context) error {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	retries := newOBSRetryState(s.retryRandom)
+	schedule := newRecurringSchedule(obsReconnectInterval, true, s.retryClockNow)
+	delay := schedule.delay()
 	for {
-		s.maintainOBSConnection(ctx)
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
+		if delay > 0 {
+			if err := s.waitRecurring(ctx, delay); err != nil {
+				return err
+			}
+		} else if err := ctx.Err(); err != nil {
+			return err
+		}
+		schedule.beginCycle()
+		result := s.maintainOBSConnection(ctx)
+		delay = s.observeOBSResult(retries, result)
+		if result.failure == obsRetryNone || result.err == nil {
+			delay = schedule.delay()
+		} else {
+			delay = schedule.failureDelay(delay)
 		}
 	}
 }
 
-func (s *Service) maintainOBSConnection(ctx context.Context) {
+func (s *Service) maintainOBSConnection(ctx context.Context) obsMaintenanceResult {
+	result := obsMaintenanceResult{}
 	switch s.obs.Status().State {
 	case obs.StateDisconnected:
 		if !s.obsRecoveryInProgress.CompareAndSwap(false, true) {
-			return
+			return result
 		}
 		defer s.obsRecoveryInProgress.Store(false)
 
@@ -1309,80 +1354,123 @@ func (s *Service) maintainOBSConnection(ctx context.Context) {
 		cancelConnect()
 		if err != nil {
 			if ctx.Err() != nil {
-				return
+				return result
 			}
 			s.setLastErr(err)
-			s.logger.Warn("connect OBS failed", "error", s.redactError(err))
-			return
+			result.failure = obsRetryConnect
+			result.err = err
+			return result
 		}
-		s.logger.Info("connected to OBS")
+		result.connected = true
+		result.recoverConnect = true
+		result.recoverProbe = true
 		if err := s.recoverPlaybackAfterOBSConnect(ctx); err != nil {
 			if ctx.Err() != nil {
-				return
+				return result
 			}
 			s.setLastErr(err)
-			s.logger.Warn("resume playback failed", "error", s.redactError(err))
+			result.failure = obsRetryResume
+			result.err = err
+			return result
 		}
+		result.recoverResume = true
 	case obs.StateConnected:
 		if s.obsRecoveryInProgress.Load() {
-			return
+			return result
 		}
 		if err := s.obs.Probe(ctx); err != nil {
 			if ctx.Err() != nil {
-				return
+				return result
 			}
 			s.setLastErr(err)
-			s.logger.Warn("probe OBS failed", "error", s.redactError(err))
-			return
+			result.failure = obsRetryProbe
+			result.err = err
+			return result
 		}
+		result.recoverProbe = true
 		if s.playbackState() == playbackIdle {
 			if !s.obsRecoveryInProgress.CompareAndSwap(false, true) {
-				return
+				return result
 			}
 			defer s.obsRecoveryInProgress.Store(false)
 			if s.obs.Status().State != obs.StateConnected || s.playbackState() != playbackIdle {
-				return
+				return result
 			}
 			if err := s.recoverPlaybackAfterOBSConnect(ctx); err != nil {
 				if ctx.Err() != nil {
-					return
+					return result
 				}
 				s.setLastErr(err)
-				s.logger.Warn("resume playback failed", "error", s.redactError(err))
+				result.failure = obsRetryResume
+				result.err = err
+				return result
 			}
+			result.recoverResume = true
 		}
 	}
+	return result
 }
 
 func (s *Service) playbackWatchdogLoop(ctx context.Context) error {
-	ticker := time.NewTicker(playbackWatchdogInterval)
-	defer ticker.Stop()
+	retries := newRecurringRetry(playbackWatchdogInterval, watchdogRetryMaxDelay, s.retryRandom)
+	schedule := newRecurringSchedule(playbackWatchdogInterval, false, s.retryClockNow)
+	delay := schedule.delay()
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if err := s.checkPlaybackWatchdog(ctx); err != nil {
-				s.setLastErr(err)
-				s.logger.Warn("playback watchdog failed", "error", s.redactError(err))
-			}
+		if err := s.waitRecurring(ctx, delay); err != nil {
+			return err
 		}
+		schedule.beginCycle()
+		if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
+			delay = schedule.delay()
+			continue
+		}
+		attempted, err := s.checkPlaybackWatchdogAttempt(ctx)
+		if !attempted {
+			delay = schedule.delay()
+			continue
+		}
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			s.setLastErr(err)
+			failure := retries.failure()
+			logRecurringFailure(s.logger, "playback watchdog failed", s.redactError(err), failure)
+			delay = schedule.failureDelay(failure.attempt.Delay)
+			continue
+		}
+		logRecurringRecovery(s.logger, "playback watchdog recovered", retries.recovery())
+		delay = schedule.delay()
 	}
 }
 
 func (s *Service) checkPlaybackWatchdog(ctx context.Context) error {
+	_, err := s.checkPlaybackWatchdogAttempt(ctx)
+	return err
+}
+
+func (s *Service) checkPlaybackWatchdogAttempt(ctx context.Context) (bool, error) {
 	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
-		return nil
+		return false, nil
 	}
 
 	var video *queue.Video
-	if err := func() error {
+	attempted := false
+	type overduePlayback struct {
+		videoID         int64
+		startedAt       *time.Time
+		durationSeconds int
+		deadline        time.Time
+	}
+	var overdue *overduePlayback
+	checkErr := func() error {
 		s.playbackMu.Lock()
 		defer s.playbackMu.Unlock()
 
 		if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
 			return nil
 		}
+		attempted = true
 		current, err := s.store.Current(ctx)
 		if err != nil {
 			return err
@@ -1420,26 +1508,38 @@ func (s *Service) checkPlaybackWatchdog(ctx context.Context) error {
 			return nil
 		}
 
-		s.logger.Warn("playback exceeded expected duration; advancing without OBS ended event",
-			"video_id", current.ID,
-			"started_at", current.StartedAt,
-			"duration_seconds", current.DurationSeconds,
-			"deadline", deadline,
-		)
+		overdue = &overduePlayback{
+			videoID:         current.ID,
+			startedAt:       current.StartedAt,
+			durationSeconds: current.DurationSeconds,
+			deadline:        deadline,
+		}
 		var advanceErr error
 		video, advanceErr = s.advancePlaybackLockedAfter(ctx, current.ID, current.LocalPath)
 		return advanceErr
-	}(); err != nil {
-		return err
+	}()
+	s.flushPlaybackNotices()
+	if overdue != nil {
+		s.logger.Warn("playback exceeded expected duration; advancing without OBS ended event",
+			"video_id", overdue.videoID,
+			"started_at", overdue.startedAt,
+			"duration_seconds", overdue.durationSeconds,
+			"deadline", overdue.deadline,
+		)
+	}
+	if checkErr != nil {
+		return attempted, checkErr
 	}
 	if video != nil {
 		_ = s.bot.SendMessage(ctx, s.cfg.AllowedChatID, fmt.Sprintf("開始播放：#%d %s", video.ID, video.FileName))
 	}
-	return nil
+	return attempted, nil
 }
 
 func (s *Service) obsEventLoop(ctx context.Context) error {
 	events := s.obs.Events()
+	libraryFailures := newEventErrorSampler()
+	queueFailures := newEventErrorSampler()
 	for {
 		select {
 		case <-ctx.Done():
@@ -1458,16 +1558,36 @@ func (s *Service) obsEventLoop(ctx context.Context) error {
 				continue
 			}
 			if s.libraryMode() {
-				if err := s.handleLibraryOBSEvent(ctx, event); err != nil {
-					s.logger.Warn("advance library playback after OBS event failed", "error", s.redactError(err))
+				attempted, err := s.handleLibraryOBSEventAttempt(ctx, event)
+				if !attempted {
+					continue
+				}
+				if err != nil {
+					logEventFailure(
+						s.logger,
+						"advance library playback after OBS event failed",
+						s.redactError(err),
+						libraryFailures.failure(),
+					)
+				} else {
+					libraryFailures.success()
 				}
 				continue
 			}
-			video, err := s.advancePlaybackForEndedEvent(ctx, event)
-			if err != nil {
-				s.logger.Warn("advance playback after OBS event failed", "error", s.redactError(err))
+			video, attempted, err := s.advancePlaybackForEndedEventAttempt(ctx, event)
+			if !attempted {
 				continue
 			}
+			if err != nil {
+				logEventFailure(
+					s.logger,
+					"advance playback after OBS event failed",
+					s.redactError(err),
+					queueFailures.failure(),
+				)
+				continue
+			}
+			queueFailures.success()
 			if video != nil {
 				_ = s.bot.SendMessage(ctx, s.cfg.AllowedChatID, fmt.Sprintf("開始播放：#%d %s", video.ID, video.FileName))
 			}
@@ -1476,37 +1596,71 @@ func (s *Service) obsEventLoop(ctx context.Context) error {
 }
 
 func (s *Service) advancePlaybackForEndedEvent(ctx context.Context, event obs.Event) (*queue.Video, error) {
-	s.playbackMu.Lock()
-	defer s.playbackMu.Unlock()
-
-	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
-		return nil, nil
-	}
-	// MediaEnded is only a reconciliation hint. OBS status and input identity,
-	// read under the same playback lock as queue mutation, are authoritative.
-	current, err := s.store.Current(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if current != nil {
-		if event.Path != "" && !sameMediaPath(event.Path, current.LocalPath) {
-			return nil, nil
-		}
-		if s.queueEndedEventIsTooEarly(event, *current) {
-			s.logger.Warn("ignore OBS ended event inside current playback guard window",
-				"video_id", current.ID,
-				"event_path", s.redactString(event.Path),
-				"event_at", event.At,
-				"started_at", current.StartedAt,
-				"duration_seconds", current.DurationSeconds,
-			)
-			return nil, nil
-		}
-		video, _, err := s.reconcileCurrentQueuePlaybackLocked(ctx, *current)
-		return video, err
-	}
-	video, _, err := s.reconcileFallbackPlaybackLocked(ctx)
+	video, _, err := s.advancePlaybackForEndedEventAttempt(ctx, event)
 	return video, err
+}
+
+func (s *Service) advancePlaybackForEndedEventAttempt(
+	ctx context.Context,
+	event obs.Event,
+) (*queue.Video, bool, error) {
+	type earlyEventNotice struct {
+		videoID         int64
+		eventPath       string
+		eventAt         time.Time
+		startedAt       *time.Time
+		durationSeconds int
+	}
+	var notice *earlyEventNotice
+	var video *queue.Video
+	attempted := false
+	err := func() error {
+		s.playbackMu.Lock()
+		defer s.playbackMu.Unlock()
+
+		if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
+			return nil
+		}
+		attempted = true
+		// MediaEnded is only a reconciliation hint. OBS status and input identity,
+		// read under the same playback lock as queue mutation, are authoritative.
+		current, err := s.store.Current(ctx)
+		if err != nil {
+			return err
+		}
+		if current != nil {
+			if event.Path != "" && !sameMediaPath(event.Path, current.LocalPath) {
+				return nil
+			}
+			if s.queueEndedEventIsTooEarly(event, *current) {
+				notice = &earlyEventNotice{
+					videoID:         current.ID,
+					eventPath:       event.Path,
+					eventAt:         event.At,
+					startedAt:       current.StartedAt,
+					durationSeconds: current.DurationSeconds,
+				}
+				return nil
+			}
+			var reconcileErr error
+			video, _, reconcileErr = s.reconcileCurrentQueuePlaybackLocked(ctx, *current)
+			return reconcileErr
+		}
+		var reconcileErr error
+		video, _, reconcileErr = s.reconcileFallbackPlaybackLocked(ctx)
+		return reconcileErr
+	}()
+	s.flushPlaybackNotices()
+	if notice != nil {
+		s.logger.Warn("ignore OBS ended event inside current playback guard window",
+			"video_id", notice.videoID,
+			"event_path", s.redactString(notice.eventPath),
+			"event_at", notice.eventAt,
+			"started_at", notice.startedAt,
+			"duration_seconds", notice.durationSeconds,
+		)
+	}
+	return video, attempted, err
 }
 
 func (s *Service) queueEndedEventIsTooEarly(event obs.Event, current queue.Video) bool {
@@ -1563,19 +1717,48 @@ func (s *Service) CleanupRetention(ctx context.Context) error {
 	if maxAge <= 0 && maxFiles <= 0 {
 		return nil
 	}
-	s.playbackMu.Lock()
-	defer s.playbackMu.Unlock()
-	s.storageMu.Lock()
-	defer s.storageMu.Unlock()
+	var report retentionCleanupReport
+	var err error
+	func() {
+		s.playbackMu.Lock()
+		defer s.playbackMu.Unlock()
+		s.storageMu.Lock()
+		defer s.storageMu.Unlock()
+		report, err = s.cleanupRetentionLocked(ctx, maxAge, maxFiles)
+	}()
+	if report.skippedLocalDeletes > 0 {
+		s.logger.Warn(
+			"skip retention local file deletes",
+			"count", report.skippedLocalDeletes,
+			"first_video_id", report.firstSkipVideoID,
+			"first_path", report.firstSkipPath,
+			"first_error", report.firstSkipError,
+		)
+	}
+	return err
+}
 
+type retentionCleanupReport struct {
+	skippedLocalDeletes int
+	firstSkipVideoID    int64
+	firstSkipPath       string
+	firstSkipError      string
+}
+
+func (s *Service) cleanupRetentionLocked(
+	ctx context.Context,
+	maxAge time.Duration,
+	maxFiles int,
+) (retentionCleanupReport, error) {
+	var report retentionCleanupReport
 	fallbackID, fallbackPath := s.randomFallbackLock()
 	playedCount, err := s.store.TerminalCount(ctx, queue.StatusPlayed)
 	if err != nil {
-		return err
+		return report, err
 	}
 	failedCanceledCount, err := s.store.TerminalCount(ctx, queue.StatusFailed, queue.StatusCanceled)
 	if err != nil {
-		return err
+		return report, err
 	}
 	var cutoff time.Time
 	if maxAge > 0 {
@@ -1592,9 +1775,10 @@ func (s *Service) CleanupRetention(ctx context.Context) error {
 		fallbackID,
 		fallbackPath,
 		remaining/2,
+		&report,
 	)
 	if err != nil {
-		return err
+		return report, err
 	}
 	remaining -= scanned
 	playedCount -= deleted
@@ -1607,13 +1791,14 @@ func (s *Service) CleanupRetention(ctx context.Context) error {
 		0,
 		"",
 		remaining,
+		&report,
 	)
 	if err != nil {
-		return err
+		return report, err
 	}
 	remaining -= scanned
 	if remaining == 0 {
-		return nil
+		return report, nil
 	}
 	_, _, err = s.cleanupTerminalGroup(
 		ctx,
@@ -1624,8 +1809,9 @@ func (s *Service) CleanupRetention(ctx context.Context) error {
 		fallbackID,
 		fallbackPath,
 		remaining,
+		&report,
 	)
-	return err
+	return report, err
 }
 
 func (s *Service) cleanupTerminalGroup(
@@ -1637,6 +1823,7 @@ func (s *Service) cleanupTerminalGroup(
 	protectedID int64,
 	protectedPath string,
 	limit int,
+	report *retentionCleanupReport,
 ) (int, int, error) {
 	if limit <= 0 || (cutoff.IsZero() && (maxFiles <= 0 || count <= maxFiles)) {
 		return 0, 0, nil
@@ -1667,7 +1854,18 @@ func (s *Service) cleanupTerminalGroup(
 		if deleteLocalFile {
 			if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, video.LocalPath); err != nil {
 				if !errors.Is(err, os.ErrNotExist) {
-					s.logger.Warn("skip retention local file delete", "video_id", video.ID, "path", s.redactString(video.LocalPath), "error", s.redactError(err))
+					report.skippedLocalDeletes++
+					if report.firstSkipError == "" {
+						report.firstSkipVideoID = video.ID
+						report.firstSkipPath = retryloop.BoundedText(
+							s.redactString(video.LocalPath),
+							retryloop.RecurringErrorMaxBytes,
+						)
+						report.firstSkipError = retryloop.BoundedErrorText(
+							s.redactError(err),
+							retryloop.RecurringErrorMaxBytes,
+						)
+					}
 				}
 			} else {
 				removeFile := s.removeFile

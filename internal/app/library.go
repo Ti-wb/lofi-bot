@@ -50,44 +50,69 @@ func (s *Service) scanLibraryLocked(ctx context.Context) error {
 }
 
 func (s *Service) librarySchedulerLoop(ctx context.Context) error {
-	ticker := time.NewTicker(librarySchedulerInterval)
-	defer ticker.Stop()
+	retries := newRecurringRetry(librarySchedulerInterval, libraryRetryMaxDelay, s.retryRandom)
+	schedule := newRecurringSchedule(librarySchedulerInterval, false, s.retryClockNow)
+	delay := schedule.delay()
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
-				continue
-			}
-			if err := s.reconcileLibraryPlayback(ctx); err != nil {
-				s.setLastErr(err)
-				s.logger.Warn("library playback check failed", "error", s.redactError(err))
-			}
+		if err := s.waitRecurring(ctx, delay); err != nil {
+			return err
 		}
+		schedule.beginCycle()
+		if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
+			delay = schedule.delay()
+			continue
+		}
+		attempted, err := s.reconcileLibraryPlaybackAttempt(ctx)
+		if !attempted {
+			delay = schedule.delay()
+			continue
+		}
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			s.setLastErr(err)
+			failure := retries.failure()
+			logRecurringFailure(s.logger, "library playback check failed", s.redactError(err), failure)
+			delay = schedule.failureDelay(failure.attempt.Delay)
+			continue
+		}
+		logRecurringRecovery(s.logger, "library playback recovered", retries.recovery())
+		delay = schedule.delay()
 	}
 }
 
 func (s *Service) recoverLibraryPlaybackAfterOBSConnect(ctx context.Context) error {
-	s.playbackMu.Lock()
-	defer s.playbackMu.Unlock()
+	var scanErr error
+	var reconcileErr error
+	func() {
+		s.playbackMu.Lock()
+		defer s.playbackMu.Unlock()
+		scanErr = s.scanLibraryLocked(ctx)
+		reconcileErr = s.reconcileLibraryPlaybackLocked(ctx, true)
+	}()
 
-	if err := s.scanLibraryLocked(ctx); err != nil {
-		s.logger.Warn("media library scan found issues during OBS recovery", "error", s.redactError(err))
-	}
-	return s.reconcileLibraryPlaybackLocked(ctx, true)
+	// Scan issues are retained in status and sampled here after releasing
+	// playbackMu so repeated reconnects cannot amplify logs or block playback.
+	s.observeLibraryRecoveryScan(scanErr)
+	return reconcileErr
 }
 
 func (s *Service) handleLibraryOBSEvent(ctx context.Context, event obs.Event) error {
+	_, err := s.handleLibraryOBSEventAttempt(ctx, event)
+	return err
+}
+
+func (s *Service) handleLibraryOBSEventAttempt(ctx context.Context, event obs.Event) (bool, error) {
 	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
-		return nil
+		return false, nil
 	}
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
 	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
-		return nil
+		return false, nil
 	}
-	return s.reconcileLibrarySourceLocked(ctx, event.InputName, false)
+	return true, s.reconcileLibrarySourceLocked(ctx, event.InputName, false)
 }
 
 func (s *Service) restartLibraryLoop(ctx context.Context) error {
@@ -126,15 +151,20 @@ func (s *Service) playLibraryLoopLocked(ctx context.Context, loop medialib.Loop,
 }
 
 func (s *Service) reconcileLibraryPlayback(ctx context.Context) error {
+	_, err := s.reconcileLibraryPlaybackAttempt(ctx)
+	return err
+}
+
+func (s *Service) reconcileLibraryPlaybackAttempt(ctx context.Context) (bool, error) {
 	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
-		return nil
+		return false, nil
 	}
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
 	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
-		return nil
+		return false, nil
 	}
-	return s.reconcileLibraryPlaybackLocked(ctx, false)
+	return true, s.reconcileLibraryPlaybackLocked(ctx, false)
 }
 
 func (s *Service) reconcileLibraryPlaybackLocked(ctx context.Context, recovering bool) error {

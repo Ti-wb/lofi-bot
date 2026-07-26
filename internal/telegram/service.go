@@ -60,6 +60,10 @@ type Service struct {
 	logger                  *slog.Logger
 	now                     func() time.Time
 	pollRetryDelay          time.Duration
+	pollRetryMaxDelay       time.Duration
+	pollProviderHintMax     time.Duration
+	retryRandom             func() uint64
+	pollSleep               func(context.Context, time.Duration) error
 	updateProcessingTimeout time.Duration
 	updateHandlerStopGrace  time.Duration
 	journalWriteTimeout     time.Duration
@@ -162,6 +166,8 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 		logger:                  logger,
 		now:                     time.Now,
 		pollRetryDelay:          defaultPollRetryDelay,
+		pollRetryMaxDelay:       defaultPollRetryMaxDelay,
+		pollProviderHintMax:     defaultPollProviderHintMax,
 		updateProcessingTimeout: defaultUpdateProcessingTimeout,
 		updateHandlerStopGrace:  defaultUpdateHandlerStopGrace,
 		journalWriteTimeout:     defaultJournalWriteTimeout,
@@ -286,6 +292,7 @@ func (s *Service) Run(ctx context.Context) error {
 	updateConfig := tgbotapi.NewUpdate(nextOffset)
 	updateConfig.Timeout = s.cfg.UpdateTimeout
 	updateConfig.Limit = 1
+	pollRetry := s.newPollRetryState()
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -297,12 +304,15 @@ func (s *Service) Run(ctx context.Context) error {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			s.logger.Warn("get telegram updates", "error", s.redactError(err))
-			if err := sleepContext(ctx, s.pollRetryDelay); err != nil {
+			hint := telegramRetryHint(err, s.pollProviderHintMax)
+			attempt, sample := pollRetry.failure(hint)
+			s.logPollFailure(err, attempt, sample)
+			if err := s.waitPollRetry(ctx, attempt.Delay); err != nil {
 				return err
 			}
 			continue
 		}
+		s.logPollRecovery(pollRetry.recovery())
 		journalCtx, cancelJournal = s.journalContext(ctx)
 		err = s.updateJournal.ConfirmUpdateOffset(journalCtx, updateConfig.Offset)
 		cancelJournal()
@@ -1847,20 +1857,6 @@ func (c *contextHTTPClient) setContext(ctx context.Context) {
 	c.mu.Lock()
 	c.ctx = ctx
 	c.mu.Unlock()
-}
-
-func sleepContext(ctx context.Context, delay time.Duration) error {
-	if delay <= 0 {
-		delay = defaultPollRetryDelay
-	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
 
 func (s *Service) redactError(err error) error {

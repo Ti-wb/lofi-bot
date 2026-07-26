@@ -129,9 +129,10 @@ type Client struct {
 	pending      map[string]chan requestResult
 	closed       bool
 
-	writeGate chan struct{}
-	nextID    atomic.Uint64
-	events    chan Event
+	writeGate  chan struct{}
+	nextID     atomic.Uint64
+	events     chan Event
+	logSamples eventLogSamplers
 }
 
 func NewClient(opts Options) (*Client, error) {
@@ -323,7 +324,15 @@ func (c *Client) PlaySourceFile(ctx context.Context, sourceName string, path str
 	}
 	if options.CenterSceneItem {
 		if err := c.centerCurrentProgramSceneItem(ctx, sourceName); err != nil {
-			c.opts.Logger.Warn("center OBS media source failed", "source", sourceName, "error", err)
+			logSampledEventWarning(
+				c.opts.Logger,
+				"center OBS media source failed",
+				c.logSamples.failure(&c.logSamples.centerSource),
+				"source", sourceName,
+				"error", c.boundedLogError(err),
+			)
+		} else {
+			c.logSamples.success(&c.logSamples.centerSource)
 		}
 	}
 	if options.Restart {
@@ -599,9 +608,15 @@ func (c *Client) readLoop(conn *websocket.Conn) {
 func (c *Client) handleEvent(raw json.RawMessage) {
 	var data eventData
 	if err := json.Unmarshal(raw, &data); err != nil {
-		c.opts.Logger.Warn("decode OBS event", "error", err)
+		logSampledEventWarning(
+			c.opts.Logger,
+			"decode OBS event",
+			c.logSamples.failure(&c.logSamples.eventDecode),
+			"error", c.boundedLogError(err),
+		)
 		return
 	}
+	c.logSamples.success(&c.logSamples.eventDecode)
 	if data.EventType != "MediaInputPlaybackEnded" {
 		return
 	}
@@ -639,16 +654,29 @@ func (c *Client) handleEvent(raw json.RawMessage) {
 	}
 	c.mu.Unlock()
 	if dropped {
-		c.opts.Logger.Warn("drop OBS event because event channel is full", "event", event.Type)
+		logSampledEventWarning(
+			c.opts.Logger,
+			"drop OBS event because event channel is full",
+			c.logSamples.failure(&c.logSamples.eventOverflow),
+			"event", event.Type,
+		)
+	} else {
+		c.logSamples.success(&c.logSamples.eventOverflow)
 	}
 }
 
 func (c *Client) handleRequestResponse(raw json.RawMessage) {
 	var data requestResponseData
 	if err := json.Unmarshal(raw, &data); err != nil {
-		c.opts.Logger.Warn("decode OBS request response", "error", err)
+		logSampledEventWarning(
+			c.opts.Logger,
+			"decode OBS request response",
+			c.logSamples.failure(&c.logSamples.responseDecode),
+			"error", c.boundedLogError(err),
+		)
 		return
 	}
+	c.logSamples.success(&c.logSamples.responseDecode)
 
 	c.mu.Lock()
 	responseCh := c.pending[data.RequestID]
