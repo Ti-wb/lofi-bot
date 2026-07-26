@@ -6,6 +6,7 @@ ENV_FILE="$REPO_ROOT/.env"
 BOT_API_RUN="$REPO_ROOT/deploy/telegram-bot-api/run.sh"
 BOT_API_HEALTH="$REPO_ROOT/deploy/telegram-bot-api/healthcheck.sh"
 BOT_API_LOGOUT="$REPO_ROOT/deploy/telegram-bot-api/logout-public.sh"
+LIVENESS_READER_AWK="$REPO_ROOT/scripts/liveness-reader.awk"
 GO_CACHE_DIR="$REPO_ROOT/.cache/go-build"
 GO_MOD_CACHE_DIR="$REPO_ROOT/.cache/go-mod"
 CURRENT_ENV_SCHEMA_VERSION=5
@@ -13,6 +14,12 @@ DEFAULT_APP_BIN="$REPO_ROOT/dist/tg-obs-bot"
 MAX_RESTART_DELAY_SECONDS=86400
 ROOT_SHUTDOWN_BUFFER_SECONDS=2
 APP_INSTANCE_CONTENTION_EXIT_CODE=73
+LIVENESS_TICK_SECONDS=1
+LIVENESS_STARTUP_GRACE_SECONDS=360
+LIVENESS_NORMAL_STALE_SECONDS=60
+LIVENESS_MEDIA_PROBE_STALE_SECONDS=150
+LIVENESS_LONG_OPERATION_STALE_SECONDS=310
+LIVENESS_APP_EXIT_RACE_SECONDS=1
 
 die() {
   printf '%s\n' "error: $1" >&2
@@ -526,6 +533,7 @@ run_app_process() {
 
 run_app() {
   load_env
+  unset TG_OBS_LIVENESS_FD3
   require_value TELEGRAM_BOT_TOKEN
   require_value TELEGRAM_API_BASE_URL
   require_value ALLOWED_CHAT_ID
@@ -690,6 +698,11 @@ process_has_exited() {
   esac
 }
 
+cleanup_liveness_dir() {
+  rm -f "$1/frames.fifo" "$1/state" "$1/state.tmp" || return 1
+  [ ! -d "$1" ] || rmdir "$1"
+}
+
 supervise_service() {
   service_name=$1
   service_kind=$2
@@ -698,6 +711,11 @@ supervise_service() {
   child_pid=
   child_launching=false
   child_group_owned=false
+  liveness_reader_pid=
+  liveness_generation_dir="${supervisor_state_file%/*}/app-liveness"
+  LIVENESS_FIFO="$liveness_generation_dir/frames.fifo"
+  LIVENESS_STATE="$liveness_generation_dir/state"
+  LIVENESS_STATE_TMP="$liveness_generation_dir/state.tmp"
 
   record_child_group() {
     recorded_group=$1
@@ -718,12 +736,104 @@ supervise_service() {
     child_group_owned=false
   }
 
+  prepare_liveness_generation() {
+    [ ! -e "$liveness_generation_dir" ] || return 1
+    (umask 077 && mkdir "$liveness_generation_dir" &&
+      mkfifo "$LIVENESS_FIFO") &&
+      chmod 700 "$liveness_generation_dir" &&
+      chmod 600 "$LIVENESS_FIFO" &&
+      [ -p "$LIVENESS_FIFO" ] && return 0
+    cleanup_liveness_dir "$liveness_generation_dir" || true
+    return 1
+  }
+
+  stop_liveness_reader_process() {
+    [ -n "$liveness_reader_pid" ] || return 0
+    process_has_exited "$liveness_reader_pid" ||
+      kill -TERM "$liveness_reader_pid" 2>/dev/null || true
+    wait "$liveness_reader_pid" 2>/dev/null || true
+    liveness_reader_pid=
+  }
+
+  consume_liveness_state() {
+    consume_line=$1
+    case "$consume_line" in
+      "ERROR malformed-frame"|"ERROR frame-order"|"ERROR worker-sequence-decrease"|"ERROR worker-phase-without-progress"|"ERROR channel-eof")
+        LIVENESS_WATCHDOG_FAILURE=${consume_line#ERROR }; return 1 ;;
+      ERROR*) LIVENESS_WATCHDOG_FAILURE=reader-exited; return 1 ;;
+    esac
+    consume_old_ifs=$IFS
+    IFS=' '
+    # The state is emitted only by the strict reader in the private directory.
+    # shellcheck disable=SC2086
+    set -- $consume_line
+    IFS=$consume_old_ifs
+    if [ "$#" -ne 7 ] || [ "$1" != TGOBS1 ] ||
+       [ "${3#t=}" = "$3" ] || [ "${4#r=}" = "$4" ] ||
+       [ "${5#e=}" = "$5" ] || [ "${6#m=}" = "$6" ] ||
+       [ "${7#p=}" = "$7" ]; then
+      LIVENESS_WATCHDOG_FAILURE=invalid-state
+      return 1
+    fi
+    consume_frame=$2
+    [ "$consume_frame" != "$liveness_frame" ] || return 0
+    shift 2
+    for consume_worker in t r e m p; do
+      consume_value=${1#?=}
+      eval "consume_previous=\$liveness_${consume_worker}_value"
+      if [ "$consume_value" != "$consume_previous" ]; then
+        eval "liveness_${consume_worker}_value=\$consume_value"
+        eval "liveness_${consume_worker}_age=-1"
+      fi
+      shift
+    done
+    liveness_frame=$consume_frame
+  }
+
+  tick_liveness_watchdog() {
+    if [ -z "$liveness_frame" ]; then
+      liveness_startup_age=$((liveness_startup_age + 1))
+      if [ "$liveness_startup_age" -ge "$LIVENESS_STARTUP_GRACE_SECONDS" ]; then
+        LIVENESS_WATCHDOG_FAILURE=startup-timeout
+        LIVENESS_WATCHDOG_AGE=$liveness_startup_age
+        return 1
+      fi
+      return 0
+    fi
+    for liveness_worker_spec in \
+      t:telegram r:obs-reconnect e:obs-events m:maintenance p:playback
+    do
+      liveness_worker=${liveness_worker_spec%%:*}
+      liveness_worker_name=${liveness_worker_spec#*:}
+      eval "liveness_value=\$liveness_${liveness_worker}_value"
+      eval "liveness_age=\$liveness_${liveness_worker}_age"
+      liveness_age=$((liveness_age + 1))
+      eval "liveness_${liveness_worker}_age=\$liveness_age"
+      liveness_phase=${liveness_value#*,}
+      case "$liveness_phase" in
+        08) liveness_limit=$LIVENESS_MEDIA_PROBE_STALE_SECONDS ;;
+        09|10) liveness_limit=$LIVENESS_LONG_OPERATION_STALE_SECONDS ;;
+        *) liveness_limit=$LIVENESS_NORMAL_STALE_SECONDS ;;
+      esac
+      if [ "$liveness_age" -ge "$liveness_limit" ]; then
+        LIVENESS_WATCHDOG_FAILURE=stale
+        LIVENESS_WATCHDOG_WORKER=$liveness_worker_name
+        LIVENESS_WATCHDOG_PHASE=$liveness_phase
+        LIVENESS_WATCHDOG_AGE=$liveness_age
+        return 1
+      fi
+    done
+  }
+
   stop_supervised_child() {
     trap - HUP INT TERM
     if [ -z "$child_pid" ] && [ "$child_launching" = true ]; then
       capture_last_background_pid
-      child_pid=$LAST_BACKGROUND_PID
+      if [ "$LAST_BACKGROUND_PID" != "$liveness_reader_pid" ]; then
+        child_pid=$LAST_BACKGROUND_PID
+      fi
     fi
+    stop_liveness_reader_process
     if [ -n "$child_pid" ]; then
       if [ "$child_group_owned" = true ]; then
         if stop_child_process_group "$child_pid" "$service_name"; then
@@ -737,6 +847,10 @@ supervise_service() {
         stop_single_child "$child_pid" "$service_name"
       fi
     fi
+    if [ "$service_kind" = app ] &&
+       ! cleanup_liveness_dir "$liveness_generation_dir"; then
+      info "error: could not remove $service_name effective-UID-owned liveness state"
+    fi
     exit 0
   }
 
@@ -746,11 +860,43 @@ supervise_service() {
     info "Starting $service_name..."
     started_at=$(date +%s)
     child_pid=
+    liveness_reader_pid=
+
+    if [ "$service_kind" = app ]; then
+      if ! prepare_liveness_generation; then
+        info "error: could not create supervisor effective-UID-owned liveness FIFO state"
+        kill -TERM "$root_supervisor_pid" 2>/dev/null || true
+        exit 1
+      fi
+      awk \
+        -v state_path="$LIVENESS_STATE" \
+        -v state_tmp="$LIVENESS_STATE_TMP" \
+        -f "$LIVENESS_READER_AWK" \
+        "$LIVENESS_FIFO" &
+      liveness_reader_pid=$!
+      liveness_frame=
+      liveness_startup_age=-1
+      LIVENESS_WATCHDOG_FAILURE=
+      LIVENESS_WATCHDOG_WORKER=-
+      LIVENESS_WATCHDOG_PHASE=-
+      LIVENESS_WATCHDOG_AGE=0
+      liveness_t_value= liveness_r_value= liveness_e_value=
+      liveness_m_value= liveness_p_value=
+      liveness_t_age=0 liveness_r_age=0 liveness_e_age=0
+      liveness_m_age=0 liveness_p_age=0
+    fi
+
     child_launching=true
     set -m
     case "$service_kind" in
       bot-api) "$BOT_API_RUN" & ;;
-      app) run_app_process & ;;
+      app)
+        (
+          TG_OBS_LIVENESS_FD3=1
+          export TG_OBS_LIVENESS_FD3
+          run_app_process
+        ) 3>"$LIVENESS_FIFO" &
+        ;;
       *) die "unknown supervised service kind: $service_kind" ;;
     esac
     child_pid=$!
@@ -760,23 +906,99 @@ supervise_service() {
       kill -TERM "$child_pid" 2>/dev/null || true
       wait "$child_pid" 2>/dev/null || true
       info "error: could not isolate $service_name child process group"
+      stop_liveness_reader_process
+      [ "$service_kind" != app ] ||
+        cleanup_liveness_dir "$liveness_generation_dir" || true
       kill -TERM "$root_supervisor_pid" 2>/dev/null || true
       exit 1
     fi
-    record_child_group "$child_pid"
+    if ! record_child_group "$child_pid"; then
+      stop_liveness_reader_process
+      [ "$service_kind" != app ] ||
+        cleanup_liveness_dir "$liveness_generation_dir" || true
+      exit 1
+    fi
+
     status=0
-    wait "$child_pid" || status=$?
+    watchdog_failed=false
+    if [ "$service_kind" = app ]; then
+      reader_status=running
+      while :; do
+        if process_has_exited "$liveness_reader_pid"; then
+          reader_status=0
+          wait "$liveness_reader_pid" 2>/dev/null || reader_status=$?
+          liveness_reader_pid=
+          if [ "$reader_status" -eq 25 ]; then
+            sleep "$LIVENESS_APP_EXIT_RACE_SECONDS"
+            process_has_exited "$child_pid" && break
+          fi
+          case "$reader_status" in
+            24) LIVENESS_WATCHDOG_FAILURE=state-write ;;
+            *) LIVENESS_WATCHDOG_FAILURE=reader-exited ;;
+          esac
+          if [ -r "$LIVENESS_STATE" ]; then
+            IFS= read -r liveness_state_line <"$LIVENESS_STATE" ||
+              liveness_state_line=
+            consume_liveness_state "$liveness_state_line" || true
+          fi
+          watchdog_failed=true
+          break
+        fi
+        process_has_exited "$child_pid" && break
+        if [ -r "$LIVENESS_STATE" ]; then
+          IFS= read -r liveness_state_line <"$LIVENESS_STATE" ||
+            liveness_state_line=
+          if ! consume_liveness_state "$liveness_state_line"; then
+            watchdog_failed=true
+            break
+          fi
+        fi
+        if ! tick_liveness_watchdog; then
+          watchdog_failed=true
+          break
+        fi
+        sleep "$LIVENESS_TICK_SECONDS"
+      done
+      if [ "$watchdog_failed" = true ]; then
+        info "error: $service_name liveness failed reason=$LIVENESS_WATCHDOG_FAILURE worker=$LIVENESS_WATCHDOG_WORKER phase=$LIVENESS_WATCHDOG_PHASE age=${LIVENESS_WATCHDOG_AGE}s reader_status=$reader_status"
+        stop_liveness_reader_process
+        if ! stop_child_process_group "$child_pid" "$service_name liveness failure"; then
+          info "error: could not drain $service_name after liveness watchdog failure"
+          cleanup_liveness_dir "$liveness_generation_dir" || true
+          kill -TERM "$root_supervisor_pid" 2>/dev/null || true
+          exit 1
+        fi
+        status=1
+      else
+        wait "$child_pid" 2>/dev/null || status=$?
+        stop_liveness_reader_process
+      fi
+    else
+      wait "$child_pid" || status=$?
+    fi
+
     exited_child_pid=$child_pid
     if ! drain_process_group "$exited_child_pid" "$service_name"; then
       info "error: could not drain $service_name process group $exited_child_pid"
+      [ "$service_kind" != app ] ||
+        cleanup_liveness_dir "$liveness_generation_dir" || true
       kill -TERM "$root_supervisor_pid" 2>/dev/null || true
       exit 1
     fi
     clear_child_group
+    if [ "$service_kind" = app ] &&
+       ! cleanup_liveness_dir "$liveness_generation_dir"; then
+      info "error: could not remove $service_name effective-UID-owned liveness state"
+      kill -TERM "$root_supervisor_pid" 2>/dev/null || true
+      exit 1
+    fi
     child_pid=
     if [ "$service_kind" = app ] && [ "$status" -eq "$APP_INSTANCE_CONTENTION_EXIT_CODE" ]; then
       info "$service_name refused startup because its database or Telegram bot is already owned; not restarting."
       return "$status"
+    fi
+    if [ "$watchdog_failed" = true ]; then
+      info "$service_name generation failed its liveness contract."
     fi
     ended_at=$(date +%s)
     runtime=$((ended_at - started_at))
@@ -815,6 +1037,7 @@ supervise_service() {
 
 run_up() {
   load_env
+  unset TG_OBS_LIVENESS_FD3
   require_stack_env
   ensure_go_cache
 
@@ -860,6 +1083,7 @@ run_up() {
   supervisor_state_dir=
   bot_child_state_file=
   app_child_state_file=
+  app_liveness_dir=
 
   cleanup() {
     status=${shutdown_status:-$?}
@@ -934,6 +1158,10 @@ run_up() {
       fi
     done
     if [ -n "$supervisor_state_dir" ]; then
+      if [ -n "$app_liveness_dir" ] &&
+         ! cleanup_liveness_dir "$app_liveness_dir"; then
+        info "error: could not remove supervisor effective-UID-owned liveness state"
+      fi
       rm -f \
         "$bot_child_state_file" "${bot_child_state_file}.tmp" \
         "$app_child_state_file" "${app_child_state_file}.tmp"
@@ -959,9 +1187,25 @@ run_up() {
   trap 'shutdown_status=143; cleanup' TERM
   trap 'shutdown_status=$?; cleanup' 0
 
-  supervisor_state_dir=$(mktemp -d "${TMPDIR:-/tmp}/tg-obs-supervisor-state.XXXXXX")
+  command -v awk >/dev/null 2>&1 ||
+    die "awk is required for app liveness supervision"
+  [ -r "$LIVENESS_READER_AWK" ] ||
+    die "app liveness reader is missing or unreadable: $LIVENESS_READER_AWK"
+  case "$(uname -s)" in
+    Darwin) liveness_runtime_base=/private/tmp ;;
+    Linux) liveness_runtime_base=/tmp ;;
+    *) die "liveness supervision is supported only on macOS and Linux" ;;
+  esac
+  supervisor_state_dir=$(
+    umask 077
+    mktemp -d "$liveness_runtime_base/tg-obs-supervisor-state.XXXXXX"
+  ) ||
+    die "could not create supervisor effective-UID-owned state directory"
+  chmod 700 "$supervisor_state_dir" ||
+    die "could not secure supervisor state directory"
   bot_child_state_file="$supervisor_state_dir/bot-api.group"
   app_child_state_file="$supervisor_state_dir/app.group"
+  app_liveness_dir="$supervisor_state_dir/app-liveness"
 
   supervisor_launching=bot-api
   candidate_pid=

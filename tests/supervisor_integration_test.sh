@@ -107,6 +107,21 @@ wait_for_line_count() {
   fail "timed out waiting for $expected lines in $path"
 }
 
+wait_for_pattern() {
+  path=$1
+  pattern=$2
+  attempts=${3:-100}
+  count=0
+  while [ "$count" -lt "$attempts" ]; do
+    if [ -f "$path" ] && grep -q "$pattern" "$path"; then
+      return 0
+    fi
+    sleep 0.1
+    count=$((count + 1))
+  done
+  fail "timed out waiting for $pattern in $path"
+}
+
 assert_process_gone() {
   pid=$1
   label=$2
@@ -131,7 +146,7 @@ wait_for_root() {
   watchdog_pid=$!
   ROOT_STATUS=0
   wait "$pid" 2>/dev/null || ROOT_STATUS=$?
-  kill "$watchdog_pid" 2>/dev/null || true
+  kill -KILL "$watchdog_pid" 2>/dev/null || true
   wait "$watchdog_pid" 2>/dev/null || true
   ACTIVE_ROOT_PID=
 }
@@ -139,8 +154,10 @@ wait_for_root() {
 new_fixture() {
   name=$1
   FIXTURE="$TEST_ROOT/$name"
-  mkdir -p "$FIXTURE/bin" "$FIXTURE/cmd/tg-obs-bot" "$FIXTURE/internal" "$FIXTURE/deploy/telegram-bot-api"
+  mkdir -p "$FIXTURE/bin" "$FIXTURE/cmd/tg-obs-bot" "$FIXTURE/internal" \
+    "$FIXTURE/scripts" "$FIXTURE/deploy/telegram-bot-api"
   cp "$REPO_ROOT/run.sh" "$FIXTURE/run.sh"
+  cp "$REPO_ROOT/scripts/liveness-reader.awk" "$FIXTURE/scripts/liveness-reader.awk"
   cp "$REPO_ROOT/deploy/telegram-bot-api/healthcheck.sh" "$FIXTURE/deploy/telegram-bot-api/healthcheck.sh"
   chmod +x "$FIXTURE/run.sh" "$FIXTURE/deploy/telegram-bot-api/healthcheck.sh"
   : >"$FIXTURE/cmd/tg-obs-bot/main.go"
@@ -219,6 +236,7 @@ EOF
 #!/bin/sh
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+source_path=${1:-}
 destination=
 for argument do
   destination=$argument
@@ -230,8 +248,31 @@ case "$destination" in
       exit 75
     fi
     ;;
+  */app-liveness/state)
+    if [ -f "$root/fail-liveness-state-write" ] &&
+       [ -r "$source_path" ] &&
+       grep -q '^TGOBS1 ' "$source_path"; then
+      rm -f "$root/fail-liveness-state-write"
+      exit 75
+    fi
+    ;;
 esac
 exec /bin/mv "$@"
+EOF
+
+  cat >"$FIXTURE/bin/mktemp" <<'EOF'
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+real_mktemp=/usr/bin/mktemp
+[ -x "$real_mktemp" ] || real_mktemp=/bin/mktemp
+created=$("$real_mktemp" "$@")
+case "$created" in
+  /private/tmp/tg-obs-supervisor-state.*|/tmp/tg-obs-supervisor-state.*)
+    printf '%s\n' "$created" >"$root/supervisor-state-dir"
+    ;;
+esac
+printf '%s\n' "$created"
 EOF
 
   cat >"$FIXTURE/grandchild.sh" <<'EOF'
@@ -265,6 +306,12 @@ if [ -s "$root/app-grandchild.pids" ]; then
     printf '%s\n' "$previous_grandchild" >"$root/replacement-started-before-drain"
   fi
 fi
+[ "${TG_OBS_LIVENESS_FD3:-}" = 1 ] ||
+  exit 94
+[ -p /dev/fd/3 ] ||
+  exit 95
+printf '%s\n' "$TG_OBS_LIVENESS_FD3" >>"$root/liveness-markers"
+printf '%s\n' 'TGOBS1 1 t=1,00 r=1,00 e=1,00 m=1,00 p=1,00' >&3
 printf '%s\n' "$$" >>"$root/app.pids"
 supervisor_pid=$(ps -o ppid= -p "$$" | tr -d '[:space:]')
 printf '%s' "$supervisor_pid" >>"$root/app-supervisor.pids"
@@ -276,7 +323,7 @@ if [ -f "$root/post-exit-pause" ]; then
   sleep 0.05
   kill -KILL "$$"
 fi
-"$root/grandchild.sh" app "$root" &
+"$root/grandchild.sh" app "$root" 3>&- &
 grandchild_pid=$!
 stop() {
   trap - HUP INT TERM
@@ -330,10 +377,36 @@ EOF
     "$FIXTURE/bin/fake-go" \
     "$FIXTURE/bin/curl" \
     "$FIXTURE/bin/mv" \
+    "$FIXTURE/bin/mktemp" \
     "$FIXTURE/grandchild.sh" \
     "$FIXTURE/app-template.sh" \
     "$FIXTURE/post-exit-grandchild.sh" \
     "$FIXTURE/deploy/telegram-bot-api/run.sh"
+}
+
+accelerate_liveness_fixture() {
+  fixture=$1
+  sed \
+    -e 's/^LIVENESS_TICK_SECONDS=1$/LIVENESS_TICK_SECONDS=0.1/' \
+    -e 's/^LIVENESS_STARTUP_GRACE_SECONDS=360$/LIVENESS_STARTUP_GRACE_SECONDS=10/' \
+    -e 's/^LIVENESS_NORMAL_STALE_SECONDS=60$/LIVENESS_NORMAL_STALE_SECONDS=3/' \
+    -e 's/^LIVENESS_MEDIA_PROBE_STALE_SECONDS=150$/LIVENESS_MEDIA_PROBE_STALE_SECONDS=5/' \
+    -e 's/^LIVENESS_LONG_OPERATION_STALE_SECONDS=310$/LIVENESS_LONG_OPERATION_STALE_SECONDS=7/' \
+    -e 's/^LIVENESS_APP_EXIT_RACE_SECONDS=1$/LIVENESS_APP_EXIT_RACE_SECONDS=0.1/' \
+    "$fixture/run.sh" >"$fixture/run.sh.liveness-test"
+  mv "$fixture/run.sh.liveness-test" "$fixture/run.sh"
+  chmod +x "$fixture/run.sh"
+  for expected in \
+    LIVENESS_TICK_SECONDS=0.1 \
+    LIVENESS_STARTUP_GRACE_SECONDS=10 \
+    LIVENESS_NORMAL_STALE_SECONDS=3 \
+    LIVENESS_MEDIA_PROBE_STALE_SECONDS=5 \
+    LIVENESS_LONG_OPERATION_STALE_SECONDS=7 \
+    LIVENESS_APP_EXIT_RACE_SECONDS=0.1
+  do
+    grep -qx "$expected" "$fixture/run.sh" ||
+      fail "liveness test did not replace production constant: $expected"
+  done
 }
 
 start_fixture_command() {
@@ -362,6 +435,48 @@ start_fixture() {
   start_fixture_command "$1" up
 }
 
+new_fixture direct_app
+direct_fixture=$FIXTURE
+cat >"$direct_fixture/direct-app" <<'EOF'
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+[ "${TG_OBS_LIVENESS_FD3+x}" != x ] || exit 96
+printf '%s\n' unset >"$root/direct-liveness-marker"
+EOF
+chmod +x "$direct_fixture/direct-app"
+rm -f "$direct_fixture/scripts/liveness-reader.awk"
+printf '%s\n' 'APP_BIN=./direct-app' >>"$direct_fixture/.env"
+start_fixture_command "$direct_fixture" app
+direct_root_pid=$ACTIVE_ROOT_PID
+wait_for_root "$direct_root_pid" 3
+[ "$ROOT_STATUS" -eq 0 ] ||
+  fail "direct app exited with $ROOT_STATUS instead of 0"
+[ "$(cat "$direct_fixture/direct-liveness-marker")" = unset ] ||
+  fail "direct app inherited the supervised liveness marker"
+direct_processes=$(fixture_command_processes "$direct_fixture")
+[ -z "$direct_processes" ] ||
+  fail "direct app leaked fixture process(es): $direct_processes"
+printf 'ok - direct app leaves the liveness marker unset and does not require the reader\n'
+
+new_fixture missing_liveness_reader
+missing_reader_fixture=$FIXTURE
+rm -f "$missing_reader_fixture/scripts/liveness-reader.awk"
+printf '%s\n' 'APP_BIN=./app-template.sh' >>"$missing_reader_fixture/.env"
+start_fixture "$missing_reader_fixture"
+missing_reader_root_pid=$ACTIVE_ROOT_PID
+wait_for_root "$missing_reader_root_pid" 3
+[ "$ROOT_STATUS" -eq 1 ] ||
+  fail "missing liveness reader exited with $ROOT_STATUS instead of 1"
+grep -q 'liveness reader is missing or unreadable' "$missing_reader_fixture/run.log" ||
+  fail "missing liveness reader was not reported"
+[ ! -e "$missing_reader_fixture/bot.pid" ] ||
+  fail "missing liveness reader started bot-api"
+missing_reader_processes=$(fixture_command_processes "$missing_reader_fixture")
+[ -z "$missing_reader_processes" ] ||
+  fail "missing liveness reader leaked fixture process(es): $missing_reader_processes"
+printf 'ok - supervised startup fails closed when the liveness reader is unavailable\n'
+
 new_fixture process_tree
 process_fixture=$FIXTURE
 start_fixture "$process_fixture"
@@ -371,6 +486,9 @@ wait_for_line_count "$process_fixture/app-grandchild.pids" 1
 wait_for_file "$process_fixture/bot.pid"
 wait_for_line_count "$process_fixture/bot-grandchild.pids" 1
 wait_for_file "$process_fixture/curl.commands"
+wait_for_line_count "$process_fixture/liveness-markers" 1
+[ "$(sed -n '1p' "$process_fixture/liveness-markers")" = 1 ] ||
+  fail "supervised app did not receive the exact liveness marker"
 
 [ -x "$process_fixture/dist/tg-obs-bot" ] || fail "atomic build did not install dist/tg-obs-bot"
 grep -q '^build ' "$process_fixture/go.commands" || fail "supervised startup did not build the app"
@@ -585,7 +703,7 @@ chmod +x "$singleton_fixture/singleton-app"
 printf '%s\n' 'APP_BIN=./singleton-app' >>"$singleton_fixture/.env"
 start_fixture "$singleton_fixture"
 singleton_root_pid=$ACTIVE_ROOT_PID
-wait_for_root "$singleton_root_pid" 6
+wait_for_root "$singleton_root_pid" 8
 [ "$ROOT_STATUS" -eq 73 ] ||
   fail "singleton contention produced root status $ROOT_STATUS instead of 73"
 [ "$(wc -l <"$singleton_fixture/singleton-app.pids" | tr -d '[:space:]')" -eq 1 ] ||
@@ -603,6 +721,189 @@ singleton_groups=$(fixture_process_groups_alive "$singleton_fixture")
 [ -z "$singleton_groups" ] ||
   fail "singleton contention leaked process group(s): $singleton_groups"
 printf 'ok - singleton contention stops the stack without restart churn\n'
+
+new_fixture liveness_watchdog
+liveness_fixture=$FIXTURE
+accelerate_liveness_fixture "$liveness_fixture"
+sed 's/^RESTART_MAX_DELAY_SECONDS=4$/RESTART_MAX_DELAY_SECONDS=1/' \
+  "$liveness_fixture/.env" >"$liveness_fixture/.env.liveness-test"
+mv "$liveness_fixture/.env.liveness-test" "$liveness_fixture/.env"
+cat >"$liveness_fixture/liveness-app" <<'EOF'
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+[ "${TG_OBS_LIVENESS_FD3:-}" = 1 ] || exit 94
+[ -p /dev/fd/3 ] || exit 95
+
+generation=0
+[ ! -f "$root/liveness-generation" ] ||
+  generation=$(cat "$root/liveness-generation")
+generation=$((generation + 1))
+printf '%s\n' "$generation" >"$root/liveness-generation"
+printf '%s\n' "$generation" >>"$root/liveness-generations"
+printf '%s\n' "$$" >>"$root/liveness-app.pids"
+
+if [ -s "$root/liveness-stubborn-grandchild.pids" ]; then
+  previous_grandchild=$(tail -n 1 "$root/liveness-stubborn-grandchild.pids")
+  if kill -0 "$previous_grandchild" 2>/dev/null; then
+    : >"$root/liveness-replacement-overlap"
+  fi
+fi
+
+stop() {
+  trap - HUP INT TERM
+  exit 0
+}
+trap stop HUP INT TERM
+
+emit() {
+  printf 'TGOBS1 %s t=%s,%s r=%s,00 e=%s,00 m=%s,00 p=%s,00\n' \
+    "$1" "$2" "$3" "$4" "$4" "$4" "$4" >&3
+}
+
+case "$generation" in
+  1)
+    "$root/grandchild.sh" liveness-stubborn "$root" 3>&- &
+    frame=1
+    other=1
+    while :; do
+      emit "$frame" 1 00 "$other"
+      frame=$((frame + 1))
+      other=$((other + 1))
+      sleep 0.1
+    done
+    ;;
+  2)
+    emit 1 1 00 1
+    printf '%s\n' malformed >&3
+    while :; do sleep 1; done
+    ;;
+  3)
+    emit 1 1 00 1
+    exec 3>&-
+    while :; do sleep 1; done
+    ;;
+  4)
+    while :; do sleep 1; done
+    ;;
+esac
+
+frame=1
+other=1
+hold=0
+while [ "$hold" -lt 4 ]; do
+  emit "$frame" 1 08 "$other"
+  frame=$((frame + 1))
+  other=$((other + 1))
+  hold=$((hold + 1))
+  sleep 0.1
+done
+hold=0
+while [ "$hold" -lt 6 ]; do
+  emit "$frame" 2 09 "$other"
+  frame=$((frame + 1))
+  other=$((other + 1))
+  hold=$((hold + 1))
+  sleep 0.1
+done
+hold=0
+while [ "$hold" -lt 6 ]; do
+  emit "$frame" 3 10 "$other"
+  frame=$((frame + 1))
+  other=$((other + 1))
+  hold=$((hold + 1))
+  sleep 0.1
+done
+sequence=4
+printf '%s\n' "$generation" >"$root/liveness-ready"
+while :; do
+  emit "$frame" "$sequence" 00 "$other"
+  frame=$((frame + 1))
+  sequence=$((sequence + 1))
+  other=$((other + 1))
+  sleep 0.1
+done
+EOF
+chmod +x "$liveness_fixture/liveness-app"
+printf '%s\n' 'APP_BIN=./liveness-app' >>"$liveness_fixture/.env"
+start_fixture "$liveness_fixture"
+liveness_root_pid=$ACTIVE_ROOT_PID
+wait_for_file "$liveness_fixture/bot.pid"
+liveness_bot_pid=$(cat "$liveness_fixture/bot.pid")
+wait_for_line_count "$liveness_fixture/liveness-generations" 5 300
+wait_for_file "$liveness_fixture/liveness-ready" 300
+[ "$(cat "$liveness_fixture/liveness-ready")" = 5 ] ||
+  fail "long-phase generation did not reach steady progress"
+sleep 0.5
+[ "$(wc -l <"$liveness_fixture/liveness-generations" | tr -d '[:space:]')" -eq 5 ] ||
+  fail "legal phase 08/09/10 grace windows restarted the app"
+[ "$(cat "$liveness_fixture/bot.pid")" = "$liveness_bot_pid" ] ||
+  fail "liveness failure restarted the sibling bot-api service"
+[ ! -e "$liveness_fixture/liveness-replacement-overlap" ] ||
+  fail "liveness replacement started before the failed process group drained"
+liveness_stubborn_pid=$(sed -n '1p' "$liveness_fixture/liveness-stubborn-grandchild.pids")
+assert_process_gone "$liveness_stubborn_pid" "liveness-failed stubborn grandchild"
+grep -q 'reason=stale worker=telegram phase=00' "$liveness_fixture/run.log" ||
+  fail "frozen worker did not trigger its fixed normal lease"
+grep -q 'reason=malformed-frame' "$liveness_fixture/run.log" ||
+  fail "malformed liveness frame did not fail its generation"
+grep -q 'reason=channel-eof' "$liveness_fixture/run.log" ||
+  fail "lost liveness channel did not fail its generation"
+grep -q 'reason=startup-timeout' "$liveness_fixture/run.log" ||
+  fail "missing startup frame did not fail its generation"
+
+healthy_liveness_pid=$(sed -n '5p' "$liveness_fixture/liveness-app.pids")
+kill -STOP "$healthy_liveness_pid"
+sleep 0.2
+: >"$liveness_fixture/fail-liveness-state-write"
+kill -KILL "$healthy_liveness_pid"
+wait_for_line_count "$liveness_fixture/liveness-generations" 6 100
+wait_for_pattern "$liveness_fixture/run.log" 'reason=state-write' 100
+[ ! -e "$liveness_fixture/fail-liveness-state-write" ] ||
+  fail "one-shot state-write failure marker was not consumed"
+wait_for_line_count "$liveness_fixture/liveness-generations" 7 200
+ready_attempts=0
+while [ "$ready_attempts" -lt 100 ]; do
+  [ "$(cat "$liveness_fixture/liveness-ready" 2>/dev/null || true)" = 7 ] && break
+  sleep 0.1
+  ready_attempts=$((ready_attempts + 1))
+done
+[ "$(cat "$liveness_fixture/liveness-ready")" = 7 ] ||
+  fail "app did not recover after an atomic liveness state-write failure"
+[ "$(grep -c 'reason=state-write' "$liveness_fixture/run.log")" -eq 1 ] ||
+  fail "state-write failure did not produce exactly one liveness restart"
+if grep -q 'tg-obs-bot exited with status 141' "$liveness_fixture/run.log"; then
+  fail "state-write failure was overwritten by an ordinary SIGPIPE exit"
+fi
+[ "$(grep -c 'reason=channel-eof' "$liveness_fixture/run.log")" -eq 1 ] ||
+  fail "ordinary app exit was misclassified as a lost liveness channel"
+
+wait_for_file "$liveness_fixture/supervisor-state-dir"
+liveness_state_dir="$(cat "$liveness_fixture/supervisor-state-dir")/app-liveness"
+liveness_state_path="$liveness_state_dir/state"
+case "$(LC_ALL=C ls -ld "$liveness_state_dir")" in
+  drwx------*) ;;
+  *) fail "liveness state directory is not mode 0700" ;;
+esac
+case "$(LC_ALL=C ls -l "$liveness_state_dir/frames.fifo")" in
+  prw-------*) ;;
+  *) fail "liveness FIFO is not mode 0600" ;;
+esac
+case "$(LC_ALL=C ls -l "$liveness_state_path")" in
+  -rw-------*) ;;
+  *) fail "liveness state file is not mode 0600" ;;
+esac
+
+kill -TERM "$liveness_root_pid"
+wait_for_root "$liveness_root_pid" 4
+[ "$ROOT_STATUS" -eq 143 ] ||
+  fail "liveness root TERM exited with $ROOT_STATUS instead of 143"
+[ ! -e "$liveness_state_dir" ] ||
+  fail "private liveness FIFO state survived root shutdown"
+liveness_processes=$(fixture_command_processes "$liveness_fixture")
+[ -z "$liveness_processes" ] ||
+  fail "liveness shutdown leaked fixture process(es): $liveness_processes"
+printf 'ok - liveness failures restart only the app; legal long phases and cleanup remain bounded\n'
 
 new_fixture launch_race
 race_fixture=$FIXTURE
