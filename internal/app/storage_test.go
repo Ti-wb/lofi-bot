@@ -9,11 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/tiwb/tg-obs-bot/internal/config"
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/media"
 )
 
@@ -205,6 +207,99 @@ func TestAtomicLibraryCopyCleansTempOnCancellation(t *testing.T) {
 	requireNoOwnedImportTemps(t, dir)
 }
 
+func TestCopyLivenessAdvancesOnlyAfterSuccessfulWriteCheckpoint(t *testing.T) {
+	registry := liveness.NewRegistry(liveness.Options{ProgressInterval: time.Millisecond})
+	worker, err := registry.Bind(liveness.WorkerTelegram, liveness.OwnerTelegram)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	ctx := liveness.WithWorker(context.Background(), worker)
+	writeStarted := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	writer := writeFunc(func(data []byte) (int, error) {
+		close(writeStarted)
+		<-releaseWrite
+		return len(data), nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, copyErr := copyDataWithContext(ctx, writer, strings.NewReader("actual-progress"))
+		done <- copyErr
+	}()
+
+	select {
+	case <-writeStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("copy did not reach blocked write")
+	}
+	blocked := worker.Snapshot()
+	time.Sleep(20 * time.Millisecond)
+	if got := worker.Snapshot(); got.Sequence != blocked.Sequence {
+		t.Fatalf("blocked write manufactured progress: before=%+v after=%+v", blocked, got)
+	}
+
+	close(releaseWrite)
+	if err := <-done; err != nil {
+		t.Fatalf("copyDataWithContext: %v", err)
+	}
+	completed := worker.Snapshot()
+	if completed.Sequence <= blocked.Sequence || completed.Phase != liveness.PhaseOperation {
+		t.Fatalf("successful write did not checkpoint progress: blocked=%+v completed=%+v", blocked, completed)
+	}
+}
+
+func TestAtomicLibraryCopyScopesDurabilityAndRestoresNormalPhase(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.mp4")
+	dest := filepath.Join(dir, "dest.mp4")
+	writeTestFile(t, source)
+	registry := liveness.NewRegistry(liveness.Options{})
+	worker, err := registry.Bind(liveness.WorkerTelegram, liveness.OwnerTelegram)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	worker.Advance(liveness.PhaseOperation)
+	ctx := liveness.WithWorker(context.Background(), worker)
+	syncStarted := make(chan struct{})
+	releaseSync := make(chan struct{})
+	var blockFirstSync sync.Once
+	done := make(chan error, 1)
+	go func() {
+		_, copyErr := copyFileAtomicWith(ctx, dest, source, 1024, nil, nil, atomicCopyOps{
+			syncDirectory: func(string) error {
+				blockFirstSync.Do(func() {
+					close(syncStarted)
+					<-releaseSync
+				})
+				return nil
+			},
+		})
+		done <- copyErr
+	}()
+
+	select {
+	case <-syncStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("copy did not reach durability sync")
+	}
+	blocked := worker.Snapshot()
+	if blocked.Phase != liveness.PhaseDurabilitySync {
+		t.Fatalf("blocked phase = %s, want %s", blocked.Phase, liveness.PhaseDurabilitySync)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := worker.Snapshot(); got.Sequence != blocked.Sequence {
+		t.Fatalf("blocked sync manufactured progress: before=%+v after=%+v", blocked, got)
+	}
+
+	close(releaseSync)
+	if err := <-done; err != nil {
+		t.Fatalf("copyFileAtomic: %v", err)
+	}
+	if phase := worker.Snapshot().Phase; phase != liveness.PhaseOperation {
+		t.Fatalf("final phase = %s, want restored %s", phase, liveness.PhaseOperation)
+	}
+}
+
 func TestAtomicLibraryCopyCleansTempOnENOSPC(t *testing.T) {
 	dir := t.TempDir()
 	source := filepath.Join(dir, "source.mp4")
@@ -230,6 +325,12 @@ func TestAtomicLibraryCopyCleansTempOnENOSPC(t *testing.T) {
 		t.Fatal("ENOSPC copy deleted source")
 	}
 	requireNoOwnedImportTemps(t, dir)
+}
+
+type writeFunc func([]byte) (int, error)
+
+func (write writeFunc) Write(data []byte) (int, error) {
+	return write(data)
 }
 
 func TestAtomicLibraryCopyPublishesOnlyCompleteFile(t *testing.T) {
@@ -439,8 +540,19 @@ func TestStaleImportSweepRemovesOnlyOwnedOldRegularTemps(t *testing.T) {
 		t.Fatalf("age fresh temp: %v", err)
 	}
 
-	if err := svc.sweepStaleLibraryImportTemps(context.Background()); err != nil {
+	registry := liveness.NewRegistry(liveness.Options{})
+	worker, err := registry.Bind(liveness.WorkerMaintenance, liveness.OwnerMaintenance)
+	if err != nil {
+		t.Fatalf("Bind maintenance: %v", err)
+	}
+	worker.Advance(liveness.PhaseOperation)
+	ctx := liveness.WithWorker(context.Background(), worker)
+	beforeSweep := worker.Snapshot().Sequence
+	if err := svc.sweepStaleLibraryImportTemps(ctx); err != nil {
 		t.Fatalf("sweep: %v", err)
+	}
+	if worker.Snapshot().Sequence <= beforeSweep {
+		t.Fatal("stale import sweep did not record an actual entry checkpoint")
 	}
 	if fileExists(oldOwned) {
 		t.Fatal("old owned import temp was not removed")

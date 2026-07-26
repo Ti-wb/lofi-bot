@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/secret"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -261,7 +262,10 @@ func (s *Service) registerQueueCommands(ctx context.Context) error {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	tracker := liveness.WorkerFromContext(ctx)
+	tracker.Advance(liveness.PhaseOperation)
 	if err := ctx.Err(); err != nil {
+		tracker.Advance(liveness.PhaseCancelWait)
 		return err
 	}
 	ownerToken, err := newUpdateOwnerToken()
@@ -296,22 +300,26 @@ func (s *Service) Run(ctx context.Context) error {
 
 	for {
 		if err := ctx.Err(); err != nil {
+			tracker.Advance(liveness.PhaseCancelWait)
 			return ctx.Err()
 		}
 
+		tracker.Advance(liveness.PhaseOperation)
 		updates, err := s.bot.GetUpdates(ctx, updateConfig)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
+				tracker.Advance(liveness.PhaseCancelWait)
 				return ctxErr
 			}
 			hint := telegramRetryHint(err, s.pollProviderHintMax)
 			attempt, sample := pollRetry.failure(hint)
 			s.logPollFailure(err, attempt, sample)
-			if err := s.waitPollRetry(ctx, attempt.Delay); err != nil {
+			if err := s.waitPollRetry(ctx, tracker, attempt.Delay); err != nil {
 				return err
 			}
 			continue
 		}
+		tracker.Advance(liveness.PhaseOperation)
 		s.logPollRecovery(pollRetry.recovery())
 		journalCtx, cancelJournal = s.journalContext(ctx)
 		err = s.updateJournal.ConfirmUpdateOffset(journalCtx, updateConfig.Offset)
@@ -322,8 +330,10 @@ func (s *Service) Run(ctx context.Context) error {
 
 		for _, update := range updates {
 			if err := ctx.Err(); err != nil {
+				tracker.Advance(liveness.PhaseCancelWait)
 				return err
 			}
+			tracker.Advance(liveness.PhaseOperation)
 			if update.UpdateID < updateConfig.Offset {
 				continue
 			}
@@ -572,6 +582,7 @@ func (s *Service) handleUpdateBounded(ctx context.Context, update tgbotapi.Updat
 	case <-updateCtx.Done():
 	}
 
+	liveness.WorkerFromContext(ctx).Advance(liveness.PhaseCancelWait)
 	stopTimer := time.NewTimer(stopGrace)
 	defer stopTimer.Stop()
 	select {

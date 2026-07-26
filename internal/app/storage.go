@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/media"
 )
 
@@ -138,9 +139,15 @@ func copyFileAtomicWith(
 	if copyData == nil {
 		copyData = copyDataWithContext
 	}
+	tracker := liveness.WorkerFromContext(ctx)
 	// A one-byte fence detects growth after fstat without allowing a mutable
 	// source to consume unbounded destination space.
-	written, err := copyData(ctx, tmp, io.LimitReader(in, info.Size()+1))
+	var written int64
+	func() {
+		copyScope := tracker.Scope(liveness.PhaseMediaCopy)
+		defer copyScope.Close()
+		written, err = copyData(ctx, tmp, io.LimitReader(in, info.Size()+1))
+	}()
 	if err != nil {
 		_ = tmp.Close()
 		return 0, err
@@ -156,9 +163,15 @@ func copyFileAtomicWith(
 		_ = tmp.Close()
 		return 0, err
 	}
-	if err := tmp.Sync(); err != nil {
+	var fileSyncErr error
+	func() {
+		syncScope := tracker.Scope(liveness.PhaseDurabilitySync)
+		defer syncScope.Close()
+		fileSyncErr = tmp.Sync()
+	}()
+	if fileSyncErr != nil {
 		_ = tmp.Close()
-		return 0, err
+		return 0, fileSyncErr
 	}
 	if err := tmp.Close(); err != nil {
 		return 0, err
@@ -179,6 +192,8 @@ func copyFileAtomicWith(
 	if syncDir == nil {
 		syncDir = syncDirectory
 	}
+	syncScope := tracker.Scope(liveness.PhaseDurabilitySync)
+	defer syncScope.Close()
 	if syncErr := syncDirectories(syncDir, stagingDir, destDir); syncErr != nil {
 		remove := ops.removeFile
 		if remove == nil {
@@ -237,6 +252,9 @@ func syncDirectories(syncDir func(string) error, paths ...string) error {
 func copyDataWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
 	buffer := make([]byte, copyBufferSize)
 	var written int64
+	tracker := liveness.WorkerFromContext(ctx)
+	copyScope := tracker.Scope(liveness.PhaseMediaCopy)
+	defer copyScope.Close()
 	for {
 		if err := ctx.Err(); err != nil {
 			return written, err
@@ -259,6 +277,7 @@ func copyDataWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int
 				if count == 0 {
 					return written, io.ErrShortWrite
 				}
+				copyScope.Checkpoint()
 			}
 		}
 		if readErr != nil {
@@ -285,7 +304,21 @@ func syncDirectory(path string) error {
 func (s *Service) sweepStaleLibraryImportTemps(ctx context.Context) error {
 	s.storageMu.Lock()
 	defer s.storageMu.Unlock()
+	return s.sweepStaleLibraryImportTempsLocked(ctx)
+}
 
+func (s *Service) trySweepStaleLibraryImportTemps(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return true, err
+	}
+	if !s.storageMu.TryLock() {
+		return false, nil
+	}
+	defer s.storageMu.Unlock()
+	return true, s.sweepStaleLibraryImportTempsLocked(ctx)
+}
+
+func (s *Service) sweepStaleLibraryImportTempsLocked(ctx context.Context) error {
 	cutoff := s.nowUTC().Add(-staleLibraryImportAge)
 	seen := make(map[string]struct{}, 2)
 	var sweepErr error
@@ -325,10 +358,12 @@ func sweepStaleLibraryImportTempsInDir(ctx context.Context, dir string, cutoff t
 	}
 	stats.Inspected = len(entries)
 	var sweepErr error
+	tracker := liveness.WorkerFromContext(ctx)
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return stats, errors.Join(sweepErr, err)
 		}
+		tracker.Advance(liveness.PhaseOperation)
 		name := entry.Name()
 		if !strings.HasPrefix(name, libraryImportTempPrefix) ||
 			!strings.HasSuffix(name, libraryImportTempSuffix) ||
@@ -350,6 +385,7 @@ func sweepStaleLibraryImportTempsInDir(ctx context.Context, dir string, cutoff t
 			}
 		} else {
 			stats.Deleted++
+			tracker.Advance(liveness.PhaseOperation)
 		}
 	}
 	return stats, sweepErr

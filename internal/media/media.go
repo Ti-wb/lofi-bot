@@ -17,6 +17,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 )
 
 type Manager struct {
@@ -112,6 +114,10 @@ func (m *Manager) Download(ctx context.Context, url, originalName string, maxByt
 }
 
 func (m *Manager) Probe(ctx context.Context, path string) (Metadata, error) {
+	tracker := liveness.WorkerFromContext(ctx)
+	probeScope := tracker.Scope(liveness.PhaseMediaProbe)
+	defer probeScope.Close()
+
 	stat, err := os.Stat(path)
 	if err != nil {
 		return Metadata{}, err

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tiwb/tg-obs-bot/internal/config"
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/obs"
 	retryloop "github.com/tiwb/tg-obs-bot/internal/retry"
 )
@@ -121,13 +123,13 @@ func TestMaintenanceRetryCadenceBacksOffAndResetsAfterRecovery(t *testing.T) {
 		retryNow:            func() time.Time { return current },
 	}
 	maintenanceCalls := 0
-	svc.maintenanceFn = func(context.Context) error {
+	svc.maintenanceFn = func(context.Context) maintenanceCycleResult {
 		maintenanceCalls++
 		current = current.Add(2 * time.Minute)
 		if maintenanceCalls <= 2 {
-			return errors.New("maintenance failed")
+			return maintenanceCycleResult{err: errors.New("maintenance failed")}
 		}
-		return nil
+		return maintenanceCycleResult{}
 	}
 	var delays []time.Duration
 	svc.retrySleep = func(_ context.Context, delay time.Duration) error {
@@ -149,6 +151,175 @@ func TestMaintenanceRetryCadenceBacksOffAndResetsAfterRecovery(t *testing.T) {
 	want := []time.Duration{interval, 8 * time.Minute, 16 * time.Minute, 8 * time.Minute}
 	if fmt.Sprint(delays) != fmt.Sprint(want) {
 		t.Fatalf("wait delays = %v, want %v", delays, want)
+	}
+}
+
+func TestMaintenanceDeferralsRetrySoonWithoutMutatingErrorBackoff(t *testing.T) {
+	const (
+		interval      = 10 * time.Minute
+		deferredCount = 9
+	)
+	current := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	var logs bytes.Buffer
+	svc := &Service{
+		logger:              slog.New(slog.NewTextHandler(&logs, nil)),
+		maintenanceInterval: interval,
+		retryRandom:         func() uint64 { return 0 },
+		retryNow:            func() time.Time { return current },
+	}
+	results := []maintenanceCycleResult{{
+		deferred: true,
+		err:      errors.New("first real failure"),
+	}}
+	for range deferredCount {
+		results = append(results, maintenanceCycleResult{deferred: true})
+	}
+	results = append(
+		results,
+		maintenanceCycleResult{
+			deferred: true,
+			err:      errors.New("second real failure"),
+		},
+		maintenanceCycleResult{},
+	)
+	maintenanceCalls := 0
+	svc.maintenanceFn = func(context.Context) maintenanceCycleResult {
+		result := results[maintenanceCalls]
+		maintenanceCalls++
+		return result
+	}
+
+	var delays []time.Duration
+	svc.retrySleep = func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+		current = current.Add(delay)
+		if len(delays) == len(results)+1 {
+			return context.Canceled
+		}
+		return nil
+	}
+
+	err := svc.maintenanceLoop(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("maintenanceLoop error = %v, want canceled", err)
+	}
+	if maintenanceCalls != len(results) {
+		t.Fatalf("maintenance calls = %d, want %d", maintenanceCalls, len(results))
+	}
+	wantDelays := []time.Duration{interval, 8 * time.Minute}
+	for range deferredCount {
+		wantDelays = append(wantDelays, maintenanceDeferredMax)
+	}
+	wantDelays = append(wantDelays, 16*time.Minute, interval)
+	if fmt.Sprint(delays) != fmt.Sprint(wantDelays) {
+		t.Fatalf("wait delays = %v, want %v", delays, wantDelays)
+	}
+
+	gotLogs := logs.String()
+	if count := strings.Count(gotLogs, `msg="periodic maintenance deferred"`); count != 2 {
+		t.Fatalf("deferred warning count = %d, want first/eighth only; logs=%q", count, gotLogs)
+	}
+	if count := strings.Count(gotLogs, `msg="periodic maintenance contention recovered"`); count != 1 {
+		t.Fatalf("deferred recovery count = %d, want one; logs=%q", count, gotLogs)
+	}
+	if !strings.Contains(gotLogs, "consecutive_deferrals=8") ||
+		!strings.Contains(gotLogs, "suppressed=6") ||
+		!strings.Contains(gotLogs, "consecutive_deferrals=9") {
+		t.Fatalf("deferred samples lack bounded counts: %q", gotLogs)
+	}
+	if strings.Contains(gotLogs, "path=") {
+		t.Fatalf("deferred logs unexpectedly contain a path: %q", gotLogs)
+	}
+	if got := maintenanceDeferredDelay(30 * time.Second); got != 30*time.Second {
+		t.Fatalf("short-interval deferred delay = %s, want normal 30s cadence", got)
+	}
+}
+
+func TestMaintenanceSkipsBusyStorageWithoutBlockingAndRecoversNextCycle(t *testing.T) {
+	ctx := context.Background()
+	mediaRoot := t.TempDir()
+	loopDir := filepath.Join(mediaRoot, "loops")
+	musicDir := filepath.Join(mediaRoot, "music")
+	for _, dir := range []string{loopDir, musicDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create media directory: %v", err)
+		}
+	}
+	svc, _, _ := newFallbackTestService(t, config.Config{
+		FallbackMode:      "off",
+		RetentionMaxFiles: 1,
+		LoopMediaDir:      loopDir,
+		MusicMediaDir:     musicDir,
+	})
+	removeCandidate := addPlayedVideo(t, ctx, svc, "maintenance-old.mp4", true)
+	time.Sleep(time.Millisecond)
+	_ = addPlayedVideo(t, ctx, svc, "maintenance-new.mp4", true)
+	now := time.Now().UTC().Truncate(time.Second)
+	svc.now = func() time.Time { return now }
+	stagingDir, err := ensureLibraryStagingDir(loopDir)
+	if err != nil {
+		t.Fatalf("create staging dir: %v", err)
+	}
+	staleTemp := filepath.Join(stagingDir, libraryImportTempPrefix+"maintenance"+libraryImportTempSuffix)
+	if err := os.WriteFile(staleTemp, []byte("stale"), 0o600); err != nil {
+		t.Fatalf("write stale temp: %v", err)
+	}
+	old := now.Add(-staleLibraryImportAge - time.Second)
+	if err := os.Chtimes(staleTemp, old, old); err != nil {
+		t.Fatalf("age stale temp: %v", err)
+	}
+	registry := liveness.NewRegistry(liveness.Options{})
+	worker, err := registry.Bind(liveness.WorkerMaintenance, liveness.OwnerMaintenance)
+	if err != nil {
+		t.Fatalf("Bind maintenance: %v", err)
+	}
+	worker.Advance(liveness.PhaseOperation)
+	maintenanceCtx := liveness.WithWorker(ctx, worker)
+
+	svc.storageMu.Lock()
+	for attempt := 1; attempt <= 2; attempt++ {
+		cycle := make(chan maintenanceCycleResult, 1)
+		go func() {
+			cycle <- svc.performMaintenanceCycle(maintenanceCtx)
+		}()
+		select {
+		case result := <-cycle:
+			if result.err != nil || !result.deferred {
+				svc.storageMu.Unlock()
+				t.Fatalf("busy maintenance cycle %d = %+v, want clean deferral", attempt, result)
+			}
+		case <-time.After(250 * time.Millisecond):
+			svc.storageMu.Unlock()
+			<-cycle
+			t.Fatalf("maintenance cycle %d blocked behind busy storage", attempt)
+		}
+		if !svc.playbackMu.TryLock() {
+			svc.storageMu.Unlock()
+			t.Fatalf("busy storage cycle %d leaked the partially acquired playback lock", attempt)
+		}
+		svc.playbackMu.Unlock()
+	}
+	svc.storageMu.Unlock()
+	if _, err := svc.store.Get(ctx, removeCandidate.ID); err != nil {
+		t.Fatalf("busy maintenance cycle mutated skipped retention row: %v", err)
+	}
+	if !fileExists(staleTemp) {
+		t.Fatal("busy maintenance cycle removed a deferred stale temp")
+	}
+
+	beforeRecovery := worker.Snapshot().Sequence
+	result := svc.performMaintenanceCycle(maintenanceCtx)
+	if result.err != nil || result.deferred {
+		t.Fatalf("recovered maintenance cycle = %+v, want complete success", result)
+	}
+	if _, err := svc.store.Get(ctx, removeCandidate.ID); err == nil {
+		t.Fatal("next maintenance cycle did not resume skipped retention")
+	}
+	if fileExists(staleTemp) {
+		t.Fatal("next maintenance cycle did not resume skipped stale-temp sweep")
+	}
+	if worker.Snapshot().Sequence <= beforeRecovery {
+		t.Fatal("recovered retention/sweep did not record an actual item checkpoint")
 	}
 }
 

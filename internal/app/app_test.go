@@ -17,6 +17,7 @@ import (
 
 	"github.com/tiwb/tg-obs-bot/internal/config"
 	medialib "github.com/tiwb/tg-obs-bot/internal/library"
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/media"
 	"github.com/tiwb/tg-obs-bot/internal/obs"
 	"github.com/tiwb/tg-obs-bot/internal/queue"
@@ -160,6 +161,25 @@ func isolateSingletonUserDirectory(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+}
+
+func TestLibraryScanRecordsBoundariesWithoutSyntheticProgress(t *testing.T) {
+	svc, _ := newLibraryTestService(t)
+	registry := liveness.NewRegistry(liveness.Options{})
+	worker, err := registry.Bind(liveness.WorkerTelegram, liveness.OwnerTelegram)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	worker.Advance(liveness.PhaseOperation)
+	ctx := liveness.WithWorker(context.Background(), worker)
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+	snapshot := worker.Snapshot()
+	if snapshot.Phase != liveness.PhaseOperation || snapshot.Sequence != 3 {
+		t.Fatalf("scan snapshot = %+v, want entry plus restored normal phase", snapshot)
+	}
 }
 
 func TestLibraryPreviewMaterializesNextPeriodPlan(t *testing.T) {
@@ -3557,6 +3577,183 @@ func TestRunReturnsWhenBotStopsUnexpectedly(t *testing.T) {
 	}
 }
 
+func TestRequiredWorkerBindingsKeepFixedPlaybackWireIDAcrossModes(t *testing.T) {
+	tests := []struct {
+		name          string
+		playerMode    string
+		playbackName  string
+		playbackOwner liveness.Owner
+	}{
+		{
+			name:          "queue watchdog",
+			playerMode:    "queue",
+			playbackName:  "playback-watchdog",
+			playbackOwner: liveness.OwnerPlaybackWatchdog,
+		},
+		{
+			name:          "library scheduler",
+			playerMode:    "library",
+			playbackName:  "library-scheduler",
+			playbackOwner: liveness.OwnerLibraryScheduler,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, _, _ := newFallbackTestService(t, config.Config{
+				FallbackMode: "off",
+				PlayerMode:   tt.playerMode,
+			})
+			svc.livenessRegistry = liveness.NewRegistry(liveness.Options{})
+
+			workers, err := svc.prepareRequiredWorkers()
+			if err != nil {
+				t.Fatalf("prepareRequiredWorkers: %v", err)
+			}
+			if len(workers) != liveness.RequiredWorkerCount {
+				t.Fatalf("worker count = %d, want %d", len(workers), liveness.RequiredWorkerCount)
+			}
+
+			seen := make(map[liveness.WorkerID]string, len(workers))
+			for _, worker := range workers {
+				if prior := seen[worker.id]; prior != "" {
+					t.Fatalf("logical worker %s owned by both %s and %s", worker.id, prior, worker.name)
+				}
+				seen[worker.id] = worker.name
+			}
+			if got := seen[liveness.WorkerPlayback]; got != tt.playbackName {
+				t.Fatalf("playback implementation = %q, want %q", got, tt.playbackName)
+			}
+
+			snapshots := svc.livenessRegistry.Snapshots()
+			for index, id := range liveness.RequiredWorkerIDs() {
+				if snapshots[index].ID != id {
+					t.Fatalf("snapshot %d ID = %s, want %s", index, snapshots[index].ID, id)
+				}
+				if snapshots[index].Phase != liveness.PhaseUnknown || snapshots[index].Sequence != 0 {
+					t.Fatalf("snapshot %d pre-launch progress = %+v, want no worker-owned progress", index, snapshots[index])
+				}
+			}
+			playback := snapshots[len(snapshots)-1]
+			if playback.ID != liveness.WorkerPlayback || playback.Owner != tt.playbackOwner {
+				t.Fatalf("playback snapshot = %+v, want fixed ID with owner %s", playback, tt.playbackOwner)
+			}
+		})
+	}
+}
+
+func TestRunFailsBeforeStartingWorkersOnDuplicateLivenessOwner(t *testing.T) {
+	svc, _, fakeBot := newFallbackTestService(t, config.Config{
+		FallbackMode: "off",
+		PlayerMode:   "queue",
+	})
+	registry := liveness.NewRegistry(liveness.Options{})
+	if _, err := registry.Bind(liveness.WorkerTelegram, liveness.OwnerTelegram); err != nil {
+		t.Fatalf("prime registry: %v", err)
+	}
+	svc.livenessRegistry = registry
+	botStarted := false
+	fakeBot.run = func(context.Context) error {
+		botStarted = true
+		return nil
+	}
+
+	err := svc.Run(context.Background())
+	if !errors.Is(err, liveness.ErrDuplicateBinding) {
+		t.Fatalf("Run error = %v, want %v", err, liveness.ErrDuplicateBinding)
+	}
+	if botStarted {
+		t.Fatal("Telegram worker started before liveness ownership validation")
+	}
+}
+
+func TestRunKeepsFourWorkerSequencesIndependentWhenTelegramWorkerStalls(t *testing.T) {
+	svc, fakeOBS, fakeBot := newFallbackTestService(t, config.Config{
+		FallbackMode: "off",
+		PlayerMode:   "queue",
+	})
+	fakeOBS.events = make(chan obs.Event)
+	svc.livenessRegistry = liveness.NewRegistry(liveness.Options{
+		ProgressInterval: 2 * time.Millisecond,
+	})
+	telegramStarted := make(chan struct{})
+	fakeBot.run = func(ctx context.Context) error {
+		close(telegramStarted)
+		// Deliberately do not advance the tracker: this required worker is the
+		// single stalled owner while the other four loops remain schedulable.
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+	select {
+	case <-telegramStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Telegram worker did not start")
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var before [liveness.RequiredWorkerCount]liveness.Snapshot
+	for {
+		before = svc.livenessRegistry.Snapshots()
+		allStarted := true
+		for _, snapshot := range before {
+			if snapshot.Sequence == 0 {
+				allStarted = false
+				break
+			}
+		}
+		if allStarted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("workers did not all start: %+v", before)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	for {
+		after := svc.livenessRegistry.Snapshots()
+		activeAdvanced := true
+		for index, snapshot := range after {
+			if snapshot.ID == liveness.WorkerTelegram {
+				if snapshot.Sequence != before[index].Sequence {
+					t.Fatalf(
+						"stalled Telegram sequence advanced from %d to %d",
+						before[index].Sequence,
+						snapshot.Sequence,
+					)
+				}
+				continue
+			}
+			if snapshot.Sequence <= before[index].Sequence {
+				activeAdvanced = false
+			}
+		}
+		if activeAdvanced {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("four active workers did not advance independently: before=%+v after=%+v", before, after)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error = %v, want cancellation", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not stop after cancellation")
+	}
+}
+
 func TestRunReturnsWhenOBSEventStreamCloses(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS, fakeBot := newFallbackTestService(t, config.Config{FallbackMode: "off"})
@@ -3651,15 +3848,15 @@ func TestRunReportsBlockedMaintenanceDuringFatalShutdown(t *testing.T) {
 	releaseMaintenance := make(chan struct{})
 	maintenanceDone := make(chan struct{})
 	firstMaintenance := true
-	svc.maintenanceFn = func(ctx context.Context) error {
+	svc.maintenanceFn = func(ctx context.Context) maintenanceCycleResult {
 		if !firstMaintenance {
-			return ctx.Err()
+			return maintenanceCycleResult{err: ctx.Err()}
 		}
 		firstMaintenance = false
 		close(maintenanceStarted)
 		<-releaseMaintenance
 		close(maintenanceDone)
-		return nil
+		return maintenanceCycleResult{}
 	}
 
 	errCh := make(chan error, 1)

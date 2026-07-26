@@ -11,6 +11,7 @@ import (
 	"time"
 
 	medialib "github.com/tiwb/tg-obs-bot/internal/library"
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/obs"
 )
 
@@ -27,6 +28,10 @@ func (s *Service) ScanLibrary(ctx context.Context) error {
 }
 
 func (s *Service) scanLibraryLocked(ctx context.Context) error {
+	tracker := liveness.WorkerFromContext(ctx)
+	scanScope := tracker.Scope(liveness.PhaseLibraryScan)
+	defer scanScope.Close()
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -50,21 +55,26 @@ func (s *Service) scanLibraryLocked(ctx context.Context) error {
 }
 
 func (s *Service) librarySchedulerLoop(ctx context.Context) error {
+	tracker := liveness.WorkerFromContext(ctx)
 	retries := newRecurringRetry(librarySchedulerInterval, libraryRetryMaxDelay, s.retryRandom)
 	schedule := newRecurringSchedule(librarySchedulerInterval, false, s.retryClockNow)
 	delay := schedule.delay()
+	waitPhase := liveness.PhaseScheduledWait
 	for {
-		if err := s.waitRecurring(ctx, delay); err != nil {
+		if err := s.waitRecurring(ctx, tracker, waitPhase, delay); err != nil {
 			return err
 		}
+		tracker.Advance(liveness.PhaseOperation)
 		schedule.beginCycle()
 		if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
 			delay = schedule.delay()
+			waitPhase = liveness.PhaseScheduledWait
 			continue
 		}
 		attempted, err := s.reconcileLibraryPlaybackAttempt(ctx)
 		if !attempted {
 			delay = schedule.delay()
+			waitPhase = liveness.PhaseScheduledWait
 			continue
 		}
 		if err != nil {
@@ -75,10 +85,12 @@ func (s *Service) librarySchedulerLoop(ctx context.Context) error {
 			failure := retries.failure()
 			logRecurringFailure(s.logger, "library playback check failed", s.redactError(err), failure)
 			delay = schedule.failureDelay(failure.attempt.Delay)
+			waitPhase = liveness.PhaseRetryWait
 			continue
 		}
 		logRecurringRecovery(s.logger, "library playback recovered", retries.recovery())
 		delay = schedule.delay()
+		waitPhase = liveness.PhaseScheduledWait
 	}
 }
 

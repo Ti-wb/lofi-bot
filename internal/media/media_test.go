@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 )
 
 func TestDownloadRejectsHTTP500(t *testing.T) {
@@ -34,6 +36,31 @@ func TestDownloadRejectsHTTP500(t *testing.T) {
 		t.Fatalf("expected empty metadata, got %#v", meta)
 	}
 	requireNoFiles(t, manager.Dir())
+}
+
+func TestProbeRecordsOnlyEntryAndExitBoundaries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clip.mp4")
+	if err := os.WriteFile(path, []byte("media"), 0o600); err != nil {
+		t.Fatalf("write media: %v", err)
+	}
+	manager, err := NewManager(t.TempDir(), fakeFFProbe(t, "printf '%s\\n' '{\"format\":{\"duration\":\"1\"}}'\n"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	registry := liveness.NewRegistry(liveness.Options{})
+	worker, err := registry.Bind(liveness.WorkerTelegram, liveness.OwnerTelegram)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	worker.Advance(liveness.PhaseOperation)
+
+	if _, err := manager.Probe(liveness.WithWorker(context.Background(), worker), path); err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	snapshot := worker.Snapshot()
+	if snapshot.Phase != liveness.PhaseOperation || snapshot.Sequence != 3 {
+		t.Fatalf("probe snapshot = %+v, want entry plus restored normal phase", snapshot)
+	}
 }
 
 func TestDownloadRejectsContentLengthOverLimit(t *testing.T) {

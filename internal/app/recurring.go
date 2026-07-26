@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	retryloop "github.com/tiwb/tg-obs-bot/internal/retry"
 )
 
@@ -85,6 +86,32 @@ func logRecurringRecovery(logger *slog.Logger, message string, sample retryloop.
 	)
 }
 
+func logMaintenanceDeferred(logger *slog.Logger, sample retryloop.Sample) {
+	if sample.Kind == retryloop.SampleNone {
+		return
+	}
+	attrs := []any{
+		"reason", "worker-lock-contention",
+		"consecutive_deferrals", sample.Consecutive,
+	}
+	if sample.Suppressed > 0 {
+		attrs = append(attrs, "suppressed", sample.Suppressed)
+	}
+	logger.Warn("periodic maintenance deferred", attrs...)
+}
+
+func logMaintenanceDeferredRecovery(logger *slog.Logger, sample retryloop.Sample) {
+	if sample.Kind != retryloop.SampleRecovery {
+		return
+	}
+	logger.Info(
+		"periodic maintenance contention recovered",
+		"reason", "worker-lock-contention",
+		"consecutive_deferrals", sample.Consecutive,
+		"suppressed", sample.Suppressed,
+	)
+}
+
 func logEventFailure(logger *slog.Logger, message string, err error, sample retryloop.Sample) {
 	if sample.Kind == retryloop.SampleNone {
 		return
@@ -99,11 +126,21 @@ func logEventFailure(logger *slog.Logger, message string, err error, sample retr
 	logger.Warn(message, attrs...)
 }
 
-func (s *Service) waitRecurring(ctx context.Context, delay time.Duration) error {
+func (s *Service) waitRecurring(
+	ctx context.Context,
+	tracker *liveness.Worker,
+	phase liveness.Phase,
+	delay time.Duration,
+) error {
 	if s.retrySleep != nil {
-		return s.retrySleep(ctx, delay)
+		tracker.Advance(phase)
+		err := s.retrySleep(ctx, delay)
+		if ctx.Err() != nil {
+			tracker.Advance(liveness.PhaseCancelWait)
+		}
+		return err
 	}
-	return retryloop.Sleep(ctx, delay)
+	return tracker.Wait(ctx, phase, delay)
 }
 
 type recurringSchedule struct {
@@ -161,6 +198,10 @@ func (s *recurringSchedule) beginCycle() {
 }
 
 func (s *recurringSchedule) failureDelay(delay time.Duration) time.Duration {
+	return s.retryDelay(delay)
+}
+
+func (s *recurringSchedule) retryDelay(delay time.Duration) time.Duration {
 	s.retryCycle = true
 	return delay
 }
@@ -177,6 +218,13 @@ func maxRetryDelay(base, configuredMax time.Duration) time.Duration {
 		return base
 	}
 	return configuredMax
+}
+
+func maintenanceDeferredDelay(interval time.Duration) time.Duration {
+	if interval > 0 && interval < maintenanceDeferredMax {
+		return interval
+	}
+	return maintenanceDeferredMax
 }
 
 // eventErrorSampler samples an event-driven error stream without delaying it.

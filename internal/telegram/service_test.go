@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/queue"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -1289,6 +1290,89 @@ func TestRunRetriesGetUpdatesError(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Run did not stop after cancellation")
+	}
+}
+
+func TestRunLivenessAdvancesDuringCappedPollRetryOutage(t *testing.T) {
+	getUpdatesErr := errors.New("local bot api unavailable")
+	bot := &fakeBotAPI{
+		updateResponses: []updateResponse{{err: getUpdatesErr}},
+		updateCalls:     make(chan struct{}, 1),
+	}
+	svc := newTestService(t, bot)
+	// Initial == max makes the first dependency failure a capped-backoff wait.
+	// The deterministic jitter result remains long enough to observe several
+	// worker-owned progress pulses without a successful Telegram response.
+	svc.pollRetryDelay = time.Second
+	svc.pollRetryMaxDelay = time.Second
+	svc.pollProviderHintMax = time.Second
+	svc.retryRandom = func() uint64 { return 0 }
+
+	registry := liveness.NewRegistry(liveness.Options{ProgressInterval: 2 * time.Millisecond})
+	var tracker *liveness.Worker
+	for _, binding := range []struct {
+		id    liveness.WorkerID
+		owner liveness.Owner
+	}{
+		{id: liveness.WorkerTelegram, owner: liveness.OwnerTelegram},
+		{id: liveness.WorkerOBSReconnect, owner: liveness.OwnerOBSReconnect},
+		{id: liveness.WorkerOBSEvents, owner: liveness.OwnerOBSEvents},
+		{id: liveness.WorkerMaintenance, owner: liveness.OwnerMaintenance},
+		{id: liveness.WorkerPlayback, owner: liveness.OwnerPlaybackWatchdog},
+	} {
+		worker, err := registry.Bind(binding.id, binding.owner)
+		if err != nil {
+			t.Fatalf("Bind(%s): %v", binding.id, err)
+		}
+		if binding.id == liveness.WorkerTelegram {
+			tracker = worker
+		}
+	}
+	if err := registry.Seal(liveness.OwnerPlaybackWatchdog); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(liveness.WithWorker(context.Background(), tracker))
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+
+	select {
+	case <-bot.updateCalls:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Telegram outage was not exercised")
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for tracker.Snapshot().Phase != liveness.PhaseRetryWait {
+		if time.Now().After(deadline) {
+			t.Fatalf("worker phase = %s, want retry wait", tracker.Snapshot().Phase)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	start := tracker.Snapshot().Sequence
+	for tracker.Snapshot().Sequence < start+3 {
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"retry sequence = %d, want at least %d without external success",
+				tracker.Snapshot().Sequence,
+				start+3,
+			)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error = %v, want cancellation", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not stop after cancellation")
+	}
+	if bot.updateCallCount != 1 {
+		t.Fatalf("GetUpdates calls = %d, want one failed operation and no success", bot.updateCallCount)
 	}
 }
 

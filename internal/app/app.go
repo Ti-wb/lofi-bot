@@ -16,6 +16,7 @@ import (
 
 	"github.com/tiwb/tg-obs-bot/internal/config"
 	medialib "github.com/tiwb/tg-obs-bot/internal/library"
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/media"
 	"github.com/tiwb/tg-obs-bot/internal/obs"
 	"github.com/tiwb/tg-obs-bot/internal/queue"
@@ -61,13 +62,14 @@ type Service struct {
 	shutdown              []func() error
 	workerStopGrace       time.Duration
 	maintenanceInterval   time.Duration
-	maintenanceFn         func(context.Context) error
+	maintenanceFn         func(context.Context) maintenanceCycleResult
 	retryRandom           func() uint64
 	retrySleep            func(context.Context, time.Duration) error
 	retryNow              func() time.Time
 	playbackNotices       [playbackNoticeKinds]playbackNotice
 	libraryScanLogMu      sync.Mutex
 	libraryScanLog        *eventErrorSampler
+	livenessRegistry      *liveness.Registry
 }
 
 type obsController interface {
@@ -111,6 +113,7 @@ const (
 	mediaCursorEpsilonMillis  = 1.0
 	defaultWorkerStopGrace    = telegram.RecommendedParentDrainGrace
 	defaultMaintenancePeriod  = 10 * time.Minute
+	maintenanceDeferredMax    = time.Minute
 )
 
 var (
@@ -126,6 +129,11 @@ type mediaProgress struct {
 	GenerationStartedAt      time.Time
 	LastProgressAt           time.Time
 	LastDefinitiveProgressAt time.Time
+}
+
+type maintenanceCycleResult struct {
+	deferred bool
+	err      error
 }
 
 type mediaInspection struct {
@@ -232,6 +240,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 		playback:            playbackIdle,
 		workerStopGrace:     defaultWorkerStopGrace,
 		maintenanceInterval: defaultMaintenancePeriod,
+		livenessRegistry:    liveness.NewRegistry(liveness.Options{}),
 		shutdown:            []func() error{instanceLock.Close, obsClient.Close, store.Close},
 	}
 	releaseUnownedLock = false
@@ -266,6 +275,12 @@ func (s *Service) Run(parentCtx context.Context) error {
 	s.logger.Info("tg-obs-bot starting", "database", s.redactString(s.cfg.DatabasePath), "media_dir", s.redactString(s.cfg.MediaDir), "player_mode", s.cfg.PlayerMode)
 	runCtx, cancel := context.WithCancel(parentCtx)
 
+	workers, err := s.prepareRequiredWorkers()
+	if err != nil {
+		cancel()
+		return fmt.Errorf("prepare required workers: %w", err)
+	}
+
 	if err := s.recoverStartupState(runCtx); err != nil {
 		cancel()
 		return err
@@ -277,26 +292,19 @@ func (s *Service) Run(parentCtx context.Context) error {
 		}
 	}
 
-	workers := []serviceWorker{
-		{name: "telegram", run: s.bot.Run},
-		{name: "obs-reconnect", run: s.obsReconnectLoop},
-		{name: "obs-events", run: s.obsEventLoop},
-		{name: "maintenance", run: s.maintenanceLoop},
-	}
-	if s.libraryMode() {
-		workers = append(workers, serviceWorker{name: "library-scheduler", run: s.librarySchedulerLoop})
-	} else {
-		workers = append(workers, serviceWorker{name: "playback-watchdog", run: s.playbackWatchdogLoop})
-	}
-
 	workerResults := make(chan serviceWorkerResult, len(workers))
 	pendingWorkers := make(map[string]struct{}, len(workers))
 	for _, worker := range workers {
 		pendingWorkers[worker.name] = struct{}{}
 		go func(worker serviceWorker) {
-			workerResults <- serviceWorkerResult{name: worker.name, err: worker.run(runCtx)}
+			worker.tracker.Advance(liveness.PhaseStarting)
+			workerCtx := liveness.WithWorker(runCtx, worker.tracker)
+			workerResults <- serviceWorkerResult{name: worker.name, err: worker.run(workerCtx)}
 		}(worker)
 	}
+	// Phase 12b starts the reporter here, after all five worker goroutines have
+	// been launched. Until its first complete frame, the supervisor uses only
+	// a bounded no-frame startup grace; worker progress is never synthesized.
 
 	var runErr error
 run:
@@ -324,13 +332,80 @@ run:
 }
 
 type serviceWorker struct {
-	name string
-	run  func(context.Context) error
+	name    string
+	id      liveness.WorkerID
+	owner   liveness.Owner
+	run     func(context.Context) error
+	tracker *liveness.Worker
 }
 
 type serviceWorkerResult struct {
 	name string
 	err  error
+}
+
+func (s *Service) prepareRequiredWorkers() ([]serviceWorker, error) {
+	registry := s.livenessRegistry
+	if registry == nil {
+		registry = liveness.NewRegistry(liveness.Options{})
+		s.livenessRegistry = registry
+	}
+
+	workers := []serviceWorker{
+		{
+			name:  "telegram",
+			id:    liveness.WorkerTelegram,
+			owner: liveness.OwnerTelegram,
+			run:   s.bot.Run,
+		},
+		{
+			name:  "obs-reconnect",
+			id:    liveness.WorkerOBSReconnect,
+			owner: liveness.OwnerOBSReconnect,
+			run:   s.obsReconnectLoop,
+		},
+		{
+			name:  "obs-events",
+			id:    liveness.WorkerOBSEvents,
+			owner: liveness.OwnerOBSEvents,
+			run:   s.obsEventLoop,
+		},
+		{
+			name:  "maintenance",
+			id:    liveness.WorkerMaintenance,
+			owner: liveness.OwnerMaintenance,
+			run:   s.maintenanceLoop,
+		},
+	}
+	playbackOwner := liveness.OwnerPlaybackWatchdog
+	playbackWorker := serviceWorker{
+		name:  "playback-watchdog",
+		id:    liveness.WorkerPlayback,
+		owner: playbackOwner,
+		run:   s.playbackWatchdogLoop,
+	}
+	if s.libraryMode() {
+		playbackOwner = liveness.OwnerLibraryScheduler
+		playbackWorker = serviceWorker{
+			name:  "library-scheduler",
+			id:    liveness.WorkerPlayback,
+			owner: playbackOwner,
+			run:   s.librarySchedulerLoop,
+		}
+	}
+	workers = append(workers, playbackWorker)
+
+	for index := range workers {
+		tracker, err := registry.Bind(workers[index].id, workers[index].owner)
+		if err != nil {
+			return nil, err
+		}
+		workers[index].tracker = tracker
+	}
+	if err := registry.Seal(playbackOwner); err != nil {
+		return nil, err
+	}
+	return workers, nil
 }
 
 func requiredWorkerError(result serviceWorkerResult) error {
@@ -407,6 +482,7 @@ func onlyContextTermination(err error) bool {
 }
 
 func (s *Service) maintenanceLoop(ctx context.Context) error {
+	tracker := liveness.WorkerFromContext(ctx)
 	interval := s.maintenanceInterval
 	if interval <= 0 {
 		interval = defaultMaintenancePeriod
@@ -417,29 +493,43 @@ func (s *Service) maintenanceLoop(ctx context.Context) error {
 		s.retryRandom,
 	)
 	schedule := newRecurringSchedule(interval, false, s.retryClockNow)
+	deferredSampler := retryloop.NewSampler(recurringLogEvery)
 	delay := schedule.delay()
+	waitPhase := liveness.PhaseScheduledWait
 
 	for {
-		if err := s.waitRecurring(ctx, delay); err != nil {
+		if err := s.waitRecurring(ctx, tracker, waitPhase, delay); err != nil {
 			return err
 		}
+		tracker.Advance(liveness.PhaseOperation)
 		schedule.beginCycle()
-		maintenance := s.maintenanceFn
-		if maintenance == nil {
-			maintenance = s.performMaintenance
+		var result maintenanceCycleResult
+		if s.maintenanceFn != nil {
+			result = s.maintenanceFn(ctx)
+		} else {
+			result = s.performMaintenanceCycle(ctx)
 		}
-		if err := maintenance(ctx); err != nil {
+		if result.err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			s.setLastErr(err)
+			s.setLastErr(result.err)
 			failure := retries.failure()
-			logRecurringFailure(s.logger, "periodic maintenance failed", s.redactError(err), failure)
+			logRecurringFailure(s.logger, "periodic maintenance failed", s.redactError(result.err), failure)
 			delay = schedule.failureDelay(failure.attempt.Delay)
+			waitPhase = liveness.PhaseRetryWait
 			continue
 		}
+		if result.deferred {
+			delay = schedule.retryDelay(maintenanceDeferredDelay(interval))
+			logMaintenanceDeferred(s.logger, deferredSampler.Failure())
+			waitPhase = liveness.PhaseScheduledWait
+			continue
+		}
+		logMaintenanceDeferredRecovery(s.logger, deferredSampler.Recovery())
 		logRecurringRecovery(s.logger, "periodic maintenance recovered", retries.recovery())
 		delay = schedule.delay()
+		waitPhase = liveness.PhaseScheduledWait
 	}
 }
 
@@ -1318,24 +1408,30 @@ func (s *Service) telegramHooks() telegram.Hooks {
 }
 
 func (s *Service) obsReconnectLoop(ctx context.Context) error {
+	tracker := liveness.WorkerFromContext(ctx)
 	retries := newOBSRetryState(s.retryRandom)
 	schedule := newRecurringSchedule(obsReconnectInterval, true, s.retryClockNow)
 	delay := schedule.delay()
+	waitPhase := liveness.PhaseScheduledWait
 	for {
 		if delay > 0 {
-			if err := s.waitRecurring(ctx, delay); err != nil {
+			if err := s.waitRecurring(ctx, tracker, waitPhase, delay); err != nil {
 				return err
 			}
 		} else if err := ctx.Err(); err != nil {
+			tracker.Advance(liveness.PhaseCancelWait)
 			return err
 		}
+		tracker.Advance(liveness.PhaseOperation)
 		schedule.beginCycle()
 		result := s.maintainOBSConnection(ctx)
 		delay = s.observeOBSResult(retries, result)
 		if result.failure == obsRetryNone || result.err == nil {
 			delay = schedule.delay()
+			waitPhase = liveness.PhaseScheduledWait
 		} else {
 			delay = schedule.failureDelay(delay)
+			waitPhase = liveness.PhaseRetryWait
 		}
 	}
 }
@@ -1412,21 +1508,26 @@ func (s *Service) maintainOBSConnection(ctx context.Context) obsMaintenanceResul
 }
 
 func (s *Service) playbackWatchdogLoop(ctx context.Context) error {
+	tracker := liveness.WorkerFromContext(ctx)
 	retries := newRecurringRetry(playbackWatchdogInterval, watchdogRetryMaxDelay, s.retryRandom)
 	schedule := newRecurringSchedule(playbackWatchdogInterval, false, s.retryClockNow)
 	delay := schedule.delay()
+	waitPhase := liveness.PhaseScheduledWait
 	for {
-		if err := s.waitRecurring(ctx, delay); err != nil {
+		if err := s.waitRecurring(ctx, tracker, waitPhase, delay); err != nil {
 			return err
 		}
+		tracker.Advance(liveness.PhaseOperation)
 		schedule.beginCycle()
 		if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
 			delay = schedule.delay()
+			waitPhase = liveness.PhaseScheduledWait
 			continue
 		}
 		attempted, err := s.checkPlaybackWatchdogAttempt(ctx)
 		if !attempted {
 			delay = schedule.delay()
+			waitPhase = liveness.PhaseScheduledWait
 			continue
 		}
 		if err != nil {
@@ -1437,10 +1538,12 @@ func (s *Service) playbackWatchdogLoop(ctx context.Context) error {
 			failure := retries.failure()
 			logRecurringFailure(s.logger, "playback watchdog failed", s.redactError(err), failure)
 			delay = schedule.failureDelay(failure.attempt.Delay)
+			waitPhase = liveness.PhaseRetryWait
 			continue
 		}
 		logRecurringRecovery(s.logger, "playback watchdog recovered", retries.recovery())
 		delay = schedule.delay()
+		waitPhase = liveness.PhaseScheduledWait
 	}
 }
 
@@ -1537,16 +1640,25 @@ func (s *Service) checkPlaybackWatchdogAttempt(ctx context.Context) (bool, error
 }
 
 func (s *Service) obsEventLoop(ctx context.Context) error {
+	tracker := liveness.WorkerFromContext(ctx)
 	events := s.obs.Events()
 	libraryFailures := newEventErrorSampler()
 	queueFailures := newEventErrorSampler()
+	progress := time.NewTicker(tracker.ProgressInterval())
+	defer progress.Stop()
 	for {
+		tracker.Advance(liveness.PhaseEventWait)
 		select {
 		case <-ctx.Done():
+			tracker.Advance(liveness.PhaseCancelWait)
 			return ctx.Err()
+		case <-progress.C:
+			continue
 		case event, ok := <-events:
+			tracker.Advance(liveness.PhaseOperation)
 			if !ok {
 				if err := ctx.Err(); err != nil {
+					tracker.Advance(liveness.PhaseCancelWait)
 					return err
 				}
 				return errors.New("OBS event stream closed")
@@ -1693,11 +1805,18 @@ func (s *Service) recoverStartupState(ctx context.Context) error {
 }
 
 func (s *Service) performMaintenance(ctx context.Context) error {
+	return s.performMaintenanceCycle(ctx).err
+}
+
+func (s *Service) performMaintenanceCycle(ctx context.Context) maintenanceCycleResult {
 	staleErr := s.failStaleDownloading(ctx, "periodic recovery: stale downloading item")
-	retentionErr := s.CleanupRetention(ctx)
+	retentionAttempted, retentionErr := s.tryCleanupRetention(ctx)
 	_, _, journalErr := s.store.PruneTelegramUpdateJournal(ctx)
-	tempErr := s.sweepStaleLibraryImportTemps(ctx)
-	return errors.Join(staleErr, retentionErr, journalErr, tempErr)
+	tempAttempted, tempErr := s.trySweepStaleLibraryImportTemps(ctx)
+	return maintenanceCycleResult{
+		deferred: !retentionAttempted || !tempAttempted,
+		err:      errors.Join(staleErr, retentionErr, journalErr, tempErr),
+	}
 }
 
 func (s *Service) failStaleDownloading(ctx context.Context, cause string) error {
@@ -1726,6 +1845,47 @@ func (s *Service) CleanupRetention(ctx context.Context) error {
 		defer s.storageMu.Unlock()
 		report, err = s.cleanupRetentionLocked(ctx, maxAge, maxFiles)
 	}()
+	s.logRetentionCleanupReport(report)
+	return err
+}
+
+// tryCleanupRetention is used only by the recurring maintenance worker. It
+// preserves the playback-before-storage lock order but skips this cycle rather
+// than letting one required worker form a lock convoy behind another.
+func (s *Service) tryCleanupRetention(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return true, err
+	}
+	maxAge := s.cfg.RetentionMaxAge()
+	maxFiles := s.cfg.RetentionMaxFiles
+	if maxAge <= 0 && maxFiles <= 0 {
+		return true, nil
+	}
+	if !s.playbackMu.TryLock() {
+		return false, nil
+	}
+	var (
+		report     retentionCleanupReport
+		cleanupErr error
+		attempted  bool
+	)
+	func() {
+		defer s.playbackMu.Unlock()
+		if !s.storageMu.TryLock() {
+			return
+		}
+		defer s.storageMu.Unlock()
+		attempted = true
+		report, cleanupErr = s.cleanupRetentionLocked(ctx, maxAge, maxFiles)
+	}()
+	if !attempted {
+		return false, nil
+	}
+	s.logRetentionCleanupReport(report)
+	return true, cleanupErr
+}
+
+func (s *Service) logRetentionCleanupReport(report retentionCleanupReport) {
 	if report.skippedLocalDeletes > 0 {
 		s.logger.Warn(
 			"skip retention local file deletes",
@@ -1735,7 +1895,6 @@ func (s *Service) CleanupRetention(ctx context.Context) error {
 			"first_error", report.firstSkipError,
 		)
 	}
-	return err
 }
 
 type retentionCleanupReport struct {
@@ -1833,9 +1992,11 @@ func (s *Service) cleanupTerminalGroup(
 		return 0, 0, err
 	}
 	deletedCount := 0
+	tracker := liveness.WorkerFromContext(ctx)
 	for _, video := range videos {
 		expired := !cutoff.IsZero() && terminalTime(video).Before(cutoff)
 		excess := maxFiles > 0 && count > maxFiles
+		tracker.Advance(liveness.PhaseOperation)
 		if !expired && !excess {
 			continue
 		}
@@ -1886,6 +2047,7 @@ func (s *Service) cleanupTerminalGroup(
 		}
 		count--
 		deletedCount++
+		tracker.Advance(liveness.PhaseOperation)
 	}
 	return len(videos), deletedCount, nil
 }

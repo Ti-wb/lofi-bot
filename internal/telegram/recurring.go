@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	retryloop "github.com/tiwb/tg-obs-bot/internal/retry"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -66,11 +67,16 @@ func (s *pollRetryState) recovery() retryloop.Sample {
 	return s.sampler.Recovery()
 }
 
-func (s *Service) waitPollRetry(ctx context.Context, delay time.Duration) error {
+func (s *Service) waitPollRetry(ctx context.Context, tracker *liveness.Worker, delay time.Duration) error {
 	if s.pollSleep != nil {
-		return s.pollSleep(ctx, delay)
+		tracker.Advance(liveness.PhaseRetryWait)
+		err := s.pollSleep(ctx, delay)
+		if ctx.Err() != nil {
+			tracker.Advance(liveness.PhaseCancelWait)
+		}
+		return err
 	}
-	return retryloop.Sleep(ctx, delay)
+	return tracker.Wait(ctx, liveness.PhaseRetryWait, delay)
 }
 
 func (s *Service) logPollFailure(err error, attempt retryloop.Attempt, sample retryloop.Sample) {
