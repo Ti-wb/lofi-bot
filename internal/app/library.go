@@ -60,10 +60,10 @@ func (s *Service) librarySchedulerLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if s.obs.Status().State != obs.StateConnected {
+			if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
 				continue
 			}
-			if err := s.ensureLibraryPlayback(ctx, false); err != nil {
+			if err := s.reconcileLibraryPlayback(ctx); err != nil {
 				s.setLastErr(err)
 				s.logger.Warn("library playback check failed", "error", s.redactError(err))
 			}
@@ -72,31 +72,42 @@ func (s *Service) librarySchedulerLoop(ctx context.Context) {
 }
 
 func (s *Service) recoverLibraryPlaybackAfterOBSConnect(ctx context.Context) error {
-	if err := s.ScanLibrary(ctx); err != nil {
+	s.playbackMu.Lock()
+	defer s.playbackMu.Unlock()
+
+	if err := s.scanLibraryLocked(ctx); err != nil {
 		s.logger.Warn("media library scan found issues during OBS recovery", "error", s.redactError(err))
 	}
-	return s.ensureLibraryPlayback(ctx, false)
+	return s.reconcileLibraryPlaybackLocked(ctx, true)
 }
 
 func (s *Service) handleLibraryOBSEvent(ctx context.Context, event obs.Event) error {
-	switch event.InputName {
-	case s.cfg.OBSMusicSourceName:
-		return s.playNextMusic(ctx, true)
-	case s.cfg.OBSLoopSourceName:
-		return s.restartLibraryLoop(ctx)
-	default:
+	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
 		return nil
 	}
+	s.playbackMu.Lock()
+	defer s.playbackMu.Unlock()
+	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
+		return nil
+	}
+	return s.reconcileLibrarySourceLocked(ctx, event.InputName, false)
 }
 
 func (s *Service) restartLibraryLoop(ctx context.Context) error {
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
+	return s.restartLibraryLoopLocked(ctx)
+}
 
+func (s *Service) restartLibraryLoopLocked(ctx context.Context) error {
 	loop, info, _, err := s.loopForTimeLocked(ctx, s.now(), false)
 	if err != nil {
 		return err
 	}
+	return s.playLibraryLoopLocked(ctx, loop, info)
+}
+
+func (s *Service) playLibraryLoopLocked(ctx context.Context, loop medialib.Loop, info medialib.PeriodInfo) error {
 	looping := true
 	mute := true
 	if err := s.obs.PlaySourceFile(ctx, s.cfg.OBSLoopSourceName, loop.Path, obs.PlaySourceOptions{
@@ -107,6 +118,7 @@ func (s *Service) restartLibraryLoop(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	s.resetMediaProgressLocked(s.cfg.OBSLoopSourceName, loop.Path)
 	s.activeLoopID = loop.ID
 	s.activeLoopPath = loop.Path
 	s.activeLoopTheme = loop.Theme
@@ -114,6 +126,87 @@ func (s *Service) restartLibraryLoop(ctx context.Context) error {
 	s.activeLoopEndsAt = info.EndsAt
 	s.setPlaybackState(playbackFile, 0, loop.Path)
 	return nil
+}
+
+func (s *Service) reconcileLibraryPlayback(ctx context.Context) error {
+	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
+		return nil
+	}
+	s.playbackMu.Lock()
+	defer s.playbackMu.Unlock()
+	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
+		return nil
+	}
+	return s.reconcileLibraryPlaybackLocked(ctx, false)
+}
+
+func (s *Service) reconcileLibraryPlaybackLocked(ctx context.Context, recovering bool) error {
+	previousLoopID := s.activeLoopID
+	previousLoopPath := s.activeLoopPath
+	previousMusicID := s.activeMusicID
+	previousMusicPath := s.activeMusicPath
+	if err := s.ensureLibraryPlaybackLocked(ctx, false); err != nil {
+		return err
+	}
+
+	var reconcileErr error
+	if previousLoopID == s.activeLoopID && previousLoopPath == s.activeLoopPath && s.activeLoopPath != "" {
+		reconcileErr = s.reconcileLibrarySourceLocked(ctx, s.cfg.OBSLoopSourceName, recovering)
+	}
+	if reconcileErr != nil && s.obs.Status().State != obs.StateConnected {
+		return reconcileErr
+	}
+	if previousMusicID == s.activeMusicID && previousMusicPath == s.activeMusicPath && s.activeMusicPath != "" {
+		reconcileErr = errors.Join(reconcileErr, s.reconcileLibrarySourceLocked(ctx, s.cfg.OBSMusicSourceName, recovering))
+	}
+	return reconcileErr
+}
+
+func (s *Service) reconcileLibrarySourceLocked(ctx context.Context, inputName string, recovering bool) error {
+	if inputName != s.cfg.OBSLoopSourceName && inputName != s.cfg.OBSMusicSourceName {
+		return nil
+	}
+
+	expectedPath := s.activeLoopPath
+	if inputName == s.cfg.OBSMusicSourceName {
+		expectedPath = s.activeMusicPath
+	}
+	inspection, err := s.inspectMediaInputLocked(ctx, inputName, expectedPath)
+	if err != nil {
+		return err
+	}
+	if inspection.PathMismatch || inspection.Stalled {
+		if inspection.PathMismatch && inspection.Settling && !recovering {
+			return nil
+		}
+		if inputName == s.cfg.OBSLoopSourceName {
+			return s.restartLibraryLoopLocked(ctx)
+		}
+		return s.replayActiveMusicLocked(ctx)
+	}
+	switch inspection.Status.State {
+	case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering:
+		return nil
+	case obs.MediaStateStopped, obs.MediaStateEnded, obs.MediaStateError:
+		if inspection.Settling && !recovering {
+			return nil
+		}
+	case obs.MediaStateNone, obs.MediaStatePaused:
+	default:
+		return fmt.Errorf("OBS media source %s returned unknown state %q", inputName, inspection.Status.State)
+	}
+
+	if expectedPath == "" {
+		return nil
+	}
+
+	if inputName == s.cfg.OBSLoopSourceName {
+		return s.restartLibraryLoopLocked(ctx)
+	}
+	if !recovering && (inspection.Status.State == obs.MediaStateStopped || inspection.Status.State == obs.MediaStateEnded || inspection.Status.State == obs.MediaStateError) {
+		return s.playNextMusicLocked(ctx, true)
+	}
+	return s.replayActiveMusicLocked(ctx)
 }
 
 func (s *Service) ensureLibraryPlayback(ctx context.Context, forceLoop bool) error {
@@ -137,22 +230,9 @@ func (s *Service) ensureLibraryPlaybackLocked(ctx context.Context, forceLoop boo
 		return err
 	}
 	if forceLoop || s.activeLoopID != loop.ID || s.activeLoopPath != loop.Path || now.After(s.activeLoopEndsAt) || now.Equal(s.activeLoopEndsAt) {
-		looping := true
-		mute := true
-		if err := s.obs.PlaySourceFile(ctx, s.cfg.OBSLoopSourceName, loop.Path, obs.PlaySourceOptions{
-			Restart:         true,
-			Looping:         &looping,
-			Mute:            &mute,
-			CenterSceneItem: true,
-		}); err != nil {
+		if err := s.playLibraryLoopLocked(ctx, loop, info); err != nil {
 			return err
 		}
-		s.activeLoopID = loop.ID
-		s.activeLoopPath = loop.Path
-		s.activeLoopTheme = loop.Theme
-		s.activeLoopPeriod = loop.Period
-		s.activeLoopEndsAt = info.EndsAt
-		s.setPlaybackState(playbackFile, 0, loop.Path)
 	}
 
 	if s.activeMusicID == "" || s.activeMusicPath == "" {
@@ -184,6 +264,27 @@ func (s *Service) playNextMusicLocked(ctx context.Context, force bool) error {
 	if err != nil {
 		return nil
 	}
+	if err := s.playMusicAssetLocked(ctx, music); err != nil {
+		return err
+	}
+	if err := s.libDB.SetLastMusicID(ctx, music.ID); err != nil && force {
+		return err
+	}
+	return nil
+}
+
+func (s *Service) replayActiveMusicLocked(ctx context.Context) error {
+	if s.activeMusicID != "" && s.activeMusicPath != "" {
+		if music, ok := s.findMusicByID(s.activeMusicID); ok && music.Path == s.activeMusicPath {
+			return s.playMusicAssetLocked(ctx, music)
+		}
+	}
+	s.activeMusicID = ""
+	s.activeMusicPath = ""
+	return s.playNextMusicLocked(ctx, false)
+}
+
+func (s *Service) playMusicAssetLocked(ctx context.Context, music medialib.Music) error {
 	looping := false
 	mute := false
 	if err := s.obs.PlaySourceFile(ctx, s.cfg.OBSMusicSourceName, music.Path, obs.PlaySourceOptions{
@@ -194,11 +295,9 @@ func (s *Service) playNextMusicLocked(ctx context.Context, force bool) error {
 	}); err != nil {
 		return err
 	}
+	s.resetMediaProgressLocked(s.cfg.OBSMusicSourceName, music.Path)
 	s.activeMusicID = music.ID
 	s.activeMusicPath = music.Path
-	if err := s.libDB.SetLastMusicID(ctx, music.ID); err != nil && force {
-		return err
-	}
 	return nil
 }
 
@@ -305,6 +404,15 @@ func (s *Service) findLoopByID(id string) (medialib.Loop, bool) {
 		}
 	}
 	return medialib.Loop{}, false
+}
+
+func (s *Service) findMusicByID(id string) (medialib.Music, bool) {
+	for _, music := range s.librarySnapshot.Music {
+		if music.ID == id {
+			return music, true
+		}
+	}
+	return medialib.Music{}, false
 }
 
 func periodPlanDate(t time.Time, period medialib.Period) string {

@@ -111,17 +111,22 @@ func TestClientConnectHandshakeTimeoutDisconnects(t *testing.T) {
 func TestWaitWriteJSONTimeoutClosesConnection(t *testing.T) {
 	releaseWrite := make(chan struct{})
 	closed := make(chan struct{}, 1)
+	writeReturned := make(chan struct{})
+	var releaseOnce sync.Once
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
 	err := waitWriteJSON(context.Background(), timeoutCtx, func() error {
 		<-releaseWrite
+		close(writeReturned)
 		return nil
 	}, func() error {
+		releaseOnce.Do(func() {
+			close(releaseWrite)
+		})
 		closed <- struct{}{}
 		return nil
 	})
-	close(releaseWrite)
 
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("wait write error = %v, want context deadline exceeded", err)
@@ -130,6 +135,252 @@ func TestWaitWriteJSONTimeoutClosesConnection(t *testing.T) {
 	case <-closed:
 	default:
 		t.Fatal("close function was not called on timeout")
+	}
+	select {
+	case <-writeReturned:
+	default:
+		t.Fatal("waitWriteJSON returned before the blocked write exited")
+	}
+}
+
+func TestClientProbeSendsGetVersion(t *testing.T) {
+	requests := make(chan requestDataPayload, 1)
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		req, err := readRequest(conn)
+		if err != nil {
+			return err
+		}
+		requests <- req
+		return writeEnvelope(conn, successfulRequestResponse(req))
+	})
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
+
+	if err := client.Probe(context.Background()); err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	req := receiveRequest(t, requests)
+	if req.RequestType != "GetVersion" {
+		t.Fatalf("request type = %q, want GetVersion", req.RequestType)
+	}
+}
+
+func TestClientProbeRequestFailureIsTypedAndKeepsConnection(t *testing.T) {
+	releaseServer := make(chan struct{})
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		req, err := readRequest(conn)
+		if err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, failedRequestResponse(req, "not available", 500)); err != nil {
+			return err
+		}
+		<-releaseServer
+		return nil
+	})
+	defer server.Close()
+	defer close(releaseServer)
+
+	client := newTestClient(t, server.URL, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
+
+	err := client.Probe(context.Background())
+	var requestErr *RequestError
+	if !errors.As(err, &requestErr) {
+		t.Fatalf("Probe error = %T %v, want *RequestError", err, err)
+	}
+	if requestErr.RequestType != "GetVersion" || requestErr.Code != 500 || requestErr.Comment != "not available" {
+		t.Fatalf("request error = %#v", requestErr)
+	}
+	if got := client.Status().State; got != StateConnected {
+		t.Fatalf("state = %s, want %s after OBS response", got, StateConnected)
+	}
+}
+
+func TestClientGetMediaInputStatusDecodesOfficialStatesAndTiming(t *testing.T) {
+	requests := make(chan requestDataPayload, 1)
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		req, err := readRequest(conn)
+		if err != nil {
+			return err
+		}
+		requests <- req
+		response := requestResponseData{
+			RequestType: req.RequestType,
+			RequestID:   req.RequestID,
+			RequestStatus: requestStatus{
+				Result: true,
+			},
+			ResponseData: mustMarshal(map[string]any{
+				"mediaState":    MediaStateBuffering,
+				"mediaDuration": 1234.5,
+				"mediaCursor":   678.25,
+			}),
+		}
+		return writeEnvelope(conn, envelope{Op: opRequestResponse, D: mustMarshal(response)})
+	})
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
+
+	status, err := client.GetMediaInputStatus(context.Background(), "music")
+	if err != nil {
+		t.Fatalf("GetMediaInputStatus: %v", err)
+	}
+	req := receiveRequest(t, requests)
+	if req.RequestType != "GetMediaInputStatus" {
+		t.Fatalf("request type = %q, want GetMediaInputStatus", req.RequestType)
+	}
+	if got := req.RequestData["inputName"]; got != "music" {
+		t.Fatalf("inputName = %v, want music", got)
+	}
+	if status.State != MediaStateBuffering {
+		t.Fatalf("state = %q, want %q", status.State, MediaStateBuffering)
+	}
+	if status.DurationMilliseconds == nil || *status.DurationMilliseconds != 1234.5 {
+		t.Fatalf("duration = %v, want 1234.5", status.DurationMilliseconds)
+	}
+	if status.CursorMilliseconds == nil || *status.CursorMilliseconds != 678.25 {
+		t.Fatalf("cursor = %v, want 678.25", status.CursorMilliseconds)
+	}
+}
+
+func TestClientGetInputSettingsDecodesMediaLocalFile(t *testing.T) {
+	requests := make(chan requestDataPayload, 1)
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		req, err := readRequest(conn)
+		if err != nil {
+			return err
+		}
+		requests <- req
+		response := requestResponseData{
+			RequestType: req.RequestType,
+			RequestID:   req.RequestID,
+			RequestStatus: requestStatus{
+				Result: true,
+			},
+			ResponseData: mustMarshal(map[string]any{
+				"inputSettings": map[string]any{
+					"local_file": "/media/current.mp4",
+					"looping":    false,
+				},
+				"inputKind": "ffmpeg_source",
+			}),
+		}
+		return writeEnvelope(conn, envelope{Op: opRequestResponse, D: mustMarshal(response)})
+	})
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
+
+	settings, err := client.GetInputSettings(context.Background(), "media")
+	if err != nil {
+		t.Fatalf("GetInputSettings: %v", err)
+	}
+	req := receiveRequest(t, requests)
+	if req.RequestType != "GetInputSettings" {
+		t.Fatalf("request type = %q, want GetInputSettings", req.RequestType)
+	}
+	if got := req.RequestData["inputName"]; got != "media" {
+		t.Fatalf("inputName = %v, want media", got)
+	}
+	if settings.LocalFile != "/media/current.mp4" {
+		t.Fatalf("local file = %q, want /media/current.mp4", settings.LocalFile)
+	}
+	if settings.InputKind != "ffmpeg_source" {
+		t.Fatalf("input kind = %q, want ffmpeg_source", settings.InputKind)
+	}
+}
+
+func TestMediaStateConstantsMatchOBSWebSocketProtocol(t *testing.T) {
+	got := []MediaState{
+		MediaStateNone,
+		MediaStatePlaying,
+		MediaStateOpening,
+		MediaStateBuffering,
+		MediaStatePaused,
+		MediaStateStopped,
+		MediaStateEnded,
+		MediaStateError,
+	}
+	want := []MediaState{
+		"OBS_MEDIA_STATE_NONE",
+		"OBS_MEDIA_STATE_PLAYING",
+		"OBS_MEDIA_STATE_OPENING",
+		"OBS_MEDIA_STATE_BUFFERING",
+		"OBS_MEDIA_STATE_PAUSED",
+		"OBS_MEDIA_STATE_STOPPED",
+		"OBS_MEDIA_STATE_ENDED",
+		"OBS_MEDIA_STATE_ERROR",
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("state constant %d = %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 
@@ -669,7 +920,7 @@ func TestClientEmitsPlayedSourceEndedEventWithPathAndIgnoresUnrelatedInputs(t *t
 	assertNoCurrentFile(t, client, "music")
 }
 
-func TestClientRequestTimeoutClearsPendingAndDisconnects(t *testing.T) {
+func TestClientProbeTimeoutClearsPendingAndDisconnects(t *testing.T) {
 	requestReceived := make(chan struct{}, 1)
 	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
 		if err := readIdentify(conn); err != nil {
@@ -688,7 +939,7 @@ func TestClientRequestTimeoutClearsPendingAndDisconnects(t *testing.T) {
 	})
 	defer server.Close()
 
-	client := newTestClient(t, server.URL, 20*time.Millisecond)
+	client := newTestClient(t, server.URL, 100*time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := client.Connect(ctx); err != nil {
@@ -700,7 +951,7 @@ func TestClientRequestTimeoutClearsPendingAndDisconnects(t *testing.T) {
 		}
 	}()
 
-	err := client.request(context.Background(), "GetVersion", nil)
+	err := client.Probe(context.Background())
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("request error = %v, want context deadline exceeded", err)
 	}
@@ -719,6 +970,151 @@ func TestClientRequestTimeoutClearsPendingAndDisconnects(t *testing.T) {
 	if got := client.Status().State; got != StateDisconnected {
 		t.Fatalf("state = %s, want %s", got, StateDisconnected)
 	}
+}
+
+func TestClientProbeTimeoutDisconnectsAndAllowsReconnect(t *testing.T) {
+	var connectionMu sync.Mutex
+	connectionCount := 0
+	secondProbe := make(chan struct{}, 1)
+	releaseSecond := make(chan struct{})
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		connectionMu.Lock()
+		connectionCount++
+		connectionNumber := connectionCount
+		connectionMu.Unlock()
+
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		req, err := readRequest(conn)
+		if err != nil {
+			return err
+		}
+		if connectionNumber == 1 {
+			var msg envelope
+			_ = conn.ReadJSON(&msg)
+			return nil
+		}
+		if err := writeEnvelope(conn, successfulRequestResponse(req)); err != nil {
+			return err
+		}
+		secondProbe <- struct{}{}
+		<-releaseSecond
+		return nil
+	})
+	defer server.Close()
+	defer close(releaseSecond)
+
+	client := newTestClient(t, server.URL, 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	if err := client.Probe(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Probe error = %v, want deadline exceeded", err)
+	}
+	if got := client.Status().State; got != StateDisconnected {
+		t.Fatalf("state after timeout = %s, want %s", got, StateDisconnected)
+	}
+
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+	if err := client.Probe(context.Background()); err != nil {
+		t.Fatalf("second Probe: %v", err)
+	}
+	waitForSignal(t, secondProbe, "server did not receive second-connection probe")
+	if got := client.Status().State; got != StateConnected {
+		t.Fatalf("state after reconnect = %s, want %s", got, StateConnected)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestClientCloseUnblocksInFlightProbe(t *testing.T) {
+	requestReceived := make(chan struct{}, 1)
+	releaseServer := make(chan struct{})
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		if _, err := readRequest(conn); err != nil {
+			return err
+		}
+		requestReceived <- struct{}{}
+		<-releaseServer
+		return nil
+	})
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- client.Probe(context.Background())
+	}()
+	waitForSignal(t, requestReceived, "server did not receive probe")
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := receiveError(t, errCh); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Probe error = %v, want ErrClosed", err)
+	}
+	assertNoPending(t, client)
+	close(releaseServer)
+}
+
+func TestClientCloseUnblocksProbeWaitingForWriteGate(t *testing.T) {
+	releaseServer := make(chan struct{})
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		<-releaseServer
+		return nil
+	})
+	defer server.Close()
+	defer close(releaseServer)
+
+	client := newTestClient(t, server.URL, time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	client.writeGate <- struct{}{}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- client.Probe(context.Background())
+	}()
+	waitForPendingCount(t, client, 1)
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := receiveError(t, errCh); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Probe error = %v, want ErrClosed", err)
+	}
+	<-client.writeGate
+	assertNoPending(t, client)
 }
 
 func TestClientRequestCallerCancelClearsPendingWithoutDisconnect(t *testing.T) {
@@ -1064,6 +1460,27 @@ func assertNoPending(t *testing.T, client *Client) {
 	client.mu.Unlock()
 	if pending != 0 {
 		t.Fatalf("pending request count = %d, want 0", pending)
+	}
+}
+
+func waitForPendingCount(t *testing.T, client *Client, want int) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		client.mu.Lock()
+		pending := len(client.pending)
+		client.mu.Unlock()
+		if pending == want {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("pending request count = %d, want %d", pending, want)
+		case <-ticker.C:
+		}
 	}
 }
 

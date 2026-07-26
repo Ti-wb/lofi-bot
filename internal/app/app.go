@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tiwb/tg-obs-bot/internal/config"
@@ -32,29 +33,34 @@ type Service struct {
 	now    func() time.Time
 	rng    *rand.Rand
 
-	mu                   sync.Mutex
-	playbackMu           sync.Mutex
-	lastErr              string
-	playback             playbackKind
-	randomFallbackID     int64
-	randomFallbackPath   string
-	randomFallbackNotice bool
-	librarySnapshot      medialib.Library
-	libraryScanErr       string
-	activeLoopID         string
-	activeLoopPath       string
-	activeLoopTheme      string
-	activeLoopPeriod     medialib.Period
-	activeLoopEndsAt     time.Time
-	activeMusicID        string
-	activeMusicPath      string
-	shutdown             []func() error
+	mu                    sync.Mutex
+	playbackMu            sync.Mutex
+	lastErr               string
+	playback              playbackKind
+	randomFallbackID      int64
+	randomFallbackPath    string
+	randomFallbackNotice  bool
+	librarySnapshot       medialib.Library
+	libraryScanErr        string
+	activeLoopID          string
+	activeLoopPath        string
+	activeLoopTheme       string
+	activeLoopPeriod      medialib.Period
+	activeLoopEndsAt      time.Time
+	activeMusicID         string
+	activeMusicPath       string
+	mediaProgressByInput  map[string]mediaProgress
+	obsRecoveryInProgress atomic.Bool
+	shutdown              []func() error
 }
 
 type obsController interface {
 	Connect(context.Context) error
 	Close() error
 	Events() <-chan obs.Event
+	Probe(context.Context) error
+	GetMediaInputStatus(context.Context, string) (obs.MediaInputStatus, error)
+	GetInputSettings(context.Context, string) (obs.InputSettings, error)
 	PlayFile(context.Context, string) error
 	PlaySourceFile(context.Context, string, string, obs.PlaySourceOptions) error
 	StopCurrent(context.Context) error
@@ -77,12 +83,32 @@ const (
 
 	playbackWatchdogInterval = 30 * time.Second
 	playbackWatchdogGrace    = 60 * time.Second
-	obsEndedEarlyTolerance   = 2 * time.Second
+	obsEndedEventSettleGrace = 2 * time.Second
 	staleDownloadingAge      = 6 * time.Hour
 	obsConnectAttemptTimeout = 15 * time.Second
 	uploadProbeTimeout       = 2 * time.Minute
 	uploadFailureTimeout     = 5 * time.Second
+	mediaProgressGrace       = 2 * time.Minute
+	mediaProgressHardGrace   = 2 * mediaProgressGrace
+	mediaCursorEpsilonMillis = 1.0
 )
+
+type mediaProgress struct {
+	Path                     string
+	State                    obs.MediaState
+	CursorMillis             float64
+	HasCursor                bool
+	GenerationStartedAt      time.Time
+	LastProgressAt           time.Time
+	LastDefinitiveProgressAt time.Time
+}
+
+type mediaInspection struct {
+	Status       obs.MediaInputStatus
+	PathMismatch bool
+	Stalled      bool
+	Settling     bool
+}
 
 type UploadRequest struct {
 	LocalPath        string
@@ -401,6 +427,7 @@ func (s *Service) advancePlaybackLockedAfter(ctx context.Context, expectedCurren
 			s.setLastErr(err)
 			return nil, err
 		}
+		s.resetMediaProgressLocked(s.cfg.OBSMediaSourceName, video.LocalPath)
 		s.setPlaybackState(playbackNormal, 0, "")
 		return &playing, nil
 	}
@@ -443,6 +470,15 @@ func (s *Service) recoverPlaybackAfterOBSConnect(ctx context.Context) error {
 		return err
 	}
 	if current == nil {
+		switch s.playbackState() {
+		case playbackRandom, playbackFile:
+			err := s.recoverFallbackPlaybackLocked(ctx)
+			if err != nil {
+				s.setPlaybackState(playbackIdle, 0, "")
+				return err
+			}
+			return nil
+		}
 		s.setPlaybackState(playbackIdle, 0, "")
 		return s.playIfIdleLocked(ctx)
 	}
@@ -456,18 +492,301 @@ func (s *Service) recoverPlaybackAfterOBSConnect(ctx context.Context) error {
 		s.setPlaybackState(playbackIdle, 0, "")
 		return s.playIfIdleLocked(ctx)
 	}
+	if s.playbackState() == playbackNormal {
+		err := s.recoverCurrentQueuePlaybackLocked(ctx, *current)
+		if err != nil {
+			s.setPlaybackState(playbackIdle, 0, "")
+			return err
+		}
+		return nil
+	}
+	return s.restartCurrentQueuePlaybackLocked(ctx, *current)
+}
+
+// Reconnect recovery must not consume the queue. A terminal OBS state can
+// belong to the connection that just failed, so replay the persisted current
+// item unless the matching source is observably healthy and progressing.
+func (s *Service) recoverCurrentQueuePlaybackLocked(ctx context.Context, current queue.Video) error {
+	inspection, err := s.inspectMediaInputLocked(ctx, s.cfg.OBSMediaSourceName, current.LocalPath)
+	if err != nil {
+		return err
+	}
+	if !inspection.PathMismatch {
+		switch inspection.Status.State {
+		case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering:
+			if !inspection.Stalled {
+				return nil
+			}
+		case obs.MediaStateNone, obs.MediaStatePaused, obs.MediaStateStopped, obs.MediaStateEnded, obs.MediaStateError:
+		default:
+			return fmt.Errorf("OBS media source %s returned unknown state %q", s.cfg.OBSMediaSourceName, inspection.Status.State)
+		}
+	}
+	return s.restartCurrentQueuePlaybackLocked(ctx, current)
+}
+
+func (s *Service) recoverFallbackPlaybackLocked(ctx context.Context) error {
+	kind := s.playbackState()
+	if kind != playbackRandom && kind != playbackFile {
+		return nil
+	}
+	expectedPath := s.currentPlaybackPath()
+	if expectedPath == "" {
+		return nil
+	}
+	inspection, err := s.inspectMediaInputLocked(ctx, s.cfg.OBSMediaSourceName, expectedPath)
+	if err != nil {
+		return err
+	}
+	if !inspection.PathMismatch {
+		switch inspection.Status.State {
+		case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering:
+			if !inspection.Stalled {
+				return nil
+			}
+		case obs.MediaStateNone, obs.MediaStatePaused, obs.MediaStateStopped, obs.MediaStateEnded, obs.MediaStateError:
+		default:
+			return fmt.Errorf("OBS media source %s returned unknown state %q", s.cfg.OBSMediaSourceName, inspection.Status.State)
+		}
+	}
+	return s.replayFallbackPlaybackLocked(ctx, kind, expectedPath)
+}
+
+func (s *Service) restartCurrentQueuePlaybackLocked(ctx context.Context, current queue.Video) error {
 	if err := s.obs.PlayFile(ctx, current.LocalPath); err != nil {
 		s.setPlaybackState(playbackIdle, 0, "")
 		s.setLastErr(err)
 		return err
 	}
 	if _, err := s.store.RestartPlaying(ctx, current.ID); err != nil {
+		_ = s.obs.StopCurrent(ctx)
+		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
+		s.setPlaybackState(playbackIdle, 0, "")
 		s.setLastErr(err)
 		return err
 	}
+	s.resetMediaProgressLocked(s.cfg.OBSMediaSourceName, current.LocalPath)
 	s.setPlaybackState(playbackNormal, 0, "")
 	s.logger.Info("recovered OBS playback", "video_id", current.ID, "path", s.redactString(current.LocalPath))
 	return nil
+}
+
+func (s *Service) reconcileCurrentQueuePlaybackLocked(ctx context.Context, current queue.Video) (*queue.Video, bool, error) {
+	inspection, err := s.inspectMediaInputLocked(ctx, s.cfg.OBSMediaSourceName, current.LocalPath)
+	if err != nil {
+		return nil, false, err
+	}
+	if inspection.PathMismatch {
+		if inspection.Settling || s.queuePlaybackSettling(current) {
+			return nil, false, nil
+		}
+		return nil, true, s.restartCurrentQueuePlaybackLocked(ctx, current)
+	}
+	switch inspection.Status.State {
+	case obs.MediaStateStopped, obs.MediaStateEnded, obs.MediaStateError:
+		if inspection.Settling || s.queuePlaybackSettling(current) {
+			return nil, false, nil
+		}
+		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
+		next, err := s.advancePlaybackLockedAfter(ctx, current.ID, current.LocalPath)
+		return next, true, err
+	case obs.MediaStateNone, obs.MediaStatePaused:
+		return nil, true, s.restartCurrentQueuePlaybackLocked(ctx, current)
+	case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering:
+		if inspection.Stalled {
+			return nil, true, s.restartCurrentQueuePlaybackLocked(ctx, current)
+		}
+		return nil, false, nil
+	default:
+		return nil, false, fmt.Errorf("OBS media source %s returned unknown state %q", s.cfg.OBSMediaSourceName, inspection.Status.State)
+	}
+}
+
+func (s *Service) queuePlaybackSettling(current queue.Video) bool {
+	if current.StartedAt == nil {
+		return true
+	}
+	return s.nowUTC().Before(current.StartedAt.Add(obsEndedEventSettleGrace))
+}
+
+func (s *Service) reconcileFallbackPlaybackLocked(ctx context.Context) (*queue.Video, bool, error) {
+	kind := s.playbackState()
+	if kind != playbackRandom && kind != playbackFile {
+		return nil, false, nil
+	}
+	expectedPath := s.currentPlaybackPath()
+	if expectedPath == "" {
+		return nil, false, nil
+	}
+	inspection, err := s.inspectMediaInputLocked(ctx, s.cfg.OBSMediaSourceName, expectedPath)
+	if err != nil {
+		return nil, false, err
+	}
+	if inspection.PathMismatch {
+		if inspection.Settling {
+			return nil, false, nil
+		}
+		return nil, true, s.replayFallbackPlaybackLocked(ctx, kind, expectedPath)
+	}
+	switch inspection.Status.State {
+	case obs.MediaStateStopped, obs.MediaStateEnded, obs.MediaStateError:
+		if inspection.Settling {
+			return nil, false, nil
+		}
+		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
+		s.setPlaybackState(playbackIdle, 0, "")
+		next, err := s.advancePlaybackLocked(ctx)
+		return next, true, err
+	case obs.MediaStateNone, obs.MediaStatePaused:
+	case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering:
+		if !inspection.PathMismatch && !inspection.Stalled {
+			return nil, false, nil
+		}
+	default:
+		return nil, false, fmt.Errorf("OBS media source %s returned unknown state %q", s.cfg.OBSMediaSourceName, inspection.Status.State)
+	}
+
+	return nil, true, s.replayFallbackPlaybackLocked(ctx, kind, expectedPath)
+}
+
+func (s *Service) replayFallbackPlaybackLocked(ctx context.Context, kind playbackKind, expectedPath string) error {
+	if err := s.obs.PlayFile(ctx, expectedPath); err != nil {
+		return err
+	}
+	s.resetMediaProgressLocked(s.cfg.OBSMediaSourceName, expectedPath)
+	var randomID int64
+	if kind == playbackRandom {
+		randomID, _ = s.randomFallbackLock()
+	}
+	s.setPlaybackState(kind, randomID, expectedPath)
+	return nil
+}
+
+func (s *Service) inspectMediaInputLocked(ctx context.Context, inputName string, expectedPath string) (mediaInspection, error) {
+	status, err := s.obs.GetMediaInputStatus(ctx, inputName)
+	if err != nil {
+		return mediaInspection{}, fmt.Errorf("get OBS media status for %s: %w", inputName, err)
+	}
+	if err := validateMediaState(status.State); err != nil {
+		return mediaInspection{}, fmt.Errorf("OBS media source %s: %w", inputName, err)
+	}
+
+	inspection := mediaInspection{
+		Status:   status,
+		Settling: s.mediaGenerationSettlingLocked(inputName, expectedPath),
+	}
+	settings, err := s.obs.GetInputSettings(ctx, inputName)
+	if err != nil {
+		return mediaInspection{}, fmt.Errorf("get OBS input settings for %s: %w", inputName, err)
+	}
+	if !sameMediaPath(settings.LocalFile, expectedPath) {
+		inspection.PathMismatch = true
+		return inspection, nil
+	}
+	switch status.State {
+	case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering:
+		inspection.Stalled = s.mediaInputStalledLocked(inputName, expectedPath, status)
+	}
+	return inspection, nil
+}
+
+func validateMediaState(state obs.MediaState) error {
+	switch state {
+	case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering,
+		obs.MediaStateNone, obs.MediaStatePaused, obs.MediaStateStopped, obs.MediaStateEnded, obs.MediaStateError:
+		return nil
+	default:
+		return fmt.Errorf("returned unknown state %q", state)
+	}
+}
+
+func sameMediaPath(actual string, expected string) bool {
+	if actual == "" || expected == "" {
+		return false
+	}
+	return filepath.Clean(actual) == filepath.Clean(expected)
+}
+
+func (s *Service) mediaInputStalledLocked(inputName string, path string, status obs.MediaInputStatus) bool {
+	now := s.nowUTC()
+	if s.mediaProgressByInput == nil {
+		s.mediaProgressByInput = make(map[string]mediaProgress)
+	}
+	previous, ok := s.mediaProgressByInput[inputName]
+	resetProgress := !ok || previous.Path != path || previous.LastProgressAt.IsZero() || now.Before(previous.LastProgressAt)
+	progressed := resetProgress || previous.State != status.State
+	definitiveProgress := resetProgress || previous.LastDefinitiveProgressAt.IsZero() || now.Before(previous.LastDefinitiveProgressAt)
+
+	hasCursor := status.CursorMilliseconds != nil
+	cursorMillis := 0.0
+	if hasCursor {
+		cursorMillis = *status.CursorMilliseconds
+	}
+	if ok && previous.HasCursor != hasCursor {
+		progressed = true
+		if hasCursor {
+			definitiveProgress = true
+		}
+	}
+	if ok && previous.HasCursor && hasCursor {
+		delta := cursorMillis - previous.CursorMillis
+		if delta < 0 {
+			delta = -delta
+		}
+		if delta >= mediaCursorEpsilonMillis {
+			progressed = true
+			definitiveProgress = true
+		}
+	}
+
+	lastProgressAt := previous.LastProgressAt
+	if progressed || lastProgressAt.IsZero() {
+		lastProgressAt = now
+	}
+	lastDefinitiveProgressAt := previous.LastDefinitiveProgressAt
+	if definitiveProgress || lastDefinitiveProgressAt.IsZero() {
+		lastDefinitiveProgressAt = now
+	}
+	generationStartedAt := previous.GenerationStartedAt
+	if ok && previous.Path != path {
+		generationStartedAt = time.Time{}
+	}
+	s.mediaProgressByInput[inputName] = mediaProgress{
+		Path:                     path,
+		State:                    status.State,
+		CursorMillis:             cursorMillis,
+		HasCursor:                hasCursor,
+		GenerationStartedAt:      generationStartedAt,
+		LastProgressAt:           lastProgressAt,
+		LastDefinitiveProgressAt: lastDefinitiveProgressAt,
+	}
+	return now.Sub(lastProgressAt) >= mediaProgressGrace ||
+		now.Sub(lastDefinitiveProgressAt) >= mediaProgressHardGrace
+}
+
+func (s *Service) resetMediaProgressLocked(inputName string, path string) {
+	if s.mediaProgressByInput == nil {
+		s.mediaProgressByInput = make(map[string]mediaProgress)
+	}
+	now := s.nowUTC()
+	s.mediaProgressByInput[inputName] = mediaProgress{
+		Path:                     path,
+		GenerationStartedAt:      now,
+		LastProgressAt:           now,
+		LastDefinitiveProgressAt: now,
+	}
+}
+
+func (s *Service) mediaGenerationSettlingLocked(inputName string, path string) bool {
+	progress, ok := s.mediaProgressByInput[inputName]
+	if !ok || progress.Path != path || progress.GenerationStartedAt.IsZero() {
+		return false
+	}
+	return s.nowUTC().Before(progress.GenerationStartedAt.Add(obsEndedEventSettleGrace))
+}
+
+func (s *Service) clearMediaProgressLocked(inputName string) {
+	delete(s.mediaProgressByInput, inputName)
 }
 
 func (s *Service) skipCurrent(ctx context.Context) (string, error) {
@@ -489,6 +808,7 @@ func (s *Service) skipCurrent(ctx context.Context) (string, error) {
 			s.setLastErr(err)
 			return "", err
 		}
+		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
 		s.setPlaybackState(playbackIdle, 0, "")
 		return "已跳過，目前沒有下一支影片。", nil
 	}
@@ -505,6 +825,7 @@ func (s *Service) skipCurrent(ctx context.Context) (string, error) {
 func (s *Service) advanceFallbackLocked(ctx context.Context) error {
 	switch s.cfg.FallbackMode {
 	case "off":
+		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
 		s.setPlaybackState(playbackIdle, 0, "")
 		return nil
 	case "file":
@@ -517,6 +838,7 @@ func (s *Service) advanceFallbackLocked(ctx context.Context) error {
 		}
 		return s.playFallbackFileLocked(ctx)
 	default:
+		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
 		s.setPlaybackState(playbackIdle, 0, "")
 		return nil
 	}
@@ -524,6 +846,7 @@ func (s *Service) advanceFallbackLocked(ctx context.Context) error {
 
 func (s *Service) playFallbackFileLocked(ctx context.Context) error {
 	if s.cfg.OBSFallbackFile == "" {
+		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
 		s.setPlaybackState(playbackIdle, 0, "")
 		return nil
 	}
@@ -531,6 +854,7 @@ func (s *Service) playFallbackFileLocked(ctx context.Context) error {
 		s.setLastErr(err)
 		return err
 	}
+	s.resetMediaProgressLocked(s.cfg.OBSMediaSourceName, s.cfg.OBSFallbackFile)
 	s.setPlaybackState(playbackFile, 0, s.cfg.OBSFallbackFile)
 	return nil
 }
@@ -553,6 +877,7 @@ func (s *Service) playRandomFallbackLocked(ctx context.Context) (*queue.Video, e
 			s.setLastErr(err)
 			return nil, err
 		}
+		s.resetMediaProgressLocked(s.cfg.OBSMediaSourceName, video.LocalPath)
 		notify := s.setPlaybackState(playbackRandom, video.ID, video.LocalPath)
 		if notify {
 			_ = s.bot.SendMessage(ctx, s.cfg.AllowedChatID, fmt.Sprintf("佇列已播放完，正在隨機播放歷史影片：#%d %s", video.ID, video.FileName))
@@ -746,32 +1071,70 @@ func (s *Service) obsReconnectLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
-		switch s.obs.Status().State {
-		case obs.StateDisconnected:
-			connectCtx, cancelConnect := context.WithTimeout(ctx, obsConnectAttemptTimeout)
-			err := s.obs.Connect(connectCtx)
-			cancelConnect()
-			if err != nil {
-				s.setLastErr(err)
-				s.logger.Warn("connect OBS failed", "error", s.redactError(err))
-			} else {
-				s.logger.Info("connected to OBS")
-				if err := s.recoverPlaybackAfterOBSConnect(ctx); err != nil {
-					s.logger.Warn("resume playback failed", "error", s.redactError(err))
-				}
-			}
-		case obs.StateConnected:
-			if s.playbackState() == playbackIdle {
-				if err := s.recoverPlaybackAfterOBSConnect(ctx); err != nil {
-					s.logger.Warn("resume playback failed", "error", s.redactError(err))
-				}
-			}
-		}
+		s.maintainOBSConnection(ctx)
 
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Service) maintainOBSConnection(ctx context.Context) {
+	switch s.obs.Status().State {
+	case obs.StateDisconnected:
+		if !s.obsRecoveryInProgress.CompareAndSwap(false, true) {
+			return
+		}
+		defer s.obsRecoveryInProgress.Store(false)
+
+		connectCtx, cancelConnect := context.WithTimeout(ctx, obsConnectAttemptTimeout)
+		err := s.obs.Connect(connectCtx)
+		cancelConnect()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			s.setLastErr(err)
+			s.logger.Warn("connect OBS failed", "error", s.redactError(err))
+			return
+		}
+		s.logger.Info("connected to OBS")
+		if err := s.recoverPlaybackAfterOBSConnect(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			s.setLastErr(err)
+			s.logger.Warn("resume playback failed", "error", s.redactError(err))
+		}
+	case obs.StateConnected:
+		if s.obsRecoveryInProgress.Load() {
+			return
+		}
+		if err := s.obs.Probe(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			s.setLastErr(err)
+			s.logger.Warn("probe OBS failed", "error", s.redactError(err))
+			return
+		}
+		if s.playbackState() == playbackIdle {
+			if !s.obsRecoveryInProgress.CompareAndSwap(false, true) {
+				return
+			}
+			defer s.obsRecoveryInProgress.Store(false)
+			if s.obs.Status().State != obs.StateConnected || s.playbackState() != playbackIdle {
+				return
+			}
+			if err := s.recoverPlaybackAfterOBSConnect(ctx); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				s.setLastErr(err)
+				s.logger.Warn("resume playback failed", "error", s.redactError(err))
+			}
 		}
 	}
 }
@@ -793,7 +1156,7 @@ func (s *Service) playbackWatchdogLoop(ctx context.Context) {
 }
 
 func (s *Service) checkPlaybackWatchdog(ctx context.Context) error {
-	if s.obs.Status().State != obs.StateConnected {
+	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
 		return nil
 	}
 
@@ -802,11 +1165,27 @@ func (s *Service) checkPlaybackWatchdog(ctx context.Context) error {
 		s.playbackMu.Lock()
 		defer s.playbackMu.Unlock()
 
+		if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
+			return nil
+		}
 		current, err := s.store.Current(ctx)
 		if err != nil {
 			return err
 		}
-		if current == nil || current.StartedAt == nil || current.DurationSeconds <= 0 {
+		if current == nil {
+			video, _, err = s.reconcileFallbackPlaybackLocked(ctx)
+			return err
+		}
+		if s.playbackState() != playbackNormal {
+			return s.restartCurrentQueuePlaybackLocked(ctx, *current)
+		}
+
+		var changed bool
+		video, changed, err = s.reconcileCurrentQueuePlaybackLocked(ctx, *current)
+		if err != nil || changed {
+			return err
+		}
+		if current.StartedAt == nil || current.DurationSeconds <= 0 {
 			return nil
 		}
 		deadline := current.StartedAt.Add(time.Duration(current.DurationSeconds)*time.Second + playbackWatchdogGrace)
@@ -844,6 +1223,9 @@ func (s *Service) obsEventLoop(ctx context.Context) {
 			if event.Type != obs.EventMediaEnded {
 				continue
 			}
+			if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
+				continue
+			}
 			if s.libraryMode() {
 				if err := s.handleLibraryOBSEvent(ctx, event); err != nil {
 					s.logger.Warn("advance library playback after OBS event failed", "error", s.redactError(err))
@@ -866,16 +1248,21 @@ func (s *Service) advancePlaybackForEndedEvent(ctx context.Context, event obs.Ev
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
 
+	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
+		return nil, nil
+	}
+	// MediaEnded is only a reconciliation hint. OBS status and input identity,
+	// read under the same playback lock as queue mutation, are authoritative.
 	current, err := s.store.Current(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if current != nil {
-		if event.Path != "" && current.LocalPath != event.Path {
+		if event.Path != "" && !sameMediaPath(event.Path, current.LocalPath) {
 			return nil, nil
 		}
-		if s.obsEventTooEarlyForCurrent(event, *current) {
-			s.logger.Warn("ignore early OBS ended event",
+		if s.queueEndedEventIsTooEarly(event, *current) {
+			s.logger.Warn("ignore OBS ended event inside current playback guard window",
 				"video_id", current.ID,
 				"event_path", s.redactString(event.Path),
 				"event_at", event.At,
@@ -884,21 +1271,29 @@ func (s *Service) advancePlaybackForEndedEvent(ctx context.Context, event obs.Ev
 			)
 			return nil, nil
 		}
-		return s.advancePlaybackLockedAfter(ctx, current.ID, current.LocalPath)
+		video, _, err := s.reconcileCurrentQueuePlaybackLocked(ctx, *current)
+		return video, err
 	}
-	return s.advancePlaybackLockedAfter(ctx, 0, event.Path)
+	video, _, err := s.reconcileFallbackPlaybackLocked(ctx)
+	return video, err
 }
 
-func (s *Service) obsEventTooEarlyForCurrent(event obs.Event, current queue.Video) bool {
-	if current.StartedAt == nil || current.DurationSeconds <= 0 {
-		return false
+func (s *Service) queueEndedEventIsTooEarly(event obs.Event, current queue.Video) bool {
+	if current.StartedAt == nil {
+		return true
 	}
-	tolerance := obsEndedEarlyTolerance
-	duration := time.Duration(current.DurationSeconds) * time.Second
-	if duration <= tolerance {
-		tolerance = duration / 2
+	trustedAfter := current.StartedAt.Add(obsEndedEventSettleGrace)
+	if current.DurationSeconds > 0 {
+		duration := time.Duration(current.DurationSeconds) * time.Second
+		tolerance := obsEndedEventSettleGrace
+		if duration <= tolerance {
+			tolerance = duration / 2
+		}
+		expectedEndGuard := current.StartedAt.Add(duration - tolerance)
+		if expectedEndGuard.After(trustedAfter) {
+			trustedAfter = expectedEndGuard
+		}
 	}
-	trustedAfter := current.StartedAt.Add(duration - tolerance)
 	eventAt := event.At
 	if eventAt.IsZero() {
 		eventAt = s.nowUTC()

@@ -68,7 +68,9 @@ On restart:
 
 - queued `ready` rows remain ordered by `queue_position`;
 - stale `downloading` rows older than 6 hours are marked `failed`;
-- an existing `playing` row is restarted from its local file path after OBS reconnects, so a planned restart may replay the current video from the beginning;
+- after a fresh application process starts, an existing `playing` row is replayed from its persisted local file path because no in-memory playback generation remains;
+- after a same-process OBS reconnect, matching active playback with observable progress keeps its current position; inactive, terminal, stalled, or path-mismatched playback replays the persisted current row and refreshes `started_at`;
+- reconnect reconciliation does not mark the current row `played` or consume the next queue row based on OBS status alone;
 - if the current file is missing, that row is marked `failed` and playback advances;
 - the reconnect loop tries OBS every 5 seconds, with a per-attempt timeout;
 - if OBS is connected and no row is `playing`, the next `ready` row starts.
@@ -76,7 +78,7 @@ On restart:
 ## Failure Handling
 
 - OBS connection loss does not delete queue state.
-- OBS reconnect replays the current `playing` row instead of waiting for a playback-ended event that may never arrive after a process or OBS restart.
+- OBS heartbeat and input reconciliation preserve matching healthy playback, replay an unhealthy persisted current item, and leave queue advancement to authoritative post-reconnect playback reconciliation.
 - OBS playback failure leaves the next `ready` item in the queue instead of marking it played.
 - A canceled item cannot become `ready` after cancellation.
 - Retention cleanup removes old played queue rows by age and maximum file count. By default it keeps local Telegram Bot API media files; `RETENTION_DELETE_LOCAL_FILES=true` opts into deleting unreferenced local files with removed rows.

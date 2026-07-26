@@ -94,7 +94,8 @@ func TestLibraryLoopEndedEventDoesNotRedrawCurrentPeriodPlan(t *testing.T) {
 	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
 	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_002.mp4")
 	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
-	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+	tick := fixedNow("2026-06-24T12:00:00+08:00")()
+	svc.now = func() time.Time { return tick }
 
 	if err := svc.ScanLibrary(ctx); err != nil {
 		t.Fatalf("scan library: %v", err)
@@ -109,6 +110,9 @@ func TestLibraryLoopEndedEventDoesNotRedrawCurrentPeriodPlan(t *testing.T) {
 	}
 
 	svc.rng = rand.New(rand.NewSource(42))
+	playsBefore := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]
+	tick = tick.Add(obsEndedEventSettleGrace + time.Millisecond)
+	fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: obs.MediaStateEnded}
 	if err := svc.handleLibraryOBSEvent(ctx, obs.Event{Type: obs.EventMediaEnded, InputName: svc.cfg.OBSLoopSourceName, Path: firstPath}); err != nil {
 		t.Fatalf("handle loop ended event: %v", err)
 	}
@@ -121,6 +125,494 @@ func TestLibraryLoopEndedEventDoesNotRedrawCurrentPeriodPlan(t *testing.T) {
 	}
 	if got := fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]; got != firstPath {
 		t.Fatalf("loop ended event restarted %q, want existing plan path %q", got, firstPath)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != playsBefore+1 {
+		t.Fatalf("loop play calls = %d, want %d after ended event", got, playsBefore+1)
+	}
+}
+
+func TestLibraryReconnectReplaysCachedLoopAndMusic(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_beta.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	loopPath := fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]
+	musicPath := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]
+	loopCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]
+	musicCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]
+
+	fakeOBS.sourcePlayed = make(map[string]string)
+	fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: obs.MediaStateNone}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{State: obs.MediaStateNone}
+	if err := svc.recoverLibraryPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover library playback: %v", err)
+	}
+
+	if got := fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]; got != loopPath {
+		t.Fatalf("recovered loop = %q, want cached %q", got, loopPath)
+	}
+	if got := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]; got != musicPath {
+		t.Fatalf("recovered music = %q, want cached %q", got, musicPath)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != loopCalls+1 {
+		t.Fatalf("loop play calls = %d, want %d", got, loopCalls+1)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls+1 {
+		t.Fatalf("music play calls = %d, want %d", got, musicCalls+1)
+	}
+}
+
+func TestLibraryReconnectKeepsHealthyCachedSourcesPlaying(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_beta.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	loopID := svc.activeLoopID
+	musicID := svc.activeMusicID
+	loopCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]
+	musicCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]
+	fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: obs.MediaStatePlaying}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{State: obs.MediaStatePlaying}
+
+	if err := svc.recoverLibraryPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover library playback: %v", err)
+	}
+
+	if svc.activeLoopID != loopID || svc.activeMusicID != musicID {
+		t.Fatalf("healthy reconnect changed active IDs: loop %q -> %q, music %q -> %q", loopID, svc.activeLoopID, musicID, svc.activeMusicID)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != loopCalls {
+		t.Fatalf("healthy reconnect loop calls = %d, want unchanged %d", got, loopCalls)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls {
+		t.Fatalf("healthy reconnect music calls = %d, want unchanged %d", got, musicCalls)
+	}
+}
+
+func TestLibraryReconnectStartsBothSourcesWithoutCachedState(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.recoverLibraryPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover fresh library playback: %v", err)
+	}
+
+	if svc.activeLoopID == "" || svc.activeMusicID == "" {
+		t.Fatalf("fresh recovery did not establish both active IDs: loop=%q music=%q", svc.activeLoopID, svc.activeMusicID)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != 1 {
+		t.Fatalf("fresh recovery loop calls = %d, want 1", got)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != 1 {
+		t.Fatalf("fresh recovery music calls = %d, want 1", got)
+	}
+}
+
+func TestLibraryReconnectRecoversOnlyAffectedSource(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_beta.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+
+	loopCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]
+	musicCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]
+	fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: obs.MediaStateStopped}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{State: obs.MediaStatePlaying}
+	if err := svc.recoverLibraryPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover stopped loop: %v", err)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != loopCalls+1 {
+		t.Fatalf("stopped loop calls = %d, want %d", got, loopCalls+1)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls {
+		t.Fatalf("healthy music calls = %d, want unchanged %d", got, musicCalls)
+	}
+
+	loopCalls = fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]
+	musicCalls = fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]
+	fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: obs.MediaStatePlaying}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{State: obs.MediaStateError}
+	if err := svc.recoverLibraryPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover errored music: %v", err)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != loopCalls {
+		t.Fatalf("healthy loop calls = %d, want unchanged %d", got, loopCalls)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls+1 {
+		t.Fatalf("errored music calls = %d, want %d", got, musicCalls+1)
+	}
+}
+
+func TestLibraryReconciliationRecoversLostEndedEvents(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_beta.mp3")
+	tick := fixedNow("2026-06-24T12:00:00+08:00")()
+	svc.now = func() time.Time { return tick }
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	loopPath := fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]
+	musicPath := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]
+	loopCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]
+	musicCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]
+	tick = tick.Add(obsEndedEventSettleGrace + time.Millisecond)
+	fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: obs.MediaStateStopped}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{State: obs.MediaStateEnded}
+
+	if err := svc.reconcileLibraryPlayback(ctx); err != nil {
+		t.Fatalf("reconcile library playback: %v", err)
+	}
+
+	if got := fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]; got != loopPath {
+		t.Fatalf("recovered loop = %q, want %q", got, loopPath)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != loopCalls+1 {
+		t.Fatalf("loop play calls = %d, want %d", got, loopCalls+1)
+	}
+	if got := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]; got == "" || got == musicPath {
+		t.Fatalf("music after ended state = %q, want a different track from %q", got, musicPath)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls+1 {
+		t.Fatalf("music play calls = %d, want %d", got, musicCalls+1)
+	}
+}
+
+func TestLibraryTerminalSettlingGuardPreventsDoubleAdvanceAndLoopRestart(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_beta.mp3")
+	tick := fixedNow("2026-06-24T12:00:00+08:00")()
+	svc.now = func() time.Time { return tick }
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	firstMusicPath := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]
+	tick = tick.Add(obsEndedEventSettleGrace + time.Millisecond)
+	fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: obs.MediaStateEnded}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{State: obs.MediaStateEnded}
+	if err := svc.reconcileLibraryPlayback(ctx); err != nil {
+		t.Fatalf("first terminal reconciliation: %v", err)
+	}
+	secondMusicPath := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]
+	if secondMusicPath == "" || secondMusicPath == firstMusicPath {
+		t.Fatalf("first terminal reconciliation music = %q, want different from %q", secondMusicPath, firstMusicPath)
+	}
+	loopCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]
+	musicCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]
+
+	fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: obs.MediaStateEnded}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{State: obs.MediaStateEnded}
+	if err := svc.handleLibraryOBSEvent(ctx, obs.Event{
+		Type:      obs.EventMediaEnded,
+		InputName: svc.cfg.OBSMusicSourceName,
+		Path:      firstMusicPath,
+	}); err != nil {
+		t.Fatalf("stale music ended event: %v", err)
+	}
+	if err := svc.reconcileLibraryPlayback(ctx); err != nil {
+		t.Fatalf("immediate stale scheduler reconciliation: %v", err)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != loopCalls {
+		t.Fatalf("stale terminal restarted loop %d times, want unchanged %d", got, loopCalls)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls {
+		t.Fatalf("stale terminal advanced music %d times, want unchanged %d", got, musicCalls)
+	}
+	if got := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]; got != secondMusicPath {
+		t.Fatalf("stale terminal changed music to %q, want %q", got, secondMusicPath)
+	}
+
+	tick = tick.Add(obsEndedEventSettleGrace + time.Millisecond)
+	if err := svc.reconcileLibraryPlayback(ctx); err != nil {
+		t.Fatalf("post-grace terminal reconciliation: %v", err)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != loopCalls+1 {
+		t.Fatalf("post-grace loop calls = %d, want %d", got, loopCalls+1)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls+1 {
+		t.Fatalf("post-grace music calls = %d, want %d", got, musicCalls+1)
+	}
+}
+
+func TestLibrarySettlingGuardDefersTransientPathMismatch(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_beta.mp3")
+	tick := fixedNow("2026-06-24T12:00:00+08:00")()
+	svc.now = func() time.Time { return tick }
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	firstMusicPath := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]
+	tick = tick.Add(obsEndedEventSettleGrace + time.Millisecond)
+	fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: obs.MediaStateEnded}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{State: obs.MediaStateEnded}
+	if err := svc.reconcileLibraryPlayback(ctx); err != nil {
+		t.Fatalf("establish next generation: %v", err)
+	}
+	secondMusicPath := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]
+	if secondMusicPath == "" || secondMusicPath == firstMusicPath {
+		t.Fatalf("next generation music = %q, want different from %q", secondMusicPath, firstMusicPath)
+	}
+	loopCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]
+	musicCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]
+	staleLoopPath := filepath.Join(t.TempDir(), "old-loop.mp4")
+
+	fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: obs.MediaStatePlaying}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{State: obs.MediaStatePlaying}
+	fakeOBS.inputFiles[svc.cfg.OBSLoopSourceName] = staleLoopPath
+	fakeOBS.inputFiles[svc.cfg.OBSMusicSourceName] = firstMusicPath
+	if err := svc.handleLibraryOBSEvent(ctx, obs.Event{
+		Type:      obs.EventMediaEnded,
+		InputName: svc.cfg.OBSMusicSourceName,
+		Path:      firstMusicPath,
+	}); err != nil {
+		t.Fatalf("settling mismatched music event: %v", err)
+	}
+	if err := svc.reconcileLibraryPlayback(ctx); err != nil {
+		t.Fatalf("settling mismatched scheduler reconciliation: %v", err)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != loopCalls {
+		t.Fatalf("settling mismatch restarted loop %d times, want unchanged %d", got, loopCalls)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls {
+		t.Fatalf("settling mismatch replayed music %d times, want unchanged %d", got, musicCalls)
+	}
+
+	tick = tick.Add(obsEndedEventSettleGrace + time.Millisecond)
+	if err := svc.reconcileLibraryPlayback(ctx); err != nil {
+		t.Fatalf("post-grace mismatched reconciliation: %v", err)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != loopCalls+1 {
+		t.Fatalf("post-grace loop replay calls = %d, want %d", got, loopCalls+1)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls+1 {
+		t.Fatalf("post-grace music replay calls = %d, want %d", got, musicCalls+1)
+	}
+	if got := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]; got != secondMusicPath {
+		t.Fatalf("post-grace mismatch changed music to %q, want replay %q", got, secondMusicPath)
+	}
+}
+
+func TestLibraryReconciliationTreatsActiveStatesAsHealthy(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+
+	for _, state := range []obs.MediaState{obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering} {
+		t.Run(string(state), func(t *testing.T) {
+			loopCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]
+			musicCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]
+			fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: state}
+			fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{State: state}
+
+			if err := svc.reconcileLibraryPlayback(ctx); err != nil {
+				t.Fatalf("reconcile library playback: %v", err)
+			}
+			if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != loopCalls {
+				t.Fatalf("loop play calls = %d, want unchanged %d", got, loopCalls)
+			}
+			if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls {
+				t.Fatalf("music play calls = %d, want unchanged %d", got, musicCalls)
+			}
+		})
+	}
+}
+
+func TestLibraryReconciliationReplaysSourceWhenLocalFileMismatches(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	tick := fixedNow("2026-06-24T12:00:00+08:00")()
+	svc.now = func() time.Time { return tick }
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	loopCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]
+	musicCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]
+	fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: obs.MediaStatePlaying}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{State: obs.MediaStatePlaying}
+	fakeOBS.inputFiles[svc.cfg.OBSLoopSourceName] = "/stale/loop.mp4"
+	tick = tick.Add(obsEndedEventSettleGrace + time.Millisecond)
+
+	if err := svc.reconcileLibraryPlayback(ctx); err != nil {
+		t.Fatalf("reconcile library playback: %v", err)
+	}
+
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != loopCalls+1 {
+		t.Fatalf("mismatched loop play calls = %d, want %d", got, loopCalls+1)
+	}
+	if got := fakeOBS.sourcePlayed[svc.cfg.OBSLoopSourceName]; got != svc.activeLoopPath {
+		t.Fatalf("replayed loop = %q, want active %q", got, svc.activeLoopPath)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls {
+		t.Fatalf("matching music play calls = %d, want unchanged %d", got, musicCalls)
+	}
+}
+
+func TestLibraryReconciliationOpeningSourceStallsAfterGrace(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	tick := fixedNow("2026-06-24T12:00:00+08:00")()
+	svc.now = func() time.Time { return tick }
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	loopCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]
+	musicCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]
+	musicCursor := 100.0
+	fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: obs.MediaStateOpening}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{
+		State:              obs.MediaStatePlaying,
+		CursorMilliseconds: &musicCursor,
+	}
+
+	if err := svc.reconcileLibraryPlayback(ctx); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	tick = tick.Add(mediaProgressGrace + time.Second)
+	musicCursor = 1000
+	if err := svc.reconcileLibraryPlayback(ctx); err != nil {
+		t.Fatalf("stalled reconcile: %v", err)
+	}
+
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSLoopSourceName]; got != loopCalls+1 {
+		t.Fatalf("stalled loop play calls = %d, want %d", got, loopCalls+1)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls {
+		t.Fatalf("progressing music play calls = %d, want unchanged %d", got, musicCalls)
+	}
+}
+
+func TestLibraryReconciliationResumesPausedMusicWithoutSkipping(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_beta.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	musicPath := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]
+	musicCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]
+	fakeOBS.mediaStatuses[svc.cfg.OBSLoopSourceName] = obs.MediaInputStatus{State: obs.MediaStatePlaying}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{State: obs.MediaStatePaused}
+
+	if err := svc.reconcileLibraryPlayback(ctx); err != nil {
+		t.Fatalf("reconcile library playback: %v", err)
+	}
+	if got := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]; got != musicPath {
+		t.Fatalf("resumed music = %q, want current track %q", got, musicPath)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls+1 {
+		t.Fatalf("music play calls = %d, want %d", got, musicCalls+1)
+	}
+}
+
+func TestLibraryEndedEventUsesCurrentOBSStateToAvoidStaleAdvance(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS := newLibraryTestService(t)
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, "loop_day_cafe_001.mp4")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_alpha.mp3")
+	writeLibraryFile(t, svc.cfg.MusicMediaDir, "music_beta.mp3")
+	svc.now = fixedNow("2026-06-24T12:00:00+08:00")
+
+	if err := svc.ScanLibrary(ctx); err != nil {
+		t.Fatalf("scan library: %v", err)
+	}
+	if err := svc.ensureLibraryPlayback(ctx, false); err != nil {
+		t.Fatalf("ensure playback: %v", err)
+	}
+	musicPath := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]
+	musicCalls := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]
+	fakeOBS.mediaStatuses[svc.cfg.OBSMusicSourceName] = obs.MediaInputStatus{State: obs.MediaStatePlaying}
+
+	if err := svc.handleLibraryOBSEvent(ctx, obs.Event{
+		Type:      obs.EventMediaEnded,
+		InputName: svc.cfg.OBSMusicSourceName,
+		Path:      musicPath,
+	}); err != nil {
+		t.Fatalf("handle stale music event: %v", err)
+	}
+	if got := fakeOBS.sourcePlayed[svc.cfg.OBSMusicSourceName]; got != musicPath {
+		t.Fatalf("music changed after stale event: got %q want %q", got, musicPath)
+	}
+	if got := fakeOBS.sourcePlayCalls[svc.cfg.OBSMusicSourceName]; got != musicCalls {
+		t.Fatalf("music play calls = %d, want unchanged %d", got, musicCalls)
 	}
 }
 
@@ -308,18 +800,22 @@ func TestRandomFallbackStartsAndNotifiesOnce(t *testing.T) {
 	}
 }
 
-func TestFallbackEndedEventAdvancesFallbackPlayback(t *testing.T) {
+func TestFallbackSettlingGuardPreventsDoubleAdvanceAfterEndedEvent(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS, _ := newFallbackTestService(t, config.Config{FallbackMode: "file"})
 	firstPath := filepath.Join(t.TempDir(), "fallback-one.mp4")
 	secondPath := filepath.Join(t.TempDir(), "fallback-two.mp4")
 	writeTestFile(t, firstPath)
 	writeTestFile(t, secondPath)
+	tick := time.Now().UTC()
+	svc.now = func() time.Time { return tick }
 	svc.cfg.OBSFallbackFile = firstPath
 	if _, err := svc.advancePlayback(ctx); err != nil {
 		t.Fatalf("start fallback: %v", err)
 	}
 	svc.cfg.OBSFallbackFile = secondPath
+	tick = tick.Add(obsEndedEventSettleGrace + time.Millisecond)
+	fakeOBS.mediaStatuses[svc.cfg.OBSMediaSourceName] = obs.MediaInputStatus{State: obs.MediaStateEnded}
 
 	video, err := svc.advancePlaybackForEndedEvent(ctx, obs.Event{
 		Type: obs.EventMediaEnded,
@@ -334,6 +830,30 @@ func TestFallbackEndedEventAdvancesFallbackPlayback(t *testing.T) {
 	}
 	if fakeOBS.lastPlayed != secondPath {
 		t.Fatalf("played path = %q, want second fallback %q", fakeOBS.lastPlayed, secondPath)
+	}
+	if fakeOBS.playFileCalls != 2 {
+		t.Fatalf("play calls = %d, want initial and first ended event", fakeOBS.playFileCalls)
+	}
+
+	fakeOBS.mediaStatuses[svc.cfg.OBSMediaSourceName] = obs.MediaInputStatus{State: obs.MediaStatePlaying}
+	fakeOBS.inputFiles[svc.cfg.OBSMediaSourceName] = firstPath
+	if _, err := svc.advancePlaybackForEndedEvent(ctx, obs.Event{Type: obs.EventMediaEnded, Path: firstPath}); err != nil {
+		t.Fatalf("stale fallback event with playing status: %v", err)
+	}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMediaSourceName] = obs.MediaInputStatus{State: obs.MediaStateEnded}
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("immediate fallback watchdog with terminal status: %v", err)
+	}
+	if fakeOBS.playFileCalls != 2 || fakeOBS.lastPlayed != secondPath {
+		t.Fatalf("immediate stale hints replayed fallback: calls/path = %d/%q, want 2/%q", fakeOBS.playFileCalls, fakeOBS.lastPlayed, secondPath)
+	}
+
+	tick = tick.Add(obsEndedEventSettleGrace + time.Millisecond)
+	if _, err := svc.advancePlaybackForEndedEvent(ctx, obs.Event{Type: obs.EventMediaEnded, Path: secondPath}); err != nil {
+		t.Fatalf("post-grace fallback ended event: %v", err)
+	}
+	if fakeOBS.playFileCalls != 3 || fakeOBS.lastPlayed != secondPath {
+		t.Fatalf("post-grace fallback recovery calls/path = %d/%q, want 3/%q", fakeOBS.playFileCalls, fakeOBS.lastPlayed, secondPath)
 	}
 }
 
@@ -776,6 +1296,349 @@ func TestRecoveredPlaybackLogRedactsPathSecrets(t *testing.T) {
 	}
 }
 
+func TestMaintainOBSConnectionProbesEveryPlaybackState(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	states := []playbackKind{
+		playbackIdle,
+		playbackNormal,
+		playbackRandom,
+		playbackFile,
+	}
+
+	for _, state := range states {
+		svc.setPlaybackState(state, 0, "")
+		svc.maintainOBSConnection(ctx)
+	}
+
+	if fakeOBS.probeCalls != len(states) {
+		t.Fatalf("probe calls = %d, want %d for all playback states", fakeOBS.probeCalls, len(states))
+	}
+	if fakeOBS.connectCalls != 0 {
+		t.Fatalf("healthy probes triggered %d reconnects, want 0", fakeOBS.connectCalls)
+	}
+}
+
+func TestMaintainOBSConnectionRecordsProbeFailureWithoutPlaybackMutation(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	svc.setPlaybackState(playbackFile, 0, "/existing/fallback.mp4")
+	fakeOBS.probeErr = context.DeadlineExceeded
+
+	svc.maintainOBSConnection(ctx)
+
+	if fakeOBS.probeCalls != 1 {
+		t.Fatalf("probe calls = %d, want 1", fakeOBS.probeCalls)
+	}
+	if fakeOBS.lastPlayed != "" {
+		t.Fatalf("probe failure should not mutate playback, played %q", fakeOBS.lastPlayed)
+	}
+	if got := svc.lastError(); !strings.Contains(got, context.DeadlineExceeded.Error()) {
+		t.Fatalf("last error = %q, want probe deadline", got)
+	}
+}
+
+func TestMaintainOBSConnectionDoesNotReconnectAfterSemanticProbeFailure(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	svc.setPlaybackState(playbackFile, 0, "/existing/fallback.mp4")
+	fakeOBS.probeErr = &obs.RequestError{
+		RequestType: "GetVersion",
+		Code:        500,
+		Comment:     "request rejected",
+	}
+
+	svc.maintainOBSConnection(ctx)
+
+	if fakeOBS.probeCalls != 1 {
+		t.Fatalf("probe calls = %d, want 1", fakeOBS.probeCalls)
+	}
+	if fakeOBS.connectCalls != 0 {
+		t.Fatalf("semantic probe failure triggered %d reconnects, want 0", fakeOBS.connectCalls)
+	}
+	if fakeOBS.state != obs.StateConnected {
+		t.Fatalf("state = %s, want %s", fakeOBS.state, obs.StateConnected)
+	}
+}
+
+func TestMaintainOBSConnectionGatesWatchdogUntilRecoveryCompletes(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	ready := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 0)
+	playing, err := svc.store.MarkPlaying(ctx, ready.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	next := addReadyVideo(t, ctx, svc, "next.mp4")
+	svc.setPlaybackState(playbackNormal, 0, "")
+	fakeOBS.state = obs.StateDisconnected
+	fakeOBS.connectNotify = make(chan struct{})
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStateEnded},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: playing.LocalPath,
+	}
+
+	svc.playbackMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			svc.playbackMu.Unlock()
+		}
+	}()
+	recoveryDone := make(chan struct{})
+	go func() {
+		svc.maintainOBSConnection(ctx)
+		close(recoveryDone)
+	}()
+	select {
+	case <-fakeOBS.connectNotify:
+	case <-time.After(time.Second):
+		t.Fatal("OBS connect did not publish connected state")
+	}
+	if !svc.obsRecoveryInProgress.Load() {
+		t.Fatal("recovery gate is not active after OBS connected")
+	}
+
+	watchdogDone := make(chan error, 1)
+	go func() {
+		watchdogDone <- svc.checkPlaybackWatchdog(ctx)
+	}()
+	select {
+	case err := <-watchdogDone:
+		if err != nil {
+			t.Fatalf("watchdog while recovery pending: %v", err)
+		}
+	case <-time.After(time.Second):
+		svc.playbackMu.Unlock()
+		locked = false
+		<-recoveryDone
+		t.Fatal("watchdog blocked on playback lock instead of honoring recovery gate")
+	}
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current while recovery pending: %v", err)
+	}
+	if current == nil || current.ID != playing.ID {
+		t.Fatalf("current while recovery pending = %#v, want id %d", current, playing.ID)
+	}
+
+	svc.playbackMu.Unlock()
+	locked = false
+	select {
+	case <-recoveryDone:
+	case <-time.After(time.Second):
+		t.Fatal("OBS recovery did not finish after playback lock released")
+	}
+	if svc.obsRecoveryInProgress.Load() {
+		t.Fatal("recovery gate remained active after recovery finished")
+	}
+	current, err = svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current after recovery: %v", err)
+	}
+	if current == nil || current.ID != playing.ID {
+		t.Fatalf("current after recovery = %#v, want replayed id %d", current, playing.ID)
+	}
+	storedNext, err := svc.store.Get(ctx, next.ID)
+	if err != nil {
+		t.Fatalf("get next: %v", err)
+	}
+	if storedNext.Status != queue.StatusReady {
+		t.Fatalf("next status = %s, want %s", storedNext.Status, queue.StatusReady)
+	}
+	if fakeOBS.playFileCalls != 1 || fakeOBS.lastPlayed != playing.LocalPath {
+		t.Fatalf("recovery play calls/path = %d/%q, want 1/%q", fakeOBS.playFileCalls, fakeOBS.lastPlayed, playing.LocalPath)
+	}
+}
+
+func TestRecoverPlaybackAfterOBSConnectKeepsMatchingActiveCurrentPosition(t *testing.T) {
+	for _, state := range []obs.MediaState{
+		obs.MediaStatePlaying,
+		obs.MediaStateOpening,
+		obs.MediaStateBuffering,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+			ready := addReadyVideo(t, ctx, svc, "current.mp4")
+			playing, err := svc.store.MarkPlaying(ctx, ready.ID)
+			if err != nil {
+				t.Fatalf("mark playing: %v", err)
+			}
+			svc.setPlaybackState(playbackNormal, 0, "")
+			cursor := 100.0
+			fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+				svc.cfg.OBSMediaSourceName: {
+					State:              state,
+					CursorMilliseconds: &cursor,
+				},
+			}
+			fakeOBS.inputFiles = map[string]string{
+				svc.cfg.OBSMediaSourceName: playing.LocalPath,
+			}
+
+			if err := svc.recoverPlaybackAfterOBSConnect(ctx); err != nil {
+				t.Fatalf("recover healthy playback: %v", err)
+			}
+			if fakeOBS.playFileCalls != 0 {
+				t.Fatalf("healthy reconnect replayed current %d times, want 0", fakeOBS.playFileCalls)
+			}
+			current, err := svc.store.Current(ctx)
+			if err != nil {
+				t.Fatalf("current: %v", err)
+			}
+			if current == nil || current.StartedAt == nil || playing.StartedAt == nil {
+				t.Fatalf("current timestamps unavailable: before=%#v after=%#v", playing, current)
+			}
+			if !current.StartedAt.Equal(*playing.StartedAt) {
+				t.Fatalf("healthy reconnect changed started_at from %s to %s", playing.StartedAt, current.StartedAt)
+			}
+		})
+	}
+}
+
+func TestRecoverPlaybackAfterOBSConnectReplaysUnhealthyCurrentWithoutAdvancing(t *testing.T) {
+	tests := []struct {
+		name         string
+		state        obs.MediaState
+		pathMismatch bool
+	}{
+		{name: "none", state: obs.MediaStateNone},
+		{name: "paused", state: obs.MediaStatePaused},
+		{name: "stopped", state: obs.MediaStateStopped},
+		{name: "ended", state: obs.MediaStateEnded},
+		{name: "error", state: obs.MediaStateError},
+		{name: "path_mismatch", state: obs.MediaStatePlaying, pathMismatch: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "queue.db")
+			svc, fakeOBS, _ := newFallbackTestServiceAtDBPath(t, config.Config{FallbackMode: "off"}, dbPath)
+			ready := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 0)
+			playing, err := svc.store.MarkPlaying(ctx, ready.ID)
+			if err != nil {
+				t.Fatalf("mark playing: %v", err)
+			}
+			next := addReadyVideo(t, ctx, svc, "next.mp4")
+			oldStarted := time.Now().UTC().Add(-2 * time.Hour)
+			db, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatalf("open raw db: %v", err)
+			}
+			if _, err := db.ExecContext(ctx, `
+UPDATE videos SET started_at = ?, updated_at = ? WHERE id = ?
+`, formatQueueTime(oldStarted), formatQueueTime(oldStarted), playing.ID); err != nil {
+				_ = db.Close()
+				t.Fatalf("age current started_at: %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("close raw db: %v", err)
+			}
+
+			svc.setPlaybackState(playbackNormal, 0, "")
+			actualPath := playing.LocalPath
+			if tt.pathMismatch {
+				actualPath = next.LocalPath
+				svc.playbackMu.Lock()
+				svc.resetMediaProgressLocked(svc.cfg.OBSMediaSourceName, playing.LocalPath)
+				svc.playbackMu.Unlock()
+			}
+			fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+				svc.cfg.OBSMediaSourceName: {State: tt.state},
+			}
+			fakeOBS.inputFiles = map[string]string{
+				svc.cfg.OBSMediaSourceName: actualPath,
+			}
+
+			if err := svc.recoverPlaybackAfterOBSConnect(ctx); err != nil {
+				t.Fatalf("recover unhealthy playback: %v", err)
+			}
+			if fakeOBS.playFileCalls != 1 {
+				t.Fatalf("play calls = %d, want 1", fakeOBS.playFileCalls)
+			}
+			if fakeOBS.lastPlayed != playing.LocalPath {
+				t.Fatalf("played path = %q, want %q", fakeOBS.lastPlayed, playing.LocalPath)
+			}
+			current, err := svc.store.Current(ctx)
+			if err != nil {
+				t.Fatalf("current: %v", err)
+			}
+			if current == nil || current.ID != playing.ID || current.StartedAt == nil {
+				t.Fatalf("current = %#v, want replayed id %d", current, playing.ID)
+			}
+			if !current.StartedAt.After(oldStarted) {
+				t.Fatalf("replayed started_at = %s, want after %s", current.StartedAt, oldStarted)
+			}
+			storedNext, err := svc.store.Get(ctx, next.ID)
+			if err != nil {
+				t.Fatalf("get next: %v", err)
+			}
+			if storedNext.Status != queue.StatusReady {
+				t.Fatalf("next status = %s, want %s", storedNext.Status, queue.StatusReady)
+			}
+		})
+	}
+}
+
+func TestRecoverPlaybackAfterOBSConnectFreshProcessReplaysCurrentDespiteHealthyOBS(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	ready := addReadyVideo(t, ctx, svc, "current.mp4")
+	playing, err := svc.store.MarkPlaying(ctx, ready.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStatePlaying},
+	}
+
+	if err := svc.recoverPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover fresh process playback: %v", err)
+	}
+
+	if fakeOBS.playFileCalls != 1 {
+		t.Fatalf("fresh process play calls = %d, want 1", fakeOBS.playFileCalls)
+	}
+	if fakeOBS.lastPlayed != playing.LocalPath {
+		t.Fatalf("played path = %q, want %q", fakeOBS.lastPlayed, playing.LocalPath)
+	}
+}
+
+func TestRecoverPlaybackAfterOBSConnectFreshProcessReplaysCurrentDespiteStaleEndedSource(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	ready := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 0)
+	playing, err := svc.store.MarkPlaying(ctx, ready.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	next := addReadyVideo(t, ctx, svc, "next.mp4")
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStateEnded},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: next.LocalPath,
+	}
+
+	if err := svc.recoverPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover fresh process playback: %v", err)
+	}
+
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if current == nil || current.ID != playing.ID {
+		t.Fatalf("current = %#v, want original id %d", current, playing.ID)
+	}
+	if fakeOBS.playFileCalls != 1 || fakeOBS.lastPlayed != playing.LocalPath {
+		t.Fatalf("replay calls/path = %d/%q, want 1/%q", fakeOBS.playFileCalls, fakeOBS.lastPlayed, playing.LocalPath)
+	}
+}
+
 func TestRecoverPlaybackAfterOBSConnectReplaysCurrent(t *testing.T) {
 	ctx := context.Background()
 	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
@@ -810,6 +1673,12 @@ func TestRecoverPlaybackAfterOBSConnectFailureLeavesPlaybackIdleForRetry(t *test
 	}
 	fakeOBS.playErr = errors.New("obs replay failed")
 	svc.setPlaybackState(playbackNormal, 0, "")
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStatePaused},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: playing.LocalPath,
+	}
 
 	err = svc.recoverPlaybackAfterOBSConnect(ctx)
 
@@ -891,12 +1760,46 @@ func TestRecoverPlaybackAfterOBSConnectRestartsFallbackWhenNoCurrent(t *testing.
 		OBSFallbackFile: staticPath,
 	})
 	svc.setPlaybackState(playbackFile, 0, staticPath)
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStateStopped},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: staticPath,
+	}
 
 	if err := svc.recoverPlaybackAfterOBSConnect(ctx); err != nil {
 		t.Fatalf("recover playback: %v", err)
 	}
 	if fakeOBS.lastPlayed != staticPath {
 		t.Fatalf("played path = %q, want fallback path %q", fakeOBS.lastPlayed, staticPath)
+	}
+	if svc.playbackState() != playbackFile {
+		t.Fatalf("playback state = %s, want %s", svc.playbackState(), playbackFile)
+	}
+}
+
+func TestRecoverPlaybackAfterOBSConnectKeepsHealthyFallbackPlaying(t *testing.T) {
+	ctx := context.Background()
+	staticPath := filepath.Join(t.TempDir(), "fallback.mp4")
+	writeTestFile(t, staticPath)
+	svc, fakeOBS, _ := newFallbackTestService(t, config.Config{
+		FallbackMode:    "file",
+		OBSFallbackFile: staticPath,
+	})
+	svc.setPlaybackState(playbackFile, 0, staticPath)
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStatePlaying},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: staticPath,
+	}
+
+	if err := svc.recoverPlaybackAfterOBSConnect(ctx); err != nil {
+		t.Fatalf("recover healthy fallback: %v", err)
+	}
+
+	if fakeOBS.playFileCalls != 0 {
+		t.Fatalf("healthy fallback replayed %d times, want 0", fakeOBS.playFileCalls)
 	}
 	if svc.playbackState() != playbackFile {
 		t.Fatalf("playback state = %s, want %s", svc.playbackState(), playbackFile)
@@ -947,6 +1850,13 @@ func TestPlaybackWatchdogAdvancesExpiredCurrent(t *testing.T) {
 		t.Fatalf("mark playing: %v", err)
 	}
 	next := addReadyVideo(t, ctx, svc, "next.mp4")
+	svc.setPlaybackState(playbackNormal, 0, "")
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStatePlaying},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: playing.LocalPath,
+	}
 	svc.now = func() time.Time {
 		return playing.StartedAt.Add(30*time.Second + playbackWatchdogGrace + time.Second)
 	}
@@ -978,7 +1888,7 @@ func TestPlaybackWatchdogAdvancesExpiredCurrent(t *testing.T) {
 
 func TestEarlyStaleOBSEndedEventDoesNotSkipCurrentAfterWatchdogAdvance(t *testing.T) {
 	ctx := context.Background()
-	svc, _, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
 	firstReady := addReadyVideoWithDuration(t, ctx, svc, "first.mp4", 30)
 	firstPlaying, err := svc.store.MarkPlaying(ctx, firstReady.ID)
 	if err != nil {
@@ -986,6 +1896,13 @@ func TestEarlyStaleOBSEndedEventDoesNotSkipCurrentAfterWatchdogAdvance(t *testin
 	}
 	second := addReadyVideo(t, ctx, svc, "second.mp4")
 	third := addReadyVideo(t, ctx, svc, "third.mp4")
+	svc.setPlaybackState(playbackNormal, 0, "")
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStatePlaying},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: firstPlaying.LocalPath,
+	}
 	svc.now = func() time.Time {
 		return firstPlaying.StartedAt.Add(30*time.Second + playbackWatchdogGrace + time.Second)
 	}
@@ -999,11 +1916,12 @@ func TestEarlyStaleOBSEndedEventDoesNotSkipCurrentAfterWatchdogAdvance(t *testin
 	if currentAfterWatchdog == nil || currentAfterWatchdog.StartedAt == nil {
 		t.Fatalf("current after watchdog = %#v", currentAfterWatchdog)
 	}
+	fakeOBS.mediaStatuses[svc.cfg.OBSMediaSourceName] = obs.MediaInputStatus{State: obs.MediaStateEnded}
 
 	video, err := svc.advancePlaybackForEndedEvent(ctx, obs.Event{
 		Type: obs.EventMediaEnded,
 		Path: second.LocalPath,
-		At:   currentAfterWatchdog.StartedAt.Add(time.Second),
+		At:   currentAfterWatchdog.StartedAt.Add(obsEndedEventSettleGrace + time.Second),
 	})
 	if err != nil {
 		t.Fatalf("stale OBS event: %v", err)
@@ -1025,6 +1943,393 @@ func TestEarlyStaleOBSEndedEventDoesNotSkipCurrentAfterWatchdogAdvance(t *testin
 	if storedThird.Status != queue.StatusReady {
 		t.Fatalf("third status = %s, want %s", storedThird.Status, queue.StatusReady)
 	}
+	if got := fakeOBS.mediaStatusCalls[svc.cfg.OBSMediaSourceName]; got != 1 {
+		t.Fatalf("known-duration guard queried stale OBS status %d times, want watchdog query only", got)
+	}
+}
+
+func TestQueueEndedEventReconcilesTerminalOBSStateWithEmptyMetadata(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	currentReady := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 0)
+	playing, err := svc.store.MarkPlaying(ctx, currentReady.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	next := addReadyVideo(t, ctx, svc, "next.mp4")
+	svc.setPlaybackState(playbackNormal, 0, "")
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStateEnded},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: playing.LocalPath,
+	}
+	tick := playing.StartedAt.Add(obsEndedEventSettleGrace + time.Millisecond)
+	svc.now = func() time.Time { return tick }
+
+	video, err := svc.advancePlaybackForEndedEvent(ctx, obs.Event{
+		Type: obs.EventMediaEnded,
+		At:   tick,
+	})
+	if err != nil {
+		t.Fatalf("reconcile ended event: %v", err)
+	}
+	if video == nil || video.ID != next.ID {
+		t.Fatalf("advanced video = %#v, want next id %d", video, next.ID)
+	}
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if current == nil || current.ID != next.ID {
+		t.Fatalf("current = %#v, want next id %d", current, next.ID)
+	}
+	if fakeOBS.mediaStatusCalls[svc.cfg.OBSMediaSourceName] != 1 {
+		t.Fatalf("media status calls = %d, want 1", fakeOBS.mediaStatusCalls[svc.cfg.OBSMediaSourceName])
+	}
+}
+
+func TestDelayedSamePathEndedEventDoesNotSkipUnknownDurationCurrent(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	firstReady := addReadyVideoWithDuration(t, ctx, svc, "first.mp4", 0)
+	firstPlaying, err := svc.store.MarkPlaying(ctx, firstReady.ID)
+	if err != nil {
+		t.Fatalf("mark first playing: %v", err)
+	}
+	secondDownloading, err := svc.store.AddDownloading(ctx, queue.Video{
+		TelegramFileID:   "second",
+		TelegramUniqueID: "second",
+		FileName:         "second.mp4",
+		LocalPath:        firstPlaying.LocalPath,
+	})
+	if err != nil {
+		t.Fatalf("add second downloading: %v", err)
+	}
+	second, err := svc.store.MarkReady(ctx, secondDownloading.ID, firstPlaying.LocalPath, 100, 0)
+	if err != nil {
+		t.Fatalf("mark second ready: %v", err)
+	}
+	third := addReadyVideo(t, ctx, svc, "third.mp4")
+	svc.setPlaybackState(playbackNormal, 0, "")
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStateEnded},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: firstPlaying.LocalPath,
+	}
+	tick := firstPlaying.StartedAt.Add(obsEndedEventSettleGrace + time.Millisecond)
+	svc.now = func() time.Time { return tick }
+
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("watchdog advance: %v", err)
+	}
+	currentAfterWatchdog, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current after watchdog: %v", err)
+	}
+	if currentAfterWatchdog == nil || currentAfterWatchdog.ID != second.ID {
+		t.Fatalf("current after watchdog = %#v, want second id %d", currentAfterWatchdog, second.ID)
+	}
+	if currentAfterWatchdog.StartedAt == nil {
+		t.Fatalf("second started_at unavailable: %#v", currentAfterWatchdog)
+	}
+	// PlayFile has succeeded, but OBS can briefly continue reporting the
+	// previous generation's terminal state.
+	fakeOBS.mediaStatuses[svc.cfg.OBSMediaSourceName] = obs.MediaInputStatus{State: obs.MediaStateEnded}
+	earlyEventAt := currentAfterWatchdog.StartedAt.Add(time.Millisecond)
+	tick = earlyEventAt
+	generationStartedAt := svc.mediaProgressByInput[svc.cfg.OBSMediaSourceName].GenerationStartedAt
+
+	for _, delayed := range []struct {
+		name string
+		path string
+		at   time.Time
+	}{
+		{name: "same_path", path: firstPlaying.LocalPath, at: earlyEventAt},
+		{name: "empty_path"},
+		{name: "stale_path", path: third.LocalPath, at: currentAfterWatchdog.StartedAt.Add(obsEndedEventSettleGrace + time.Second)},
+	} {
+		t.Run(delayed.name, func(t *testing.T) {
+			video, err := svc.advancePlaybackForEndedEvent(ctx, obs.Event{
+				Type: obs.EventMediaEnded,
+				Path: delayed.path,
+				At:   delayed.at,
+			})
+			if err != nil {
+				t.Fatalf("delayed OBS event: %v", err)
+			}
+			if video != nil {
+				t.Fatalf("delayed OBS event advanced to %#v, want nil", video)
+			}
+		})
+	}
+
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if current == nil || current.ID != second.ID {
+		t.Fatalf("current = %#v, want second id %d", current, second.ID)
+	}
+	storedThird, err := svc.store.Get(ctx, third.ID)
+	if err != nil {
+		t.Fatalf("get third: %v", err)
+	}
+	if storedThird.Status != queue.StatusReady {
+		t.Fatalf("third status = %s, want %s", storedThird.Status, queue.StatusReady)
+	}
+	if fakeOBS.playFileCalls != 1 {
+		t.Fatalf("play calls = %d, want watchdog advance only", fakeOBS.playFileCalls)
+	}
+	if got := fakeOBS.mediaStatusCalls[svc.cfg.OBSMediaSourceName]; got != 1 {
+		t.Fatalf("guarded events queried stale OBS status %d times, want watchdog query only", got)
+	}
+
+	settledFrom := generationStartedAt
+	if currentAfterWatchdog.StartedAt.After(settledFrom) {
+		settledFrom = *currentAfterWatchdog.StartedAt
+	}
+	tick = settledFrom.Add(obsEndedEventSettleGrace + time.Millisecond)
+	video, err := svc.advancePlaybackForEndedEvent(ctx, obs.Event{
+		Type: obs.EventMediaEnded,
+		Path: firstPlaying.LocalPath,
+		At:   tick,
+	})
+	if err != nil {
+		t.Fatalf("legitimate terminal event: %v", err)
+	}
+	if video == nil || video.ID != third.ID {
+		t.Fatalf("legitimate terminal event advanced to %#v, want third id %d", video, third.ID)
+	}
+	current, err = svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current after legitimate event: %v", err)
+	}
+	if current == nil || current.ID != third.ID {
+		t.Fatalf("current after legitimate event = %#v, want third id %d", current, third.ID)
+	}
+	if fakeOBS.playFileCalls != 2 {
+		t.Fatalf("play calls = %d, want watchdog and legitimate event advances", fakeOBS.playFileCalls)
+	}
+	if got := fakeOBS.mediaStatusCalls[svc.cfg.OBSMediaSourceName]; got != 2 {
+		t.Fatalf("media status calls = %d, want watchdog plus legitimate event query", got)
+	}
+}
+
+func TestWatchdogSettlingGuardDoesNotSkipNewSamePathCurrentAfterEndedEvent(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	svc, fakeOBS, _ := newFallbackTestServiceAtDBPath(t, config.Config{FallbackMode: "off"}, dbPath)
+	firstReady := addReadyVideoWithDuration(t, ctx, svc, "first.mp4", 0)
+	firstPlaying, err := svc.store.MarkPlaying(ctx, firstReady.ID)
+	if err != nil {
+		t.Fatalf("mark first playing: %v", err)
+	}
+	secondDownloading, err := svc.store.AddDownloading(ctx, queue.Video{
+		TelegramFileID:   "second",
+		TelegramUniqueID: "second",
+		FileName:         "second.mp4",
+		LocalPath:        firstPlaying.LocalPath,
+	})
+	if err != nil {
+		t.Fatalf("add second downloading: %v", err)
+	}
+	second, err := svc.store.MarkReady(ctx, secondDownloading.ID, firstPlaying.LocalPath, 100, 0)
+	if err != nil {
+		t.Fatalf("mark second ready: %v", err)
+	}
+	third := addReadyVideo(t, ctx, svc, "third.mp4")
+
+	oldStarted := time.Now().UTC().Add(-time.Hour)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+UPDATE videos SET started_at = ?, updated_at = ? WHERE id = ?
+`, formatQueueTime(oldStarted), formatQueueTime(oldStarted), firstPlaying.ID); err != nil {
+		_ = db.Close()
+		t.Fatalf("age first started_at: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw db: %v", err)
+	}
+
+	tick := time.Now().UTC()
+	svc.now = func() time.Time { return tick }
+	svc.setPlaybackState(playbackNormal, 0, "")
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStateEnded},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: firstPlaying.LocalPath,
+	}
+	video, err := svc.advancePlaybackForEndedEvent(ctx, obs.Event{
+		Type: obs.EventMediaEnded,
+		Path: firstPlaying.LocalPath,
+		At:   tick,
+	})
+	if err != nil {
+		t.Fatalf("legitimate first ended event: %v", err)
+	}
+	if video == nil || video.ID != second.ID {
+		t.Fatalf("first ended event advanced to %#v, want second id %d", video, second.ID)
+	}
+	currentSecond, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current second: %v", err)
+	}
+	if currentSecond == nil || currentSecond.ID != second.ID || currentSecond.StartedAt == nil {
+		t.Fatalf("current second = %#v, want id %d with started_at", currentSecond, second.ID)
+	}
+
+	fakeOBS.mediaStatuses[svc.cfg.OBSMediaSourceName] = obs.MediaInputStatus{State: obs.MediaStateEnded}
+	tick = currentSecond.StartedAt.Add(time.Millisecond)
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("immediate watchdog: %v", err)
+	}
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current after immediate watchdog: %v", err)
+	}
+	if current == nil || current.ID != second.ID {
+		t.Fatalf("current after immediate watchdog = %#v, want second id %d", current, second.ID)
+	}
+	storedThird, err := svc.store.Get(ctx, third.ID)
+	if err != nil {
+		t.Fatalf("get third: %v", err)
+	}
+	if storedThird.Status != queue.StatusReady {
+		t.Fatalf("third status = %s, want %s", storedThird.Status, queue.StatusReady)
+	}
+	if fakeOBS.playFileCalls != 1 {
+		t.Fatalf("play calls = %d, want first event advance only", fakeOBS.playFileCalls)
+	}
+
+	generationStartedAt := svc.mediaProgressByInput[svc.cfg.OBSMediaSourceName].GenerationStartedAt
+	settledFrom := generationStartedAt
+	if currentSecond.StartedAt.After(settledFrom) {
+		settledFrom = *currentSecond.StartedAt
+	}
+	tick = settledFrom.Add(obsEndedEventSettleGrace + time.Millisecond)
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("post-grace watchdog: %v", err)
+	}
+	current, err = svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current after post-grace watchdog: %v", err)
+	}
+	if current == nil || current.ID != third.ID {
+		t.Fatalf("current after post-grace watchdog = %#v, want third id %d", current, third.ID)
+	}
+	if fakeOBS.playFileCalls != 2 {
+		t.Fatalf("play calls = %d, want first event and post-grace watchdog advances", fakeOBS.playFileCalls)
+	}
+}
+
+func TestQueueSettlingGuardDefersTransientPathMismatch(t *testing.T) {
+	for _, state := range []obs.MediaState{obs.MediaStatePlaying, obs.MediaStateEnded} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "queue.db")
+			svc, fakeOBS, _ := newFallbackTestServiceAtDBPath(t, config.Config{FallbackMode: "off"}, dbPath)
+			firstReady := addReadyVideoWithDuration(t, ctx, svc, "first.mp4", 0)
+			firstPlaying, err := svc.store.MarkPlaying(ctx, firstReady.ID)
+			if err != nil {
+				t.Fatalf("mark first playing: %v", err)
+			}
+			second := addReadyVideoWithDuration(t, ctx, svc, "second.mp4", 0)
+			third := addReadyVideo(t, ctx, svc, "third.mp4")
+
+			oldStarted := time.Now().UTC().Add(-time.Hour)
+			db, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatalf("open raw db: %v", err)
+			}
+			if _, err := db.ExecContext(ctx, `
+UPDATE videos SET started_at = ?, updated_at = ? WHERE id = ?
+`, formatQueueTime(oldStarted), formatQueueTime(oldStarted), firstPlaying.ID); err != nil {
+				_ = db.Close()
+				t.Fatalf("age first started_at: %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("close raw db: %v", err)
+			}
+
+			tick := time.Now().UTC()
+			svc.now = func() time.Time { return tick }
+			svc.setPlaybackState(playbackNormal, 0, "")
+			fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+				svc.cfg.OBSMediaSourceName: {State: obs.MediaStateEnded},
+			}
+			fakeOBS.inputFiles = map[string]string{
+				svc.cfg.OBSMediaSourceName: firstPlaying.LocalPath,
+			}
+			video, err := svc.advancePlaybackForEndedEvent(ctx, obs.Event{
+				Type: obs.EventMediaEnded,
+				Path: firstPlaying.LocalPath,
+				At:   tick,
+			})
+			if err != nil {
+				t.Fatalf("advance first: %v", err)
+			}
+			if video == nil || video.ID != second.ID {
+				t.Fatalf("first event advanced to %#v, want second id %d", video, second.ID)
+			}
+			currentSecond, err := svc.store.Current(ctx)
+			if err != nil {
+				t.Fatalf("current second: %v", err)
+			}
+			if currentSecond == nil || currentSecond.ID != second.ID || currentSecond.StartedAt == nil {
+				t.Fatalf("current second = %#v, want id %d with started_at", currentSecond, second.ID)
+			}
+			generationStartedAt := svc.mediaProgressByInput[svc.cfg.OBSMediaSourceName].GenerationStartedAt
+
+			fakeOBS.mediaStatuses[svc.cfg.OBSMediaSourceName] = obs.MediaInputStatus{State: state}
+			fakeOBS.inputFiles[svc.cfg.OBSMediaSourceName] = firstPlaying.LocalPath
+			tick = generationStartedAt.Add(time.Millisecond)
+			if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+				t.Fatalf("settling mismatch watchdog: %v", err)
+			}
+			current, err := svc.store.Current(ctx)
+			if err != nil {
+				t.Fatalf("current after settling mismatch: %v", err)
+			}
+			if current == nil || current.ID != second.ID {
+				t.Fatalf("current after settling mismatch = %#v, want second id %d", current, second.ID)
+			}
+			if fakeOBS.playFileCalls != 1 {
+				t.Fatalf("settling mismatch play calls = %d, want initial transition only", fakeOBS.playFileCalls)
+			}
+
+			settledFrom := generationStartedAt
+			if currentSecond.StartedAt.After(settledFrom) {
+				settledFrom = *currentSecond.StartedAt
+			}
+			tick = settledFrom.Add(obsEndedEventSettleGrace + time.Millisecond)
+			if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+				t.Fatalf("post-grace mismatch watchdog: %v", err)
+			}
+			current, err = svc.store.Current(ctx)
+			if err != nil {
+				t.Fatalf("current after post-grace mismatch: %v", err)
+			}
+			if current == nil || current.ID != second.ID {
+				t.Fatalf("current after post-grace mismatch = %#v, want replayed second id %d", current, second.ID)
+			}
+			storedThird, err := svc.store.Get(ctx, third.ID)
+			if err != nil {
+				t.Fatalf("get third: %v", err)
+			}
+			if storedThird.Status != queue.StatusReady {
+				t.Fatalf("third status = %s, want %s", storedThird.Status, queue.StatusReady)
+			}
+			if fakeOBS.playFileCalls != 2 || fakeOBS.lastPlayed != second.LocalPath {
+				t.Fatalf("post-grace mismatch replay calls/path = %d/%q, want 2/%q", fakeOBS.playFileCalls, fakeOBS.lastPlayed, second.LocalPath)
+			}
+		})
+	}
 }
 
 func TestPlaybackWatchdogIgnoresUnknownDuration(t *testing.T) {
@@ -1036,6 +2341,13 @@ func TestPlaybackWatchdogIgnoresUnknownDuration(t *testing.T) {
 		t.Fatalf("mark playing: %v", err)
 	}
 	_ = addReadyVideo(t, ctx, svc, "next.mp4")
+	svc.setPlaybackState(playbackNormal, 0, "")
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStatePlaying},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: playing.LocalPath,
+	}
 	svc.now = func() time.Time {
 		return playing.StartedAt.Add(24 * time.Hour)
 	}
@@ -1052,6 +2364,319 @@ func TestPlaybackWatchdogIgnoresUnknownDuration(t *testing.T) {
 	}
 	if fakeOBS.lastPlayed != "" {
 		t.Fatalf("watchdog should not advance unknown duration, played %q", fakeOBS.lastPlayed)
+	}
+}
+
+func TestPlaybackWatchdogAdvancesMissedTerminalEventWithUnknownDurationExactlyOnce(t *testing.T) {
+	for _, state := range []obs.MediaState{
+		obs.MediaStateStopped,
+		obs.MediaStateEnded,
+		obs.MediaStateError,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			svc, fakeOBS, fakeBot := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+			currentReady := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 0)
+			playing, err := svc.store.MarkPlaying(ctx, currentReady.ID)
+			if err != nil {
+				t.Fatalf("mark playing: %v", err)
+			}
+			next := addReadyVideo(t, ctx, svc, "next.mp4")
+			svc.setPlaybackState(playbackNormal, 0, "")
+			fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+				svc.cfg.OBSMediaSourceName: {State: state},
+			}
+			fakeOBS.inputFiles = map[string]string{
+				svc.cfg.OBSMediaSourceName: playing.LocalPath,
+			}
+			svc.now = func() time.Time {
+				return playing.StartedAt.Add(obsEndedEventSettleGrace + time.Millisecond)
+			}
+
+			if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+				t.Fatalf("first watchdog: %v", err)
+			}
+			if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+				t.Fatalf("second watchdog: %v", err)
+			}
+
+			stored, err := svc.store.Get(ctx, playing.ID)
+			if err != nil {
+				t.Fatalf("get original: %v", err)
+			}
+			if stored.Status != queue.StatusPlayed {
+				t.Fatalf("original status = %s, want %s", stored.Status, queue.StatusPlayed)
+			}
+			current, err := svc.store.Current(ctx)
+			if err != nil {
+				t.Fatalf("current: %v", err)
+			}
+			if current == nil || current.ID != next.ID {
+				t.Fatalf("current = %#v, want next id %d", current, next.ID)
+			}
+			if fakeOBS.playFileCalls != 1 {
+				t.Fatalf("play calls = %d, want exactly 1", fakeOBS.playFileCalls)
+			}
+			if len(fakeBot.messages) != 1 {
+				t.Fatalf("notifications = %d, want exactly 1", len(fakeBot.messages))
+			}
+		})
+	}
+}
+
+func TestPlaybackWatchdogKeepsHealthyUnknownDurationCurrent(t *testing.T) {
+	for _, state := range []obs.MediaState{
+		obs.MediaStatePlaying,
+		obs.MediaStateOpening,
+		obs.MediaStateBuffering,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+			currentReady := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 0)
+			playing, err := svc.store.MarkPlaying(ctx, currentReady.ID)
+			if err != nil {
+				t.Fatalf("mark playing: %v", err)
+			}
+			_ = addReadyVideo(t, ctx, svc, "next.mp4")
+			svc.setPlaybackState(playbackNormal, 0, "")
+			fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+				svc.cfg.OBSMediaSourceName: {State: state},
+			}
+			fakeOBS.inputFiles = map[string]string{
+				svc.cfg.OBSMediaSourceName: playing.LocalPath,
+			}
+
+			if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+				t.Fatalf("watchdog: %v", err)
+			}
+
+			current, err := svc.store.Current(ctx)
+			if err != nil {
+				t.Fatalf("current: %v", err)
+			}
+			if current == nil || current.ID != playing.ID {
+				t.Fatalf("current = %#v, want original id %d", current, playing.ID)
+			}
+			if fakeOBS.playFileCalls != 0 {
+				t.Fatalf("healthy state replayed %d times, want 0", fakeOBS.playFileCalls)
+			}
+		})
+	}
+}
+
+func TestPlaybackWatchdogReplaysPausedOrEmptyCurrentWithoutSkipping(t *testing.T) {
+	for _, state := range []obs.MediaState{obs.MediaStatePaused, obs.MediaStateNone} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+			currentReady := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 0)
+			playing, err := svc.store.MarkPlaying(ctx, currentReady.ID)
+			if err != nil {
+				t.Fatalf("mark playing: %v", err)
+			}
+			next := addReadyVideo(t, ctx, svc, "next.mp4")
+			svc.setPlaybackState(playbackNormal, 0, "")
+			fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+				svc.cfg.OBSMediaSourceName: {State: state},
+			}
+			fakeOBS.inputFiles = map[string]string{
+				svc.cfg.OBSMediaSourceName: playing.LocalPath,
+			}
+
+			if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+				t.Fatalf("first watchdog: %v", err)
+			}
+			if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+				t.Fatalf("second watchdog: %v", err)
+			}
+
+			current, err := svc.store.Current(ctx)
+			if err != nil {
+				t.Fatalf("current: %v", err)
+			}
+			if current == nil || current.ID != playing.ID {
+				t.Fatalf("current = %#v, want original id %d", current, playing.ID)
+			}
+			storedNext, err := svc.store.Get(ctx, next.ID)
+			if err != nil {
+				t.Fatalf("get next: %v", err)
+			}
+			if storedNext.Status != queue.StatusReady {
+				t.Fatalf("next status = %s, want %s", storedNext.Status, queue.StatusReady)
+			}
+			if fakeOBS.playFileCalls != 1 {
+				t.Fatalf("replay calls = %d, want exactly 1", fakeOBS.playFileCalls)
+			}
+			if fakeOBS.lastPlayed != playing.LocalPath {
+				t.Fatalf("replayed path = %q, want %q", fakeOBS.lastPlayed, playing.LocalPath)
+			}
+		})
+	}
+}
+
+func TestPlaybackWatchdogReplaysExpectedPathInsteadOfAdvancingStaleTerminalSource(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	currentReady := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 0)
+	playing, err := svc.store.MarkPlaying(ctx, currentReady.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	next := addReadyVideo(t, ctx, svc, "next.mp4")
+	svc.setPlaybackState(playbackNormal, 0, "")
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStateEnded},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: next.LocalPath,
+	}
+	svc.now = func() time.Time {
+		return playing.StartedAt.Add(obsEndedEventSettleGrace + time.Millisecond)
+	}
+
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("watchdog: %v", err)
+	}
+
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if current == nil || current.ID != playing.ID {
+		t.Fatalf("current = %#v, want original id %d", current, playing.ID)
+	}
+	if fakeOBS.playFileCalls != 1 || fakeOBS.lastPlayed != playing.LocalPath {
+		t.Fatalf("replay calls/path = %d/%q, want 1/%q", fakeOBS.playFileCalls, fakeOBS.lastPlayed, playing.LocalPath)
+	}
+}
+
+func TestPlaybackWatchdogFrozenCursorUsesGraceAndProgressReset(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	currentReady := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 0)
+	playing, err := svc.store.MarkPlaying(ctx, currentReady.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	svc.setPlaybackState(playbackNormal, 0, "")
+	tick := playing.StartedAt.Add(time.Minute)
+	svc.now = func() time.Time { return tick }
+	cursor := 100.0
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {
+			State:              obs.MediaStatePlaying,
+			CursorMilliseconds: &cursor,
+		},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: playing.LocalPath,
+	}
+
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("initial watchdog: %v", err)
+	}
+	tick = tick.Add(mediaProgressGrace - time.Second)
+	cursor = 200
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("progress watchdog: %v", err)
+	}
+	tick = tick.Add(mediaProgressGrace - time.Second)
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("pre-grace watchdog: %v", err)
+	}
+	if fakeOBS.playFileCalls != 0 {
+		t.Fatalf("progress reset still replayed %d times before grace", fakeOBS.playFileCalls)
+	}
+	tick = tick.Add(2 * time.Second)
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("stalled watchdog: %v", err)
+	}
+	if fakeOBS.playFileCalls != 1 {
+		t.Fatalf("frozen cursor replay calls = %d, want 1", fakeOBS.playFileCalls)
+	}
+}
+
+func TestPlaybackWatchdogOpeningToBufferingProgressEventuallyStalls(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	currentReady := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 0)
+	playing, err := svc.store.MarkPlaying(ctx, currentReady.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	svc.setPlaybackState(playbackNormal, 0, "")
+	tick := playing.StartedAt.Add(time.Minute)
+	svc.now = func() time.Time { return tick }
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStateOpening},
+	}
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: playing.LocalPath,
+	}
+
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("opening watchdog: %v", err)
+	}
+	tick = tick.Add(mediaProgressGrace - time.Second)
+	fakeOBS.mediaStatuses[svc.cfg.OBSMediaSourceName] = obs.MediaInputStatus{State: obs.MediaStateBuffering}
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("buffering transition watchdog: %v", err)
+	}
+	tick = tick.Add(mediaProgressGrace - time.Second)
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("pre-grace buffering watchdog: %v", err)
+	}
+	if fakeOBS.playFileCalls != 0 {
+		t.Fatalf("state transition did not reset progress grace; replay calls = %d", fakeOBS.playFileCalls)
+	}
+	tick = tick.Add(2 * time.Second)
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("stalled buffering watchdog: %v", err)
+	}
+	if fakeOBS.playFileCalls != 1 {
+		t.Fatalf("stalled buffering replay calls = %d, want 1", fakeOBS.playFileCalls)
+	}
+}
+
+func TestPlaybackWatchdogOpeningBufferingOscillationHitsHardGrace(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+	currentReady := addReadyVideoWithDuration(t, ctx, svc, "current.mp4", 0)
+	playing, err := svc.store.MarkPlaying(ctx, currentReady.ID)
+	if err != nil {
+		t.Fatalf("mark playing: %v", err)
+	}
+	svc.setPlaybackState(playbackNormal, 0, "")
+	tick := playing.StartedAt.Add(time.Minute)
+	svc.now = func() time.Time { return tick }
+	fakeOBS.inputFiles = map[string]string{
+		svc.cfg.OBSMediaSourceName: playing.LocalPath,
+	}
+
+	for i := 0; i < 4; i++ {
+		state := obs.MediaStateOpening
+		if i%2 == 1 {
+			state = obs.MediaStateBuffering
+		}
+		fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+			svc.cfg.OBSMediaSourceName: {State: state},
+		}
+		if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+			t.Fatalf("oscillation watchdog %d: %v", i, err)
+		}
+		if fakeOBS.playFileCalls != 0 {
+			t.Fatalf("oscillation replayed at tick %d before hard grace", i)
+		}
+		tick = tick.Add(mediaProgressGrace / 2)
+	}
+
+	fakeOBS.mediaStatuses[svc.cfg.OBSMediaSourceName] = obs.MediaInputStatus{State: obs.MediaStateOpening}
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("hard-grace watchdog: %v", err)
+	}
+	if fakeOBS.playFileCalls != 1 {
+		t.Fatalf("oscillation hard-grace replay calls = %d, want 1", fakeOBS.playFileCalls)
 	}
 }
 
@@ -1162,11 +2787,14 @@ func newFallbackTestServiceAtDBPath(t *testing.T, cfg config.Config, dbPath stri
 	if cfg.TelegramBotAPIDir == "" {
 		cfg.TelegramBotAPIDir = t.TempDir()
 	}
+	if cfg.OBSMediaSourceName == "" {
+		cfg.OBSMediaSourceName = "media"
+	}
 	if err := os.MkdirAll(cfg.TelegramBotAPIDir, 0o755); err != nil {
 		t.Fatalf("create telegram bot api dir: %v", err)
 	}
 	cfg.AllowedChatID = -100123
-	fakeOBS := &fakeOBS{state: obs.StateConnected}
+	fakeOBS := &fakeOBS{state: obs.StateConnected, mediaSourceName: cfg.OBSMediaSourceName}
 	fakeBot := &fakeBot{}
 	return &Service{
 		cfg:      cfg,
@@ -1239,7 +2867,11 @@ func newLibraryTestService(t *testing.T) (*Service, *fakeOBS) {
 	if err != nil {
 		t.Fatalf("new media manager: %v", err)
 	}
-	fakeOBS := &fakeOBS{state: obs.StateConnected, sourcePlayed: make(map[string]string)}
+	fakeOBS := &fakeOBS{
+		state:           obs.StateConnected,
+		sourcePlayed:    make(map[string]string),
+		mediaSourceName: cfg.OBSMediaSourceName,
+	}
 	return &Service{
 		cfg:      cfg,
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -1401,20 +3033,83 @@ var (
 )
 
 type fakeOBS struct {
-	state        obs.State
-	lastPlayed   string
-	lastSource   string
-	sourcePlayed map[string]string
-	playErr      error
+	state            obs.State
+	lastPlayed       string
+	lastSource       string
+	sourcePlayed     map[string]string
+	sourcePlayCalls  map[string]int
+	mediaStatuses    map[string]obs.MediaInputStatus
+	mediaStatusErrs  map[string]error
+	mediaStatusCalls map[string]int
+	inputFiles       map[string]string
+	inputSettingsErr map[string]error
+	inputSettingCall map[string]int
+	mediaSourceName  string
+	connectErr       error
+	connectNotify    chan struct{}
+	connectCalls     int
+	probeErr         error
+	probeCalls       int
+	playFileCalls    int
+	playErr          error
 }
 
-func (f *fakeOBS) Connect(context.Context) error { return nil }
-func (f *fakeOBS) Close() error                  { return nil }
-func (f *fakeOBS) Events() <-chan obs.Event      { return nil }
+func (f *fakeOBS) Connect(context.Context) error {
+	f.connectCalls++
+	if f.connectErr != nil {
+		return f.connectErr
+	}
+	f.state = obs.StateConnected
+	if f.connectNotify != nil {
+		f.connectNotify <- struct{}{}
+	}
+	return nil
+}
+func (f *fakeOBS) Close() error             { return nil }
+func (f *fakeOBS) Events() <-chan obs.Event { return nil }
+func (f *fakeOBS) Probe(context.Context) error {
+	f.probeCalls++
+	return f.probeErr
+}
+func (f *fakeOBS) GetMediaInputStatus(_ context.Context, inputName string) (obs.MediaInputStatus, error) {
+	if f.mediaStatusCalls == nil {
+		f.mediaStatusCalls = make(map[string]int)
+	}
+	f.mediaStatusCalls[inputName]++
+	if err := f.mediaStatusErrs[inputName]; err != nil {
+		return obs.MediaInputStatus{}, err
+	}
+	if status, ok := f.mediaStatuses[inputName]; ok {
+		return status, nil
+	}
+	return obs.MediaInputStatus{State: obs.MediaStatePlaying}, nil
+}
+func (f *fakeOBS) GetInputSettings(_ context.Context, inputName string) (obs.InputSettings, error) {
+	if f.inputSettingCall == nil {
+		f.inputSettingCall = make(map[string]int)
+	}
+	f.inputSettingCall[inputName]++
+	if err := f.inputSettingsErr[inputName]; err != nil {
+		return obs.InputSettings{}, err
+	}
+	return obs.InputSettings{
+		LocalFile: f.inputFiles[inputName],
+		InputKind: "ffmpeg_source",
+	}, nil
+}
 func (f *fakeOBS) PlayFile(_ context.Context, path string) error {
 	if f.playErr != nil {
 		return f.playErr
 	}
+	f.playFileCalls++
+	if f.inputFiles == nil {
+		f.inputFiles = make(map[string]string)
+	}
+	if f.mediaStatuses == nil {
+		f.mediaStatuses = make(map[string]obs.MediaInputStatus)
+	}
+	f.inputFiles[f.mediaSourceName] = path
+	f.mediaStatuses[f.mediaSourceName] = obs.MediaInputStatus{State: obs.MediaStatePlaying}
 	f.lastPlayed = path
 	f.lastSource = ""
 	return nil
@@ -1426,19 +3121,39 @@ func (f *fakeOBS) PlaySourceFile(_ context.Context, sourceName string, path stri
 	if f.sourcePlayed == nil {
 		f.sourcePlayed = make(map[string]string)
 	}
+	if f.sourcePlayCalls == nil {
+		f.sourcePlayCalls = make(map[string]int)
+	}
+	if f.mediaStatuses == nil {
+		f.mediaStatuses = make(map[string]obs.MediaInputStatus)
+	}
+	if f.inputFiles == nil {
+		f.inputFiles = make(map[string]string)
+	}
 	f.sourcePlayed[sourceName] = path
+	f.sourcePlayCalls[sourceName]++
+	f.inputFiles[sourceName] = path
+	f.mediaStatuses[sourceName] = obs.MediaInputStatus{State: obs.MediaStatePlaying}
 	f.lastPlayed = path
 	f.lastSource = sourceName
 	return nil
 }
 func (f *fakeOBS) StopCurrent(context.Context) error {
 	f.lastPlayed = ""
+	if f.mediaStatuses == nil {
+		f.mediaStatuses = make(map[string]obs.MediaInputStatus)
+	}
+	f.mediaStatuses[f.mediaSourceName] = obs.MediaInputStatus{State: obs.MediaStateStopped}
 	return nil
 }
 func (f *fakeOBS) StopSource(_ context.Context, sourceName string) error {
 	if f.sourcePlayed != nil {
 		delete(f.sourcePlayed, sourceName)
 	}
+	if f.mediaStatuses == nil {
+		f.mediaStatuses = make(map[string]obs.MediaInputStatus)
+	}
+	f.mediaStatuses[sourceName] = obs.MediaInputStatus{State: obs.MediaStateStopped}
 	if f.lastSource == sourceName {
 		f.lastPlayed = ""
 	}
