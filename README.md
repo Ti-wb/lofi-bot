@@ -84,7 +84,9 @@ For unattended use with the portable shell environment, build first and keep `./
 ./run.sh up
 ```
 
-`./run.sh up` supervises the Telegram Local Bot API Server and `tg-obs-bot` separately. If either child exits, only that child is restarted with exponential backoff. The supervisor uses `dist/tg-obs-bot` when it is current; if the binary is missing or older than Go source files, it falls back to `go run` and prints a warning. You can set `RESTART_MIN_DELAY_SECONDS`, `RESTART_MAX_DELAY_SECONDS`, or `APP_BIN` to customize restart delays or the app binary path. Restart delays must be positive integers no larger than 86400 seconds.
+`./run.sh up` supervises the Telegram Local Bot API Server and `tg-obs-bot` separately. It never supervises `go run`: when `dist/tg-obs-bot` is missing or older than the Go sources, startup first builds a temporary binary and atomically installs it; a build or process-group isolation failure aborts startup. Each service generation runs in its own process group, and the supervisor drains that complete group before starting a replacement, so descendants cannot accumulate across crashes. The root process also tracks each active generation in private runtime state; if either service supervisor dies unexpectedly, it drains both trees and exits non-zero. `HUP`, `Ctrl-C`/`INT`, and `TERM` use a bounded `TERM`-then-`KILL` shutdown.
+
+Set `APP_BIN` to use a different executable. The optional supervisor controls are `RESTART_MIN_DELAY_SECONDS` (default `2`), `RESTART_MAX_DELAY_SECONDS` (default `60`), `RESTART_RESET_AFTER_SECONDS` (default `300`, resets exponential backoff after a stable run), and `SHUTDOWN_GRACE_SECONDS` (default `15`). These values must be positive integers no larger than 86400 seconds.
 
 After changing `.env`, restart the root `./run.sh up` process so both child services inherit the same configuration.
 

@@ -11,6 +11,7 @@ GO_MOD_CACHE_DIR="$REPO_ROOT/.cache/go-mod"
 CURRENT_ENV_SCHEMA_VERSION=4
 DEFAULT_APP_BIN="$REPO_ROOT/dist/tg-obs-bot"
 MAX_RESTART_DELAY_SECONDS=86400
+ROOT_SHUTDOWN_BUFFER_SECONDS=2
 
 die() {
   printf '%s\n' "error: $1" >&2
@@ -426,21 +427,85 @@ app_sources_newer_than_bin() {
   return 1
 }
 
+build_default_app_binary() {
+  mkdir -p "$REPO_ROOT/dist"
+  build_path="$REPO_ROOT/dist/.tg-obs-bot.build.$$"
+  build_signal_status=
+  build_pid=
+  build_launching=true
+
+  stop_build_process_group() {
+    trap - HUP INT TERM
+    if [ -z "$build_pid" ] && [ "$build_launching" = true ]; then
+      capture_last_background_pid
+      build_pid=$LAST_BACKGROUND_PID
+    fi
+    if [ -n "$build_pid" ]; then
+      if is_process_group_leader "$build_pid"; then
+        stop_child_process_group "$build_pid" "tg-obs-bot build" || true
+      elif kill -0 "$build_pid" 2>/dev/null; then
+        stop_single_child "$build_pid" "tg-obs-bot build"
+      fi
+    fi
+    exit "$build_signal_status"
+  }
+
+  trap 'build_signal_status=129; stop_build_process_group' HUP
+  trap 'build_signal_status=130; stop_build_process_group' INT
+  trap 'build_signal_status=143; stop_build_process_group' TERM
+  set -m
+  (
+    set +m
+    trap 'rm -f "$build_path"' 0
+    trap 'exit 1' HUP INT TERM
+    cd "$REPO_ROOT"
+    info "Building tg-obs-bot..."
+    env GOCACHE="$GO_CACHE_DIR" GOMODCACHE="$GO_MOD_CACHE_DIR" "${GO:-go}" build -o "$build_path" ./cmd/tg-obs-bot
+    mv "$build_path" "$DEFAULT_APP_BIN"
+    trap - 0 HUP INT TERM
+  ) &
+  build_pid=$!
+  set +m
+  build_launching=false
+  if ! is_process_group_leader "$build_pid"; then
+    kill -TERM "$build_pid" 2>/dev/null || true
+    wait "$build_pid" 2>/dev/null || true
+    die "could not isolate tg-obs-bot build process group"
+  fi
+
+  build_status=0
+  wait "$build_pid" || build_status=$?
+  trap - HUP INT TERM
+  return "$build_status"
+}
+
+prepare_app_binary() {
+  if [ -n "${APP_BIN:-}" ]; then
+    case "$APP_BIN" in
+      /*) app_executable=$APP_BIN ;;
+      */*) app_executable="$REPO_ROOT/$APP_BIN" ;;
+      *)
+        app_executable=$(command -v "$APP_BIN" 2>/dev/null) || die "APP_BIN is not executable or not found: $APP_BIN"
+        ;;
+    esac
+    [ -f "$app_executable" ] && [ -x "$app_executable" ] || die "APP_BIN is not executable or not found: $APP_BIN"
+    APP_EXECUTABLE=$app_executable
+    return
+  fi
+
+  if [ ! -x "$DEFAULT_APP_BIN" ]; then
+    info "Built binary not found at $DEFAULT_APP_BIN; building it before startup."
+    build_default_app_binary
+  elif app_sources_newer_than_bin; then
+    info "Built binary at $DEFAULT_APP_BIN is older than Go sources; rebuilding it before startup."
+    build_default_app_binary
+  fi
+  APP_EXECUTABLE=$DEFAULT_APP_BIN
+}
+
 run_app_process() {
   cd "$REPO_ROOT"
-  if [ -n "${APP_BIN:-}" ]; then
-    exec "$APP_BIN"
-  fi
-  if [ -x "$DEFAULT_APP_BIN" ]; then
-    if app_sources_newer_than_bin; then
-      info "Built binary at $DEFAULT_APP_BIN is older than Go sources; falling back to go run. Run ./run.sh build before unattended production use."
-    else
-      exec "$DEFAULT_APP_BIN"
-    fi
-  else
-    info "Built binary not found at $DEFAULT_APP_BIN; falling back to go run. Run ./run.sh build for production."
-  fi
-  exec env GOCACHE="$GO_CACHE_DIR" GOMODCACHE="$GO_MOD_CACHE_DIR" "${GO:-go}" run ./cmd/tg-obs-bot
+  exec "$APP_EXECUTABLE"
 }
 
 run_app() {
@@ -449,6 +514,14 @@ run_app() {
   require_value TELEGRAM_API_BASE_URL
   require_value ALLOWED_CHAT_ID
   ensure_go_cache
+  : "${SHUTDOWN_GRACE_SECONDS:=15}"
+  if ! is_positive_integer "$SHUTDOWN_GRACE_SECONDS"; then
+    die "SHUTDOWN_GRACE_SECONDS must be a positive integer"
+  fi
+  if [ "$SHUTDOWN_GRACE_SECONDS" -gt "$MAX_RESTART_DELAY_SECONDS" ]; then
+    die "SHUTDOWN_GRACE_SECONDS must be no greater than $MAX_RESTART_DELAY_SECONDS"
+  fi
+  prepare_app_binary
   run_app_process
 }
 
@@ -482,6 +555,244 @@ wait_for_health() {
   return 1
 }
 
+signal_process_group() {
+  signal=$1
+  group_leader=$2
+  /bin/kill "-$signal" "-$group_leader" 2>/dev/null || true
+}
+
+capture_last_background_pid() {
+  set +u
+  LAST_BACKGROUND_PID=$!
+  set -u
+}
+
+stop_single_child() {
+  single_pid=$1
+  single_name=$2
+  kill -TERM "$single_pid" 2>/dev/null || true
+  (
+    sleep "$SHUTDOWN_GRACE_SECONDS"
+    if kill -0 "$single_pid" 2>/dev/null; then
+      info "$single_name did not stop within ${SHUTDOWN_GRACE_SECONDS}s; sending KILL to PID $single_pid."
+      kill -KILL "$single_pid" 2>/dev/null || true
+    fi
+  ) &
+  single_killer_pid=$!
+  wait "$single_pid" 2>/dev/null || true
+  kill "$single_killer_pid" 2>/dev/null || true
+  wait "$single_killer_pid" 2>/dev/null || true
+}
+
+wait_for_process_group_exit() {
+  wait_group_leader=$1
+  wait_seconds=$2
+  wait_elapsed=0
+  while [ "$wait_elapsed" -lt "$wait_seconds" ]; do
+    if ! process_group_alive "$wait_group_leader"; then
+      return 0
+    fi
+    sleep 1
+    wait_elapsed=$((wait_elapsed + 1))
+  done
+  ! process_group_alive "$wait_group_leader"
+}
+
+drain_process_group() {
+  drain_group_leader=$1
+  drain_name=$2
+  if ! process_group_alive "$drain_group_leader"; then
+    return 0
+  fi
+  signal_process_group TERM "$drain_group_leader"
+  if ! wait_for_process_group_exit "$drain_group_leader" "$SHUTDOWN_GRACE_SECONDS"; then
+    info "$drain_name left processes behind after exit; sending KILL to process group $drain_group_leader."
+    signal_process_group KILL "$drain_group_leader"
+    wait_for_process_group_exit "$drain_group_leader" 1 || return 1
+  fi
+}
+
+stop_child_process_group() {
+  stop_group_leader=$1
+  stop_name=$2
+  if ! process_group_alive "$stop_group_leader"; then
+    wait "$stop_group_leader" 2>/dev/null || true
+    return 0
+  fi
+
+  signal_process_group TERM "$stop_group_leader"
+  (
+    sleep "$SHUTDOWN_GRACE_SECONDS"
+    if process_group_alive "$stop_group_leader"; then
+      info "$stop_name did not stop within ${SHUTDOWN_GRACE_SECONDS}s; sending KILL to process group $stop_group_leader."
+      signal_process_group KILL "$stop_group_leader"
+    fi
+  ) &
+  stop_killer_pid=$!
+  wait "$stop_group_leader" 2>/dev/null || true
+  if process_group_alive "$stop_group_leader"; then
+    wait "$stop_killer_pid" 2>/dev/null || true
+  else
+    kill "$stop_killer_pid" 2>/dev/null || true
+    wait "$stop_killer_pid" 2>/dev/null || true
+  fi
+  if process_group_alive "$stop_group_leader"; then
+    signal_process_group KILL "$stop_group_leader"
+    wait_for_process_group_exit "$stop_group_leader" 1 || return 1
+  fi
+}
+
+process_group_alive() {
+  group_leader=$1
+  /bin/kill -0 "-$group_leader" 2>/dev/null
+}
+
+is_process_group_leader() {
+  process_pid=$1
+  process_pgid=$(ps -o pgid= -p "$process_pid" 2>/dev/null | tr -d '[:space:]')
+  [ "$process_pgid" = "$process_pid" ]
+}
+
+read_process_group_state() {
+  state_file=$1
+  state_group=
+  if [ -r "$state_file" ]; then
+    IFS= read -r state_group <"$state_file" || state_group=
+  fi
+  case "$state_group" in
+    ""|*[!0-9]*|0) return 0 ;;
+  esac
+  printf '%s' "$state_group"
+}
+
+process_has_exited() {
+  watched_pid=$1
+  watched_state=$(ps -o stat= -p "$watched_pid" 2>/dev/null | tr -d '[:space:]')
+  case "$watched_state" in
+    ""|Z*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+supervise_service() {
+  service_name=$1
+  service_kind=$2
+  supervisor_state_file=$3
+  set +m
+  child_pid=
+  child_launching=false
+  child_group_owned=false
+
+  record_child_group() {
+    recorded_group=$1
+    child_group_owned=true
+    if ! printf '%s\n' "$recorded_group" >"${supervisor_state_file}.tmp" ||
+       ! mv "${supervisor_state_file}.tmp" "$supervisor_state_file"; then
+      info "error: could not record $service_name child process group $recorded_group"
+      stop_child_process_group "$recorded_group" "$service_name" || true
+      rm -f "${supervisor_state_file}.tmp"
+      child_group_owned=false
+      kill -TERM "$root_supervisor_pid" 2>/dev/null || true
+      return 1
+    fi
+  }
+
+  clear_child_group() {
+    rm -f "$supervisor_state_file" "${supervisor_state_file}.tmp"
+    child_group_owned=false
+  }
+
+  stop_supervised_child() {
+    trap - HUP INT TERM
+    if [ -z "$child_pid" ] && [ "$child_launching" = true ]; then
+      capture_last_background_pid
+      child_pid=$LAST_BACKGROUND_PID
+    fi
+    if [ -n "$child_pid" ]; then
+      if [ "$child_group_owned" = true ]; then
+        if stop_child_process_group "$child_pid" "$service_name"; then
+          clear_child_group
+        fi
+      elif is_process_group_leader "$child_pid"; then
+        if stop_child_process_group "$child_pid" "$service_name"; then
+          clear_child_group
+        fi
+      elif kill -0 "$child_pid" 2>/dev/null; then
+        stop_single_child "$child_pid" "$service_name"
+      fi
+    fi
+    exit 0
+  }
+
+  trap stop_supervised_child HUP INT TERM
+  delay=$RESTART_MIN_DELAY_SECONDS
+  while :; do
+    info "Starting $service_name..."
+    started_at=$(date +%s)
+    child_pid=
+    child_launching=true
+    set -m
+    case "$service_kind" in
+      bot-api) "$BOT_API_RUN" & ;;
+      app) run_app_process & ;;
+      *) die "unknown supervised service kind: $service_kind" ;;
+    esac
+    child_pid=$!
+    set +m
+    child_launching=false
+    if ! is_process_group_leader "$child_pid"; then
+      kill -TERM "$child_pid" 2>/dev/null || true
+      wait "$child_pid" 2>/dev/null || true
+      info "error: could not isolate $service_name child process group"
+      kill -TERM "$root_supervisor_pid" 2>/dev/null || true
+      exit 1
+    fi
+    record_child_group "$child_pid"
+    status=0
+    wait "$child_pid" || status=$?
+    exited_child_pid=$child_pid
+    if ! drain_process_group "$exited_child_pid" "$service_name"; then
+      info "error: could not drain $service_name process group $exited_child_pid"
+      kill -TERM "$root_supervisor_pid" 2>/dev/null || true
+      exit 1
+    fi
+    clear_child_group
+    child_pid=
+    ended_at=$(date +%s)
+    runtime=$((ended_at - started_at))
+    if [ "$runtime" -ge "$RESTART_RESET_AFTER_SECONDS" ]; then
+      if [ "$delay" -ne "$RESTART_MIN_DELAY_SECONDS" ]; then
+        info "$service_name ran for ${runtime}s; resetting restart delay."
+      fi
+      delay=$RESTART_MIN_DELAY_SECONDS
+    fi
+    info "$service_name exited with status $status; restarting in ${delay}s..."
+    child_launching=true
+    set -m
+    sleep "$delay" &
+    child_pid=$!
+    set +m
+    child_launching=false
+    if ! is_process_group_leader "$child_pid"; then
+      kill -TERM "$child_pid" 2>/dev/null || true
+      wait "$child_pid" 2>/dev/null || true
+      info "error: could not isolate $service_name restart-delay process group"
+      kill -TERM "$root_supervisor_pid" 2>/dev/null || true
+      exit 1
+    fi
+    record_child_group "$child_pid"
+    wait "$child_pid" 2>/dev/null || true
+    if ! drain_process_group "$child_pid" "$service_name restart delay"; then
+      info "error: could not drain $service_name restart-delay process group $child_pid"
+      kill -TERM "$root_supervisor_pid" 2>/dev/null || true
+      exit 1
+    fi
+    clear_child_group
+    child_pid=
+    delay=$(delay_next "$delay")
+  done
+}
+
 run_up() {
   load_env
   require_stack_env
@@ -489,11 +800,19 @@ run_up() {
 
   : "${RESTART_MIN_DELAY_SECONDS:=2}"
   : "${RESTART_MAX_DELAY_SECONDS:=60}"
+  : "${RESTART_RESET_AFTER_SECONDS:=300}"
+  : "${SHUTDOWN_GRACE_SECONDS:=15}"
   if ! is_positive_integer "$RESTART_MIN_DELAY_SECONDS"; then
     die "RESTART_MIN_DELAY_SECONDS must be a positive integer"
   fi
   if ! is_positive_integer "$RESTART_MAX_DELAY_SECONDS"; then
     die "RESTART_MAX_DELAY_SECONDS must be a positive integer"
+  fi
+  if ! is_positive_integer "$RESTART_RESET_AFTER_SECONDS"; then
+    die "RESTART_RESET_AFTER_SECONDS must be a positive integer"
+  fi
+  if ! is_positive_integer "$SHUTDOWN_GRACE_SECONDS"; then
+    die "SHUTDOWN_GRACE_SECONDS must be a positive integer"
   fi
   if [ "$RESTART_MIN_DELAY_SECONDS" -gt "$MAX_RESTART_DELAY_SECONDS" ]; then
     die "RESTART_MIN_DELAY_SECONDS must be no greater than $MAX_RESTART_DELAY_SECONDS"
@@ -501,23 +820,104 @@ run_up() {
   if [ "$RESTART_MAX_DELAY_SECONDS" -gt "$MAX_RESTART_DELAY_SECONDS" ]; then
     die "RESTART_MAX_DELAY_SECONDS must be no greater than $MAX_RESTART_DELAY_SECONDS"
   fi
+  if [ "$RESTART_RESET_AFTER_SECONDS" -gt "$MAX_RESTART_DELAY_SECONDS" ]; then
+    die "RESTART_RESET_AFTER_SECONDS must be no greater than $MAX_RESTART_DELAY_SECONDS"
+  fi
+  if [ "$SHUTDOWN_GRACE_SECONDS" -gt "$MAX_RESTART_DELAY_SECONDS" ]; then
+    die "SHUTDOWN_GRACE_SECONDS must be no greater than $MAX_RESTART_DELAY_SECONDS"
+  fi
   if [ "$RESTART_MAX_DELAY_SECONDS" -lt "$RESTART_MIN_DELAY_SECONDS" ]; then
     die "RESTART_MAX_DELAY_SECONDS must be greater than or equal to RESTART_MIN_DELAY_SECONDS"
   fi
+  root_supervisor_pid=$$
+  prepare_app_binary
 
   bot_api_supervisor_pid=""
   app_supervisor_pid=""
+  shutdown_status=
+  supervisor_launching=
+  candidate_pid=
+  supervisor_state_dir=
+  bot_child_state_file=
+  app_child_state_file=
 
   cleanup() {
-    status=$?
-    trap - INT TERM EXIT
-    if [ -n "$app_supervisor_pid" ] && kill -0 "$app_supervisor_pid" 2>/dev/null; then
-      kill "$app_supervisor_pid" 2>/dev/null || true
-      wait "$app_supervisor_pid" 2>/dev/null || true
+    status=${shutdown_status:-$?}
+    trap - 0 HUP INT TERM
+
+    if [ -n "$supervisor_launching" ] && [ -z "$candidate_pid" ]; then
+      capture_last_background_pid
+      pending_pid=$LAST_BACKGROUND_PID
+      if [ "$pending_pid" != "$bot_api_supervisor_pid" ] && [ "$pending_pid" != "$app_supervisor_pid" ]; then
+        candidate_pid=$pending_pid
+      fi
     fi
-    if [ -n "$bot_api_supervisor_pid" ] && kill -0 "$bot_api_supervisor_pid" 2>/dev/null; then
-      kill "$bot_api_supervisor_pid" 2>/dev/null || true
-      wait "$bot_api_supervisor_pid" 2>/dev/null || true
+    if [ -n "$supervisor_launching" ] && [ -n "$candidate_pid" ]; then
+      if is_process_group_leader "$candidate_pid"; then
+        case "$supervisor_launching" in
+          bot-api) bot_api_supervisor_pid=$candidate_pid ;;
+          app) app_supervisor_pid=$candidate_pid ;;
+        esac
+      elif kill -0 "$candidate_pid" 2>/dev/null; then
+        stop_single_child "$candidate_pid" "service supervisor"
+      fi
+    fi
+
+    bot_child_group=$(read_process_group_state "$bot_child_state_file")
+    app_child_group=$(read_process_group_state "$app_child_state_file")
+
+    for supervisor_pid in "$app_supervisor_pid" "$bot_api_supervisor_pid"; do
+      if [ -n "$supervisor_pid" ] && process_group_alive "$supervisor_pid"; then
+        signal_process_group TERM "$supervisor_pid"
+      fi
+    done
+    for child_group in "$app_child_group" "$bot_child_group"; do
+      if [ -n "$child_group" ] && process_group_alive "$child_group"; then
+        signal_process_group TERM "$child_group"
+      fi
+    done
+
+    root_shutdown_limit=$((SHUTDOWN_GRACE_SECONDS + ROOT_SHUTDOWN_BUFFER_SECONDS))
+    elapsed=0
+    while [ "$elapsed" -lt "$root_shutdown_limit" ]; do
+      groups_alive=false
+      for supervisor_pid in "$app_supervisor_pid" "$bot_api_supervisor_pid"; do
+        if [ -n "$supervisor_pid" ] && process_group_alive "$supervisor_pid"; then
+          groups_alive=true
+        fi
+      done
+      for child_group in "$app_child_group" "$bot_child_group"; do
+        if [ -n "$child_group" ] && process_group_alive "$child_group"; then
+          groups_alive=true
+        fi
+      done
+      [ "$groups_alive" = false ] && break
+      sleep 1
+      elapsed=$((elapsed + 1))
+    done
+
+    for supervisor_pid in "$app_supervisor_pid" "$bot_api_supervisor_pid"; do
+      if [ -n "$supervisor_pid" ] && process_group_alive "$supervisor_pid"; then
+        info "Service supervisor process group $supervisor_pid did not stop after child shutdown grace; sending KILL."
+        signal_process_group KILL "$supervisor_pid"
+      fi
+    done
+    for child_group in "$app_child_group" "$bot_child_group"; do
+      if [ -n "$child_group" ] && process_group_alive "$child_group"; then
+        info "Service child process group $child_group did not stop after shutdown grace; sending KILL."
+        signal_process_group KILL "$child_group"
+      fi
+    done
+    for supervisor_pid in "$app_supervisor_pid" "$bot_api_supervisor_pid"; do
+      if [ -n "$supervisor_pid" ]; then
+        wait "$supervisor_pid" 2>/dev/null || true
+      fi
+    done
+    if [ -n "$supervisor_state_dir" ]; then
+      rm -f \
+        "$bot_child_state_file" "${bot_child_state_file}.tmp" \
+        "$app_child_state_file" "${app_child_state_file}.tmp"
+      rmdir "$supervisor_state_dir" 2>/dev/null || true
     fi
     exit "$status"
   }
@@ -534,45 +934,62 @@ run_up() {
     printf '%s' "$next"
   }
 
-  trap cleanup INT TERM EXIT
+  trap 'shutdown_status=129; cleanup' HUP
+  trap 'shutdown_status=130; cleanup' INT
+  trap 'shutdown_status=143; cleanup' TERM
+  trap 'shutdown_status=$?; cleanup' 0
 
-  (
-    trap 'if [ -n "${child_pid:-}" ] && kill -0 "$child_pid" 2>/dev/null; then kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; fi; exit 0' INT TERM
-    delay=$RESTART_MIN_DELAY_SECONDS
-    while :; do
-      info "Starting Telegram Local Bot API Server..."
-      "$BOT_API_RUN" &
-      child_pid=$!
-      status=0
-      wait "$child_pid" || status=$?
-      info "Telegram Local Bot API Server exited with status $status; restarting in ${delay}s..."
-      sleep "$delay"
-      delay=$(delay_next "$delay")
-    done
-  ) &
-  bot_api_supervisor_pid=$!
+  supervisor_state_dir=$(mktemp -d "${TMPDIR:-/tmp}/tg-obs-supervisor-state.XXXXXX")
+  bot_child_state_file="$supervisor_state_dir/bot-api.group"
+  app_child_state_file="$supervisor_state_dir/app.group"
+
+  supervisor_launching=bot-api
+  candidate_pid=
+  set -m
+  supervise_service "Telegram Local Bot API Server" bot-api "$bot_child_state_file" &
+  candidate_pid=$!
+  set +m
+  if ! is_process_group_leader "$candidate_pid"; then
+    kill "$candidate_pid" 2>/dev/null || true
+    wait "$candidate_pid" 2>/dev/null || true
+    die "could not isolate Telegram Local Bot API Server supervisor process group"
+  fi
+  bot_api_supervisor_pid=$candidate_pid
+  supervisor_launching=
+  candidate_pid=
 
   if ! wait_for_health 30; then
     info "Telegram Local Bot API Server is not healthy yet; tg-obs-bot will still start and retry Telegram polling."
   fi
 
-  (
-    trap 'if [ -n "${child_pid:-}" ] && kill -0 "$child_pid" 2>/dev/null; then kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; fi; exit 0' INT TERM
-    delay=$RESTART_MIN_DELAY_SECONDS
-    while :; do
-      info "Starting tg-obs-bot..."
-      run_app_process &
-      child_pid=$!
-      status=0
-      wait "$child_pid" || status=$?
-      info "tg-obs-bot exited with status $status; restarting in ${delay}s..."
-      sleep "$delay"
-      delay=$(delay_next "$delay")
-    done
-  ) &
-  app_supervisor_pid=$!
+  supervisor_launching=app
+  candidate_pid=
+  set -m
+  supervise_service "tg-obs-bot" app "$app_child_state_file" &
+  candidate_pid=$!
+  set +m
+  if ! is_process_group_leader "$candidate_pid"; then
+    kill "$candidate_pid" 2>/dev/null || true
+    wait "$candidate_pid" 2>/dev/null || true
+    die "could not isolate tg-obs-bot supervisor process group"
+  fi
+  app_supervisor_pid=$candidate_pid
+  supervisor_launching=
+  candidate_pid=
 
-  wait "$bot_api_supervisor_pid" "$app_supervisor_pid" || true
+  while :; do
+    if process_has_exited "$bot_api_supervisor_pid"; then
+      info "Telegram Local Bot API Server supervisor exited unexpectedly; shutting down the stack."
+      shutdown_status=1
+      cleanup
+    fi
+    if process_has_exited "$app_supervisor_pid"; then
+      info "tg-obs-bot supervisor exited unexpectedly; shutting down the stack."
+      shutdown_status=1
+      cleanup
+    fi
+    sleep 1
+  done
 }
 
 check_cmd() {
