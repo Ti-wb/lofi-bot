@@ -90,19 +90,20 @@ const (
 	playbackRandom playbackKind = "random_played"
 	playbackFile   playbackKind = "fallback_file"
 
-	playbackWatchdogInterval = 30 * time.Second
-	playbackWatchdogGrace    = 60 * time.Second
-	obsEndedEventSettleGrace = 2 * time.Second
-	staleDownloadingAge      = 6 * time.Hour
-	obsConnectAttemptTimeout = 15 * time.Second
-	uploadProbeTimeout       = 2 * time.Minute
-	uploadFailureTimeout     = 5 * time.Second
-	retentionBatchSize       = 256
-	mediaProgressGrace       = 2 * time.Minute
-	mediaProgressHardGrace   = 2 * mediaProgressGrace
-	mediaCursorEpsilonMillis = 1.0
-	defaultWorkerStopGrace   = telegram.RecommendedParentDrainGrace
-	defaultMaintenancePeriod = 10 * time.Minute
+	playbackWatchdogInterval  = 30 * time.Second
+	playbackWatchdogGrace     = 60 * time.Second
+	obsEndedEventSettleGrace  = 2 * time.Second
+	staleDownloadingAge       = 6 * time.Hour
+	obsConnectAttemptTimeout  = 15 * time.Second
+	obsPlaybackCleanupTimeout = 5 * time.Second
+	uploadProbeTimeout        = 2 * time.Minute
+	uploadFailureTimeout      = 5 * time.Second
+	retentionBatchSize        = 256
+	mediaProgressGrace        = 2 * time.Minute
+	mediaProgressHardGrace    = 2 * mediaProgressGrace
+	mediaCursorEpsilonMillis  = 1.0
+	defaultWorkerStopGrace    = telegram.RecommendedParentDrainGrace
+	defaultMaintenancePeriod  = 10 * time.Minute
 )
 
 var (
@@ -553,6 +554,17 @@ func (s *Service) advancePlaybackLockedAfter(ctx context.Context, expectedCurren
 		return nil, err
 	}
 
+	// playbackMu is held across the durable transition and every following
+	// side effect. Once SQLite has no current row, memory must stop describing
+	// the previous generation before any later query or OBS operation can fail.
+	s.transitionQueuePlaybackToIdleLocked()
+	return s.startNextQueuePlaybackLocked(ctx)
+}
+
+// startNextQueuePlaybackLocked requires playbackMu and a durable queue state
+// with no playing row. It publishes a normal/fallback in-memory generation
+// only after the corresponding durable/OBS start operation succeeds.
+func (s *Service) startNextQueuePlaybackLocked(ctx context.Context) (*queue.Video, error) {
 	for {
 		video, err := s.store.NextReady(ctx)
 		if err != nil {
@@ -577,14 +589,46 @@ func (s *Service) advancePlaybackLockedAfter(ctx context.Context, expectedCurren
 		}
 		playing, err := s.store.MarkPlaying(ctx, video.ID)
 		if err != nil {
-			_ = s.obs.StopCurrent(ctx)
-			s.setLastErr(err)
-			return nil, err
+			transitionErr := s.stopUncommittedQueuePlaybackLocked(err)
+			s.setLastErr(transitionErr)
+			return nil, transitionErr
 		}
 		s.resetMediaProgressLocked(s.cfg.OBSMediaSourceName, video.LocalPath)
 		s.setPlaybackState(playbackNormal, 0, "")
 		return &playing, nil
 	}
+}
+
+// transitionQueuePlaybackToIdleLocked requires playbackMu. It clears every
+// in-memory claim about the queue media generation after SQLite no longer has
+// a matching playing row.
+func (s *Service) transitionQueuePlaybackToIdleLocked() {
+	s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.playback = playbackIdle
+	s.randomFallbackID = 0
+	s.randomFallbackPath = ""
+	// Keep the episode-level notice bit across an internal fallback rotation.
+	// A durable normal start or a true idle/off result resets it through
+	// setPlaybackState.
+}
+
+// stopUncommittedQueuePlaybackLocked requires playbackMu. PlayFile succeeded
+// but MarkPlaying did not, so OBS cleanup must not inherit an already-canceled
+// request context or leave memory claiming that the ready row is current.
+func (s *Service) stopUncommittedQueuePlaybackLocked(primaryErr error) error {
+	s.transitionQueuePlaybackToIdleLocked()
+	stopCtx, cancel := context.WithTimeout(context.Background(), obsPlaybackCleanupTimeout)
+	stopErr := s.obs.StopCurrent(stopCtx)
+	cancel()
+	if stopErr == nil {
+		return primaryErr
+	}
+	return errors.Join(
+		primaryErr,
+		fmt.Errorf("stop OBS after queue playback persistence failure: %w", stopErr),
+	)
 }
 
 func (s *Service) playIfIdle(ctx context.Context) error {
@@ -601,13 +645,24 @@ func (s *Service) playIfIdleLocked(ctx context.Context) error {
 	if current != nil {
 		return nil
 	}
+	kind := s.playbackState()
+	if kind == playbackNormal {
+		// Self-heal an interrupted queue transition. A normal generation without
+		// a durable current row is impossible and must not suppress retries.
+		s.transitionQueuePlaybackToIdleLocked()
+		kind = playbackIdle
+	}
 	if s.obs.Status().State != obs.StateConnected {
 		return nil
 	}
-	if s.playbackState() != playbackIdle {
+	switch kind {
+	case playbackRandom, playbackFile:
 		return nil
+	case playbackIdle:
+	default:
+		s.transitionQueuePlaybackToIdleLocked()
 	}
-	_, err = s.advancePlaybackLocked(ctx)
+	_, err = s.startNextQueuePlaybackLocked(ctx)
 	return err
 }
 
@@ -1333,7 +1388,19 @@ func (s *Service) checkPlaybackWatchdog(ctx context.Context) error {
 			return err
 		}
 		if current == nil {
-			video, _, err = s.reconcileFallbackPlaybackLocked(ctx)
+			switch s.playbackState() {
+			case playbackRandom, playbackFile:
+				video, _, err = s.reconcileFallbackPlaybackLocked(ctx)
+				return err
+			case playbackNormal:
+				// A prior transition may have durably finished the old row
+				// before a later queue/OBS operation failed.
+				s.transitionQueuePlaybackToIdleLocked()
+			case playbackIdle:
+			default:
+				s.transitionQueuePlaybackToIdleLocked()
+			}
+			video, err = s.startNextQueuePlaybackLocked(ctx)
 			return err
 		}
 		if s.playbackState() != playbackNormal {

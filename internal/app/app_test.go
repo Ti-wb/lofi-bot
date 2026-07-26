@@ -1718,6 +1718,387 @@ func TestAdvancePlaybackDoesNotMarkReadyPlayedWhenOBSPlayFails(t *testing.T) {
 	}
 }
 
+func TestAdvancePlaybackMarkPlayingFailureLeavesRecoverableIdleGeneration(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	svc, fakeOBS, fakeBot := newLocalUploadTestServiceAtDBPath(
+		t,
+		config.Config{FallbackMode: "off"},
+		dbPath,
+	)
+	firstReady := addReadyVideo(t, ctx, svc, "first.mp4")
+	firstPlaying, err := svc.store.MarkPlaying(ctx, firstReady.ID)
+	if err != nil {
+		t.Fatalf("mark first playing: %v", err)
+	}
+	second := addReadyVideo(t, ctx, svc, "second.mp4")
+	third := addReadyVideo(t, ctx, svc, "third.mp4")
+	svc.setPlaybackState(playbackNormal, 0, "")
+	svc.resetMediaProgressLocked(svc.cfg.OBSMediaSourceName, firstPlaying.LocalPath)
+	fakeOBS.lastPlayed = firstPlaying.LocalPath
+	fakeOBS.inputFiles = map[string]string{svc.cfg.OBSMediaSourceName: firstPlaying.LocalPath}
+	fakeOBS.mediaStatuses = map[string]obs.MediaInputStatus{
+		svc.cfg.OBSMediaSourceName: {State: obs.MediaStatePlaying},
+	}
+	dropFailure := installMarkPlayingFailureTrigger(t, dbPath, second.ID)
+
+	video, err := svc.advancePlayback(ctx)
+	if err == nil || !strings.Contains(err.Error(), "phase9 transient mark playing") {
+		t.Fatalf("advance error = %v, want transient MarkPlaying failure", err)
+	}
+	if video != nil {
+		t.Fatalf("advance video = %#v, want nil", video)
+	}
+	assertQueuePlaybackIdle(t, svc)
+	if fakeOBS.stopCurrentCalls != 1 {
+		t.Fatalf("StopCurrent calls = %d, want 1", fakeOBS.stopCurrentCalls)
+	}
+	assertBoundedStopContext(t, fakeOBS)
+	if fakeOBS.playFileCalls != 1 {
+		t.Fatalf("play calls after failed persistence = %d, want 1", fakeOBS.playFileCalls)
+	}
+	if current, currentErr := svc.store.Current(ctx); currentErr != nil {
+		t.Fatalf("current after failed persistence: %v", currentErr)
+	} else if current != nil {
+		t.Fatalf("current after failed persistence = %#v, want nil", current)
+	}
+	assertStoredStatus(t, ctx, svc, firstPlaying.ID, queue.StatusPlayed)
+	assertStoredStatus(t, ctx, svc, second.ID, queue.StatusReady)
+	assertStoredStatus(t, ctx, svc, third.ID, queue.StatusReady)
+
+	// Both generation guards must reject the stale first generation while the
+	// durable queue has no current row.
+	for _, guard := range []struct {
+		name string
+		id   int64
+		path string
+	}{
+		{name: "id", id: firstPlaying.ID},
+		{name: "path", path: firstPlaying.LocalPath},
+	} {
+		svc.playbackMu.Lock()
+		staleVideo, staleErr := svc.advancePlaybackLockedAfter(ctx, guard.id, guard.path)
+		svc.playbackMu.Unlock()
+		if staleErr != nil || staleVideo != nil {
+			t.Fatalf("%s guard result video=%#v err=%v, want no-op", guard.name, staleVideo, staleErr)
+		}
+	}
+	if fakeOBS.playFileCalls != 1 {
+		t.Fatalf("stale guards replayed media: calls = %d, want 1", fakeOBS.playFileCalls)
+	}
+	assertStoredStatus(t, ctx, svc, second.ID, queue.StatusReady)
+	assertStoredStatus(t, ctx, svc, third.ID, queue.StatusReady)
+
+	dropFailure()
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("watchdog recovery: %v", err)
+	}
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current after watchdog recovery: %v", err)
+	}
+	if current == nil || current.ID != second.ID {
+		t.Fatalf("current after watchdog = %#v, want second id %d", current, second.ID)
+	}
+	if fakeOBS.playFileCalls != 2 || fakeOBS.lastPlayed != second.LocalPath {
+		t.Fatalf(
+			"watchdog recovery calls/path = %d/%q, want 2/%q",
+			fakeOBS.playFileCalls,
+			fakeOBS.lastPlayed,
+			second.LocalPath,
+		)
+	}
+	if svc.playbackState() != playbackNormal {
+		t.Fatalf("playback state after recovery = %s, want %s", svc.playbackState(), playbackNormal)
+	}
+	if progress := svc.mediaProgressByInput[svc.cfg.OBSMediaSourceName]; progress.Path != second.LocalPath {
+		t.Fatalf("media progress after recovery = %#v, want second path", progress)
+	}
+	assertStoredStatus(t, ctx, svc, firstPlaying.ID, queue.StatusPlayed)
+	assertStoredStatus(t, ctx, svc, second.ID, queue.StatusPlaying)
+	assertStoredStatus(t, ctx, svc, third.ID, queue.StatusReady)
+	if len(fakeBot.messages) != 1 {
+		t.Fatalf("recovery notifications = %d, want 1", len(fakeBot.messages))
+	}
+
+	// A delayed first-generation hint must not consume the third row after the
+	// second generation is durably playing.
+	svc.playbackMu.Lock()
+	staleVideo, staleErr := svc.advancePlaybackLockedAfter(ctx, firstPlaying.ID, firstPlaying.LocalPath)
+	svc.playbackMu.Unlock()
+	if staleErr != nil || staleVideo != nil {
+		t.Fatalf("post-recovery stale guard video=%#v err=%v, want no-op", staleVideo, staleErr)
+	}
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("healthy normal watchdog: %v", err)
+	}
+	if fakeOBS.playFileCalls != 2 {
+		t.Fatalf("healthy normal playback restarted: calls = %d, want 2", fakeOBS.playFileCalls)
+	}
+	assertStoredStatus(t, ctx, svc, second.ID, queue.StatusPlaying)
+	assertStoredStatus(t, ctx, svc, third.ID, queue.StatusReady)
+}
+
+func TestAdvancePlaybackMarkPlayingAndStopErrorsPreservePrimaryFailure(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	svc, fakeOBS, _ := newLocalUploadTestServiceAtDBPath(
+		t,
+		config.Config{FallbackMode: "off"},
+		dbPath,
+	)
+	first := addReadyVideo(t, ctx, svc, "first.mp4")
+	if _, err := svc.store.MarkPlaying(ctx, first.ID); err != nil {
+		t.Fatalf("mark first playing: %v", err)
+	}
+	second := addReadyVideo(t, ctx, svc, "second.mp4")
+	svc.setPlaybackState(playbackNormal, 0, "")
+	svc.resetMediaProgressLocked(svc.cfg.OBSMediaSourceName, first.LocalPath)
+	dropFailure := installMarkPlayingFailureTrigger(t, dbPath, second.ID)
+	defer dropFailure()
+	stopErr := errors.New("stop cleanup failed")
+	fakeOBS.stopErr = stopErr
+
+	video, err := svc.advancePlayback(ctx)
+	if video != nil {
+		t.Fatalf("advance video = %#v, want nil", video)
+	}
+	if err == nil || !strings.Contains(err.Error(), "phase9 transient mark playing") {
+		t.Fatalf("advance error = %v, want primary MarkPlaying failure", err)
+	}
+	if !errors.Is(err, stopErr) {
+		t.Fatalf("advance error = %v, want joined StopCurrent failure", err)
+	}
+	if got := svc.lastError(); !strings.Contains(got, "phase9 transient mark playing") ||
+		!strings.Contains(got, stopErr.Error()) {
+		t.Fatalf("last error = %q, want primary and cleanup failures", got)
+	}
+	assertBoundedStopContext(t, fakeOBS)
+	assertQueuePlaybackIdle(t, svc)
+	if current, currentErr := svc.store.Current(ctx); currentErr != nil {
+		t.Fatalf("current after cleanup failure: %v", currentErr)
+	} else if current != nil {
+		t.Fatalf("current after cleanup failure = %#v, want nil", current)
+	}
+	assertStoredStatus(t, ctx, svc, second.ID, queue.StatusReady)
+}
+
+func TestAdvancePlaybackNextReadyErrorLeavesIdleAndRetryable(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	svc, fakeOBS, _ := newLocalUploadTestServiceAtDBPath(
+		t,
+		config.Config{FallbackMode: "off"},
+		dbPath,
+	)
+	first := addReadyVideo(t, ctx, svc, "first.mp4")
+	if _, err := svc.store.MarkPlaying(ctx, first.ID); err != nil {
+		t.Fatalf("mark first playing: %v", err)
+	}
+	second := addReadyVideo(t, ctx, svc, "second.mp4")
+	svc.setPlaybackState(playbackNormal, 0, "")
+	svc.resetMediaProgressLocked(svc.cfg.OBSMediaSourceName, first.LocalPath)
+	execQueueSQL(t, dbPath, `UPDATE videos SET created_at = ? WHERE id = ?`, "not-a-time", second.ID)
+
+	video, err := svc.advancePlayback(ctx)
+	if video != nil {
+		t.Fatalf("advance video = %#v, want nil", video)
+	}
+	if err == nil || !strings.Contains(err.Error(), "parse videos.created_at") {
+		t.Fatalf("advance error = %v, want NextReady decode failure", err)
+	}
+	assertQueuePlaybackIdle(t, svc)
+	if fakeOBS.playFileCalls != 0 {
+		t.Fatalf("NextReady error reached OBS: play calls = %d", fakeOBS.playFileCalls)
+	}
+	assertRawStoredStatus(t, dbPath, first.ID, queue.StatusPlayed)
+	assertRawStoredStatus(t, dbPath, second.ID, queue.StatusReady)
+
+	execQueueSQL(t, dbPath, `UPDATE videos SET created_at = ? WHERE id = ?`, formatQueueTime(second.CreatedAt), second.ID)
+	if err := svc.playIfIdle(ctx); err != nil {
+		t.Fatalf("playIfIdle retry: %v", err)
+	}
+	current, err := svc.store.Current(ctx)
+	if err != nil {
+		t.Fatalf("current after retry: %v", err)
+	}
+	if current == nil || current.ID != second.ID {
+		t.Fatalf("current after retry = %#v, want second id %d", current, second.ID)
+	}
+	if fakeOBS.playFileCalls != 1 || svc.playbackState() != playbackNormal {
+		t.Fatalf(
+			"retry calls/state = %d/%s, want 1/%s",
+			fakeOBS.playFileCalls,
+			svc.playbackState(),
+			playbackNormal,
+		)
+	}
+}
+
+func TestAdvancePlaybackFallbackErrorLeavesIdleAndWatchdogRetries(t *testing.T) {
+	ctx := context.Background()
+	fallbackPath := filepath.Join(t.TempDir(), "fallback.mp4")
+	writeTestFile(t, fallbackPath)
+	svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{
+		FallbackMode:    "file",
+		OBSFallbackFile: fallbackPath,
+	})
+	first := addReadyVideo(t, ctx, svc, "first.mp4")
+	if _, err := svc.store.MarkPlaying(ctx, first.ID); err != nil {
+		t.Fatalf("mark first playing: %v", err)
+	}
+	svc.setPlaybackState(playbackNormal, 0, "")
+	svc.resetMediaProgressLocked(svc.cfg.OBSMediaSourceName, first.LocalPath)
+	playErr := errors.New("fallback play failed")
+	fakeOBS.playErr = playErr
+
+	video, err := svc.advancePlayback(ctx)
+	if video != nil || !errors.Is(err, playErr) {
+		t.Fatalf("fallback failure video=%#v err=%v, want %v", video, err, playErr)
+	}
+	assertQueuePlaybackIdle(t, svc)
+	assertStoredStatus(t, ctx, svc, first.ID, queue.StatusPlayed)
+	if current, currentErr := svc.store.Current(ctx); currentErr != nil {
+		t.Fatalf("current after fallback error: %v", currentErr)
+	} else if current != nil {
+		t.Fatalf("current after fallback error = %#v, want nil", current)
+	}
+
+	fakeOBS.playErr = nil
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("watchdog fallback retry: %v", err)
+	}
+	if svc.playbackState() != playbackFile || svc.currentPlaybackPath() != fallbackPath {
+		t.Fatalf(
+			"fallback retry state/path = %s/%q, want %s/%q",
+			svc.playbackState(),
+			svc.currentPlaybackPath(),
+			playbackFile,
+			fallbackPath,
+		)
+	}
+	if fakeOBS.playFileCalls != 1 {
+		t.Fatalf("fallback retry play calls = %d, want 1", fakeOBS.playFileCalls)
+	}
+	if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+		t.Fatalf("healthy fallback watchdog: %v", err)
+	}
+	if fakeOBS.playFileCalls != 1 || svc.playbackState() != playbackFile {
+		t.Fatalf(
+			"healthy fallback changed: calls/state = %d/%s",
+			fakeOBS.playFileCalls,
+			svc.playbackState(),
+		)
+	}
+}
+
+func TestMissingCurrentSelfHealingStartsReadyQueueWithoutDoubleConsumption(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		recover func(context.Context, *Service) error
+	}{
+		{name: "play_if_idle", recover: func(ctx context.Context, svc *Service) error {
+			return svc.playIfIdle(ctx)
+		}},
+		{name: "watchdog", recover: func(ctx context.Context, svc *Service) error {
+			return svc.checkPlaybackWatchdog(ctx)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			svc, fakeOBS, _ := newLocalUploadTestService(t, config.Config{FallbackMode: "off"})
+			first := addReadyVideo(t, ctx, svc, "first.mp4")
+			second := addReadyVideo(t, ctx, svc, "second.mp4")
+			svc.setPlaybackState(playbackNormal, 0, "")
+			svc.resetMediaProgressLocked(svc.cfg.OBSMediaSourceName, "/stale/finished.mp4")
+
+			if err := test.recover(ctx, svc); err != nil {
+				t.Fatalf("self-healing recovery: %v", err)
+			}
+			current, err := svc.store.Current(ctx)
+			if err != nil {
+				t.Fatalf("current after self-heal: %v", err)
+			}
+			if current == nil || current.ID != first.ID {
+				t.Fatalf("current after self-heal = %#v, want first id %d", current, first.ID)
+			}
+			if fakeOBS.playFileCalls != 1 || fakeOBS.lastPlayed != first.LocalPath {
+				t.Fatalf(
+					"self-heal calls/path = %d/%q, want 1/%q",
+					fakeOBS.playFileCalls,
+					fakeOBS.lastPlayed,
+					first.LocalPath,
+				)
+			}
+			if progress := svc.mediaProgressByInput[svc.cfg.OBSMediaSourceName]; progress.Path != first.LocalPath {
+				t.Fatalf("self-healed media progress = %#v, want first path", progress)
+			}
+			if err := test.recover(ctx, svc); err != nil {
+				t.Fatalf("healthy normal recovery: %v", err)
+			}
+			if fakeOBS.playFileCalls != 1 {
+				t.Fatalf("healthy normal state replayed current: calls = %d", fakeOBS.playFileCalls)
+			}
+			assertStoredStatus(t, ctx, svc, first.ID, queue.StatusPlaying)
+			assertStoredStatus(t, ctx, svc, second.ID, queue.StatusReady)
+		})
+	}
+}
+
+func TestMissingCurrentRecoveryPreservesHealthyFallbackGenerations(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		mode string
+		kind playbackKind
+	}{
+		{name: "random", mode: "random_played", kind: playbackRandom},
+		{name: "file", mode: "file", kind: playbackFile},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			fallbackPath := filepath.Join(t.TempDir(), test.name+".mp4")
+			writeTestFile(t, fallbackPath)
+			cfg := config.Config{FallbackMode: test.mode}
+			if test.mode == "file" {
+				cfg.OBSFallbackFile = fallbackPath
+			}
+			svc, fakeOBS, _ := newLocalUploadTestService(t, cfg)
+			if test.mode == "random_played" {
+				played := addPlayedVideo(t, ctx, svc, "history.mp4", true)
+				fallbackPath = played.LocalPath
+			}
+			if _, err := svc.advancePlayback(ctx); err != nil {
+				t.Fatalf("start fallback: %v", err)
+			}
+			if svc.playbackState() != test.kind || svc.currentPlaybackPath() != fallbackPath {
+				t.Fatalf(
+					"initial state/path = %s/%q, want %s/%q",
+					svc.playbackState(),
+					svc.currentPlaybackPath(),
+					test.kind,
+					fallbackPath,
+				)
+			}
+			if err := svc.playIfIdle(ctx); err != nil {
+				t.Fatalf("playIfIdle with healthy fallback: %v", err)
+			}
+			if err := svc.checkPlaybackWatchdog(ctx); err != nil {
+				t.Fatalf("watchdog with healthy fallback: %v", err)
+			}
+			if fakeOBS.playFileCalls != 1 ||
+				svc.playbackState() != test.kind ||
+				svc.currentPlaybackPath() != fallbackPath {
+				t.Fatalf(
+					"healthy fallback changed: calls/state/path = %d/%s/%q",
+					fakeOBS.playFileCalls,
+					svc.playbackState(),
+					svc.currentPlaybackPath(),
+				)
+			}
+		})
+	}
+}
+
 func TestStatusTextRedactsLastErrorSecrets(t *testing.T) {
 	const (
 		token    = "123456:ABCdefghi_jklmnop"
@@ -3686,6 +4067,103 @@ func assertFailedUploadVisible(t *testing.T, ctx context.Context, svc *Service, 
 	}
 }
 
+func installMarkPlayingFailureTrigger(t *testing.T, dbPath string, videoID int64) func() {
+	t.Helper()
+	const triggerName = "fail_mark_playing_phase9"
+	execQueueSQL(t, dbPath, fmt.Sprintf(`
+CREATE TRIGGER %s
+BEFORE UPDATE OF status ON videos
+WHEN NEW.id = %d AND NEW.status = 'playing'
+BEGIN
+	SELECT RAISE(FAIL, 'phase9 transient mark playing');
+END
+`, triggerName, videoID))
+	dropped := false
+	drop := func() {
+		if dropped {
+			return
+		}
+		execQueueSQL(t, dbPath, "DROP TRIGGER "+triggerName)
+		dropped = true
+	}
+	t.Cleanup(drop)
+	return drop
+}
+
+func execQueueSQL(t *testing.T, dbPath string, query string, args ...any) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw queue database: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(context.Background(), query, args...); err != nil {
+		t.Fatalf("execute raw queue SQL: %v", err)
+	}
+}
+
+func assertQueuePlaybackIdle(t *testing.T, svc *Service) {
+	t.Helper()
+	if got := svc.playbackState(); got != playbackIdle {
+		t.Fatalf("playback state = %s, want %s", got, playbackIdle)
+	}
+	if path := svc.currentPlaybackPath(); path != "" {
+		t.Fatalf("current playback path = %q, want empty", path)
+	}
+	if progress, ok := svc.mediaProgressByInput[svc.cfg.OBSMediaSourceName]; ok {
+		t.Fatalf("stale media progress remained after durable finish: %#v", progress)
+	}
+}
+
+func assertBoundedStopContext(t *testing.T, fakeOBS *fakeOBS) {
+	t.Helper()
+	if fakeOBS.stopCurrentCalls != 1 {
+		t.Fatalf("StopCurrent calls = %d, want 1", fakeOBS.stopCurrentCalls)
+	}
+	if !fakeOBS.stopHadDeadline {
+		t.Fatal("StopCurrent cleanup context had no deadline")
+	}
+	remaining := time.Until(fakeOBS.stopDeadline)
+	if remaining <= 0 || remaining > obsPlaybackCleanupTimeout {
+		t.Fatalf(
+			"StopCurrent cleanup deadline remaining = %s, want within (0, %s]",
+			remaining,
+			obsPlaybackCleanupTimeout,
+		)
+	}
+}
+
+func assertStoredStatus(t *testing.T, ctx context.Context, svc *Service, videoID int64, want queue.Status) {
+	t.Helper()
+	video, err := svc.store.Get(ctx, videoID)
+	if err != nil {
+		t.Fatalf("get video %d: %v", videoID, err)
+	}
+	if video.Status != want {
+		t.Fatalf("video %d status = %s, want %s", videoID, video.Status, want)
+	}
+}
+
+func assertRawStoredStatus(t *testing.T, dbPath string, videoID int64, want queue.Status) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw queue database: %v", err)
+	}
+	defer db.Close()
+	var got queue.Status
+	if err := db.QueryRowContext(
+		context.Background(),
+		`SELECT status FROM videos WHERE id = ?`,
+		videoID,
+	).Scan(&got); err != nil {
+		t.Fatalf("query video %d status: %v", videoID, err)
+	}
+	if got != want {
+		t.Fatalf("video %d status = %s, want %s", videoID, got, want)
+	}
+}
+
 func newFallbackTestService(t *testing.T, cfg config.Config) (*Service, *fakeOBS, *fakeBot) {
 	t.Helper()
 	return newFallbackTestServiceAtDBPath(t, cfg, filepath.Join(t.TempDir(), "queue.db"))
@@ -4022,6 +4500,10 @@ type fakeOBS struct {
 	probeCalls       int
 	playFileCalls    int
 	playErr          error
+	stopCurrentCalls int
+	stopErr          error
+	stopHadDeadline  bool
+	stopDeadline     time.Time
 }
 
 func (f *fakeOBS) Connect(context.Context) error {
@@ -4108,7 +4590,12 @@ func (f *fakeOBS) PlaySourceFile(_ context.Context, sourceName string, path stri
 	f.lastSource = sourceName
 	return nil
 }
-func (f *fakeOBS) StopCurrent(context.Context) error {
+func (f *fakeOBS) StopCurrent(ctx context.Context) error {
+	f.stopCurrentCalls++
+	f.stopDeadline, f.stopHadDeadline = ctx.Deadline()
+	if f.stopErr != nil {
+		return f.stopErr
+	}
 	f.lastPlayed = ""
 	if f.mediaStatuses == nil {
 		f.mediaStatuses = make(map[string]obs.MediaInputStatus)
