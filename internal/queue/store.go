@@ -14,7 +14,8 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db  *sql.DB
+	now func() time.Time
 }
 
 const (
@@ -42,7 +43,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 
-	store := &Store{db: db}
+	store := &Store{db: db, now: time.Now}
 	if err := store.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -71,7 +72,13 @@ PRAGMA busy_timeout=5000;
 		return err
 	}
 
-	if _, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+
+	if _, err := tx.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS videos (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	telegram_file_id TEXT NOT NULL,
@@ -97,10 +104,10 @@ CREATE TABLE IF NOT EXISTS videos (
 		return err
 	}
 
-	if err := s.ensureVideoColumn(ctx, "local_path", `ALTER TABLE videos ADD COLUMN local_path TEXT NOT NULL DEFAULT ''`); err != nil {
+	if err := ensureVideoColumn(ctx, tx, "local_path", `ALTER TABLE videos ADD COLUMN local_path TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 UPDATE videos
 SET finished_at = updated_at
 WHERE status IN (?, ?, ?) AND (finished_at IS NULL OR finished_at = '')
@@ -108,7 +115,7 @@ WHERE status IN (?, ?, ?) AND (finished_at IS NULL OR finished_at = '')
 		return err
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 CREATE INDEX IF NOT EXISTS idx_videos_status_position ON videos(status, queue_position);
 CREATE INDEX IF NOT EXISTS idx_videos_created ON videos(created_at);
 CREATE INDEX IF NOT EXISTS idx_videos_status_finished ON videos(status, finished_at, updated_at);
@@ -116,24 +123,34 @@ CREATE INDEX IF NOT EXISTS idx_videos_status_updated ON videos(status, updated_a
 CREATE INDEX IF NOT EXISTS idx_videos_local_path ON videos(local_path);
 CREATE INDEX IF NOT EXISTS idx_videos_finished_status ON videos(finished_at, updated_at, id, status);
 CREATE INDEX IF NOT EXISTS idx_videos_updated_status ON videos(updated_at DESC, id DESC, status);
-`)
-	return err
+`); err != nil {
+		return err
+	}
+	if err := migrateTelegramUpdateJournal(ctx, tx, s.nowUTC()); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (s *Store) ensureVideoColumn(ctx context.Context, name, alter string) error {
-	hasColumn, err := s.videoColumnExists(ctx, name)
+type schemaDB interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func ensureVideoColumn(ctx context.Context, db schemaDB, name, alter string) error {
+	hasColumn, err := videoColumnExists(ctx, db, name)
 	if err != nil {
 		return err
 	}
 	if hasColumn {
 		return nil
 	}
-	_, err = s.db.ExecContext(ctx, alter)
+	_, err = db.ExecContext(ctx, alter)
 	return err
 }
 
-func (s *Store) videoColumnExists(ctx context.Context, name string) (bool, error) {
-	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(videos)`)
+func videoColumnExists(ctx context.Context, db schemaDB, name string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(videos)`)
 	if err != nil {
 		return false, err
 	}
@@ -153,6 +170,13 @@ func (s *Store) videoColumnExists(ctx context.Context, name string) (bool, error
 		}
 	}
 	return false, rows.Err()
+}
+
+func (s *Store) nowUTC() time.Time {
+	if s.now == nil {
+		return time.Now().UTC()
+	}
+	return s.now().UTC()
 }
 
 func (s *Store) AddDownloading(ctx context.Context, v Video) (Video, error) {

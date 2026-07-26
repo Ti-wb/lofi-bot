@@ -24,8 +24,18 @@ const (
 	defaultPollRetryDelay          = 3 * time.Second
 	defaultUpdateProcessingTimeout = 5 * time.Minute
 	defaultUpdateHandlerStopGrace  = 5 * time.Second
+	defaultJournalWriteTimeout     = 4 * time.Second
+	defaultUpdateLeaseBuffer       = 30 * time.Second
+	defaultStuckOwnerLease         = 10 * time.Second
 	defaultAdminLookupTimeout      = 5 * time.Second
 	adminCacheTTL                  = 60 * time.Second
+
+	// RecommendedParentDrainGrace reserves enough time for a handler that
+	// ignores cancellation to consume its stop grace and for the update
+	// journal to persist Abort/Fail in an independent bounded context, plus a
+	// small scheduling cushion. The app coordinator uses this as its outer
+	// worker-drain budget.
+	RecommendedParentDrainGrace = defaultUpdateHandlerStopGrace + defaultJournalWriteTimeout + time.Second
 )
 
 var queueItemPattern = regexp.MustCompile(`#([0-9]+).*第 ([0-9]+) 位`)
@@ -52,9 +62,14 @@ type Service struct {
 	pollRetryDelay          time.Duration
 	updateProcessingTimeout time.Duration
 	updateHandlerStopGrace  time.Duration
+	journalWriteTimeout     time.Duration
+	updateLeaseBuffer       time.Duration
+	stuckOwnerLease         time.Duration
 	adminLookupTimeout      time.Duration
 	adminCacheMutex         sync.Mutex
 	adminCache              map[int64]adminCacheEntry
+	updateJournal           UpdateJournal
+	updateHandler           func(context.Context, tgbotapi.Update) error
 }
 
 type adminCacheEntry struct {
@@ -149,11 +164,17 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 		pollRetryDelay:          defaultPollRetryDelay,
 		updateProcessingTimeout: defaultUpdateProcessingTimeout,
 		updateHandlerStopGrace:  defaultUpdateHandlerStopGrace,
+		journalWriteTimeout:     defaultJournalWriteTimeout,
+		updateLeaseBuffer:       defaultUpdateLeaseBuffer,
+		stuckOwnerLease:         defaultStuckOwnerLease,
 		adminLookupTimeout:      defaultAdminLookupTimeout,
 		adminCache:              make(map[int64]adminCacheEntry),
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	if s.updateJournal == nil {
+		return nil, errors.New("telegram update journal is required")
 	}
 	if s.bot == nil {
 		bot, err := newProductionBotAPI(cfg)
@@ -168,6 +189,12 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 func WithBotAPI(bot botAPI) Option {
 	return func(s *Service) {
 		s.bot = bot
+	}
+}
+
+func WithUpdateJournal(journal UpdateJournal) Option {
+	return func(s *Service) {
+		s.updateJournal = journal
 	}
 }
 
@@ -228,11 +255,35 @@ func (s *Service) registerQueueCommands(ctx context.Context) error {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ownerToken, err := newUpdateOwnerToken()
+	if err != nil {
+		return journalFailure("create update owner token", err)
+	}
+	journalCtx, cancelJournal := s.journalContext(ctx)
+	nextOffset, confirmedOffset, err := s.updateJournal.LoadUpdateCheckpoint(journalCtx)
+	cancelJournal()
+	if err != nil {
+		return journalOperationError(ctx, "load polling checkpoint", err)
+	}
+	if nextOffset < 0 || confirmedOffset < 0 || confirmedOffset > nextOffset {
+		return journalFailure(
+			"load polling checkpoint",
+			fmt.Errorf(
+				"invalid offsets: next_offset=%d confirmed_offset=%d",
+				nextOffset,
+				confirmedOffset,
+			),
+		)
+	}
+
 	if err := s.registerCommands(ctx); err != nil {
 		s.logger.Warn("register telegram commands", "error", s.redactError(err))
 	}
 
-	updateConfig := tgbotapi.NewUpdate(0)
+	updateConfig := tgbotapi.NewUpdate(nextOffset)
 	updateConfig.Timeout = s.cfg.UpdateTimeout
 	updateConfig.Limit = 1
 
@@ -252,6 +303,12 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		journalCtx, cancelJournal = s.journalContext(ctx)
+		err = s.updateJournal.ConfirmUpdateOffset(journalCtx, updateConfig.Offset)
+		cancelJournal()
+		if err != nil {
+			return journalOperationError(ctx, "confirm polling offset", err)
+		}
 
 		for _, update := range updates {
 			if err := ctx.Err(); err != nil {
@@ -260,20 +317,211 @@ func (s *Service) Run(ctx context.Context) error {
 			if update.UpdateID < updateConfig.Offset {
 				continue
 			}
+			metadata := metadataForUpdate(update)
+			journalCtx, cancelJournal = s.journalContext(ctx)
+			disposition, attemptCount, failureCount, err := s.updateJournal.BeginUpdateAttempt(
+				journalCtx,
+				update.UpdateID,
+				metadata.kind,
+				metadata.action,
+				metadata.chatID,
+				metadata.messageID,
+				metadata.actorID,
+				ownerToken,
+				s.updateLeaseUntil(),
+				maxUpdateHandlerFailures,
+			)
+			cancelJournal()
+			if err != nil {
+				return journalOperationError(ctx, "begin update attempt", err)
+			}
+			switch disposition {
+			case updateBeginAlreadyTerminal, updateBeginDead:
+				updateConfig.Offset = update.UpdateID + 1
+				continue
+			case updateBeginBusy:
+				return fmt.Errorf("%w: update_id=%d", ErrUpdateAttemptBusy, update.UpdateID)
+			case updateBeginExecute:
+			default:
+				return journalFailure(
+					"begin update attempt",
+					fmt.Errorf("unknown disposition %q", disposition),
+				)
+			}
+
 			timedOut, err := s.handleUpdateBounded(ctx, update)
 			if err != nil {
-				return err
+				cause := boundedJournalError(s.redactError(err))
+				switch {
+				case errors.Is(err, ErrUpdateHandlerStuck):
+					dead, journalErr := s.recordUpdateFailure(
+						update.UpdateID,
+						ownerToken,
+						cause,
+						s.now().Add(s.effectiveStuckOwnerLease()),
+					)
+					if journalErr != nil {
+						return errors.Join(err, journalErr)
+					}
+					if dead {
+						s.logPoisonUpdate(update.UpdateID, attemptCount, failureCount+1, metadata, cause)
+					}
+					// A stuck handler may still own application locks. Even
+					// after the third failure dead-letters the update, this
+					// process generation must stop and never poll again.
+					return err
+				case ctx.Err() != nil:
+					if journalErr := s.abortUpdateAttempt(update.UpdateID, ownerToken); journalErr != nil {
+						return errors.Join(err, journalErr)
+					}
+					return err
+				default:
+					dead, journalErr := s.recordUpdateFailure(
+						update.UpdateID,
+						ownerToken,
+						cause,
+						time.Time{},
+					)
+					if journalErr != nil {
+						return errors.Join(err, journalErr)
+					}
+					if !dead {
+						return err
+					}
+					s.logPoisonUpdate(update.UpdateID, attemptCount, failureCount+1, metadata, cause)
+					if errors.Is(err, ErrUpdateHandlerPanic) {
+						// A recovered panic may have left unrelated in-process
+						// state inconsistent. Persist quarantine atomically,
+						// then let the supervisor replace this generation;
+						// only the next generation may poll past it.
+						return err
+					}
+					updateConfig.Offset = update.UpdateID + 1
+					continue
+				}
 			}
 			if timedOut {
 				s.logger.Warn("telegram update processing timed out", "update_id", update.UpdateID)
 			}
-			// Telegram confirms an update only when the next GetUpdates request
-			// reaches it with an offset greater than this update ID. Advance the
-			// in-memory offset only after the handler has reached a terminal
-			// outcome; a stuck handler returns above without acknowledging it.
+			if err := s.completeUpdateAttempt(update.UpdateID, ownerToken); err != nil {
+				return err
+			}
+			// The done journal row and durable next offset commit atomically.
+			// Telegram itself confirms that offset only on the next successful
+			// GetUpdates request, when confirmed_offset advances separately.
 			updateConfig.Offset = update.UpdateID + 1
 		}
 	}
+}
+
+func (s *Service) updateLeaseUntil() time.Time {
+	processingTimeout := s.updateProcessingTimeout
+	if processingTimeout <= 0 {
+		processingTimeout = defaultUpdateProcessingTimeout
+	}
+	stopGrace := s.updateHandlerStopGrace
+	if stopGrace <= 0 {
+		stopGrace = defaultUpdateHandlerStopGrace
+	}
+	buffer := s.updateLeaseBuffer
+	if buffer <= 0 {
+		buffer = defaultUpdateLeaseBuffer
+	}
+	return s.now().Add(processingTimeout + stopGrace + buffer)
+}
+
+func (s *Service) effectiveStuckOwnerLease() time.Duration {
+	if s.stuckOwnerLease <= 0 {
+		return defaultStuckOwnerLease
+	}
+	return s.stuckOwnerLease
+}
+
+func (s *Service) journalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := s.journalWriteTimeout
+	if timeout <= 0 {
+		timeout = defaultJournalWriteTimeout
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func (s *Service) independentJournalContext() (context.Context, context.CancelFunc) {
+	return s.journalContext(context.Background())
+}
+
+func (s *Service) abortUpdateAttempt(updateID int, ownerToken string) error {
+	journalCtx, cancel := s.independentJournalContext()
+	defer cancel()
+	if err := s.updateJournal.AbortUpdateAttempt(journalCtx, updateID, ownerToken); err != nil {
+		return journalFailure("abort canceled update attempt", err)
+	}
+	return nil
+}
+
+func (s *Service) completeUpdateAttempt(updateID int, ownerToken string) error {
+	journalCtx, cancel := s.independentJournalContext()
+	err := s.updateJournal.CompleteUpdateAttempt(
+		journalCtx,
+		updateID,
+		updateID+1,
+		ownerToken,
+	)
+	cancel()
+	if err == nil {
+		return nil
+	}
+
+	// A failed terminal transaction must remain at-least-once replayable, but
+	// it must not retain the normal multi-minute processing lease. Release the
+	// still-owned claim in a fresh bounded context so a supervisor restart can
+	// replay immediately. If the commit actually succeeded despite an
+	// ambiguous driver error, Abort will safely fail its owner/status guard and
+	// the terminal row will repair the checkpoint on the next Begin.
+	completeErr := journalFailure("complete update attempt", err)
+	if abortErr := s.abortUpdateAttempt(updateID, ownerToken); abortErr != nil {
+		return errors.Join(completeErr, abortErr)
+	}
+	return completeErr
+}
+
+func (s *Service) recordUpdateFailure(
+	updateID int,
+	ownerToken string,
+	cause string,
+	holdLeaseUntil time.Time,
+) (bool, error) {
+	journalCtx, cancel := s.independentJournalContext()
+	defer cancel()
+	dead, err := s.updateJournal.FailUpdateAttempt(
+		journalCtx,
+		updateID,
+		updateID+1,
+		ownerToken,
+		maxUpdateHandlerFailures,
+		cause,
+		holdLeaseUntil,
+	)
+	if err != nil {
+		return false, journalFailure("record failed update attempt", err)
+	}
+	return dead, nil
+}
+
+func (s *Service) logPoisonUpdate(
+	updateID int,
+	attemptCount int,
+	failureCount int,
+	metadata updateMetadata,
+	cause string,
+) {
+	s.logger.Error(
+		"Telegram update quarantined after repeated handler failures",
+		"update_id", updateID,
+		"attempt_count", attemptCount,
+		"failure_count", failureCount,
+		"action", metadata.action,
+		"error", cause,
+	)
 }
 
 func (s *Service) handleUpdateBounded(ctx context.Context, update tgbotapi.Update) (bool, error) {
@@ -289,29 +537,39 @@ func (s *Service) handleUpdateBounded(ctx context.Context, update tgbotapi.Updat
 	updateCtx, cancel := context.WithTimeout(ctx, updateTimeout)
 	defer cancel()
 
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
+		var handlerErr error
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				handlerErr = fmt.Errorf("%w: %v", ErrUpdateHandlerPanic, recovered)
+			}
+			done <- handlerErr
+		}()
+		if s.updateHandler != nil {
+			handlerErr = s.updateHandler(updateCtx, update)
+			return
+		}
 		s.handleUpdate(updateCtx, update)
 	}()
 
 	select {
-	case <-done:
+	case handlerErr := <-done:
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		return errors.Is(updateCtx.Err(), context.DeadlineExceeded), nil
+		return errors.Is(updateCtx.Err(), context.DeadlineExceeded), handlerErr
 	case <-updateCtx.Done():
 	}
 
 	stopTimer := time.NewTimer(stopGrace)
 	defer stopTimer.Stop()
 	select {
-	case <-done:
+	case handlerErr := <-done:
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		return errors.Is(updateCtx.Err(), context.DeadlineExceeded), nil
+		return errors.Is(updateCtx.Err(), context.DeadlineExceeded), handlerErr
 	case <-stopTimer.C:
 		cause := updateCtx.Err()
 		if cause == nil {

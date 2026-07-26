@@ -3,16 +3,21 @@ package telegram
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/tiwb/tg-obs-bot/internal/queue"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -767,6 +772,99 @@ func TestNewDefaultsRequestTimeoutExceedsUpdateTimeout(t *testing.T) {
 	}
 }
 
+func TestNewRequiresUpdateJournal(t *testing.T) {
+	_, err := New(Config{
+		Token:         "token",
+		APIBaseURL:    "http://127.0.0.1:8081",
+		AllowedChatID: testChatID,
+	}, Hooks{}, slog.Default(), WithBotAPI(&fakeBotAPI{}))
+	if err == nil || !strings.Contains(err.Error(), "update journal is required") {
+		t.Fatalf("New error = %v, want required update journal", err)
+	}
+}
+
+func TestMetadataForUpdateInfersOnlyCoarseActionAndTelegramIDs(t *testing.T) {
+	command := commandMessage(42, "/queue")
+	command.MessageID = 91
+	tests := []struct {
+		name   string
+		update tgbotapi.Update
+		want   updateMetadata
+	}{
+		{
+			name:   "command",
+			update: tgbotapi.Update{Message: command},
+			want: updateMetadata{
+				kind:      "message",
+				action:    "queue",
+				chatID:    testChatID,
+				messageID: 91,
+				actorID:   42,
+			},
+		},
+		{
+			name: "callback",
+			update: tgbotapi.Update{CallbackQuery: &tgbotapi.CallbackQuery{
+				Data: "remove:12345 extra arguments are not journaled",
+				From: &tgbotapi.User{ID: 43},
+				Message: &tgbotapi.Message{
+					MessageID: 92,
+					Chat:      &tgbotapi.Chat{ID: testChatID},
+				},
+			}},
+			want: updateMetadata{
+				kind:      "callback_query",
+				action:    "remove",
+				chatID:    testChatID,
+				messageID: 92,
+				actorID:   43,
+			},
+		},
+		{
+			name: "video upload",
+			update: tgbotapi.Update{Message: &tgbotapi.Message{
+				MessageID: 93,
+				Chat:      &tgbotapi.Chat{ID: testChatID},
+				From:      &tgbotapi.User{ID: 44},
+				Video:     &tgbotapi.Video{FileID: "file"},
+			}},
+			want: updateMetadata{
+				kind:      "message",
+				action:    "upload_video",
+				chatID:    testChatID,
+				messageID: 93,
+				actorID:   44,
+			},
+		},
+		{
+			name: "malformed command entity",
+			update: tgbotapi.Update{Message: &tgbotapi.Message{
+				MessageID: 94,
+				Chat:      &tgbotapi.Chat{ID: testChatID},
+				From:      &tgbotapi.User{ID: 45},
+				Text:      "/q",
+				Entities: []tgbotapi.MessageEntity{
+					{Type: "bot_command", Offset: 0, Length: 999},
+				},
+			}},
+			want: updateMetadata{
+				kind:      "message",
+				chatID:    testChatID,
+				messageID: 94,
+				actorID:   45,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := metadataForUpdate(tt.update); got != tt.want {
+				t.Fatalf("metadata = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestProductionBotAPIUpdateAndRequestGatesAreIndependent(t *testing.T) {
 	api := &productionBotAPI{
 		updateClient:   &contextHTTPClient{},
@@ -1194,6 +1292,683 @@ func TestRunRetriesGetUpdatesError(t *testing.T) {
 	}
 }
 
+func TestRunRestartsFromDurableOffsetAndConfirmsOnSuccessfulNextPoll(t *testing.T) {
+	journal := newFakeUpdateJournal()
+	handled := atomic.Int32{}
+
+	firstBot := &fakeBotAPI{
+		updateResponses: []updateResponse{
+			{updates: []tgbotapi.Update{
+				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			}},
+		},
+		updateCalls: make(chan struct{}, 2),
+	}
+	first := newTestServiceWithJournal(t, firstBot, journal)
+	first.updateHandler = func(context.Context, tgbotapi.Update) error {
+		handled.Add(1)
+		return nil
+	}
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstErr := make(chan error, 1)
+	go func() {
+		firstErr <- first.Run(firstCtx)
+	}()
+	waitForUpdateCalls(t, firstBot.updateCalls, 2)
+	cancelFirst()
+	if err := <-firstErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Run error = %v, want cancellation", err)
+	}
+
+	next, confirmed, attempt, ok := journal.snapshot(10)
+	if !ok {
+		t.Fatal("durable attempt for update 10 is missing")
+	}
+	if next != 11 || confirmed != 0 || attempt.status != "done" {
+		t.Fatalf(
+			"after first process: next=%d confirmed=%d status=%q, want 11/0/done",
+			next,
+			confirmed,
+			attempt.status,
+		)
+	}
+
+	secondBot := &fakeBotAPI{
+		updateResponses: []updateResponse{{}},
+		updateCalls:     make(chan struct{}, 2),
+	}
+	second := newTestServiceWithJournal(t, secondBot, journal)
+	second.updateHandler = func(context.Context, tgbotapi.Update) error {
+		t.Fatal("confirmed update was replayed after restart")
+		return nil
+	}
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	secondErr := make(chan error, 1)
+	go func() {
+		secondErr <- second.Run(secondCtx)
+	}()
+	waitForUpdateCalls(t, secondBot.updateCalls, 2)
+	cancelSecond()
+	if err := <-secondErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("second Run error = %v, want cancellation", err)
+	}
+
+	if got := secondBot.updateConfigs[0].Offset; got != 11 {
+		t.Fatalf("restart poll offset = %d, want durable offset 11", got)
+	}
+	next, confirmed, _, _ = journal.snapshot(10)
+	if next != 11 || confirmed != 11 {
+		t.Fatalf("confirmed checkpoint = (%d, %d), want (11, 11)", next, confirmed)
+	}
+	if got := handled.Load(); got != 1 {
+		t.Fatalf("handler executions = %d, want exactly 1", got)
+	}
+}
+
+func TestRunRestartAcrossTelegramGapAbandonsOnlySafeOldAttempts(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	store, err := queue.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open real update journal: %v", err)
+	}
+	defer store.Close()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open fixture database: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC()
+	created := now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	fixtures := []struct {
+		id         int
+		status     string
+		owner      string
+		leaseUntil any
+		lastError  string
+	}{
+		{id: 5, status: "failed", lastError: "earlier handler failure"},
+		{id: 6, status: "running", owner: "expired-owner", leaseUntil: now.Add(-time.Hour).Format(time.RFC3339Nano)},
+		{id: 7, status: "running", owner: "active-old-owner", leaseUntil: now.Add(time.Hour).Format(time.RFC3339Nano)},
+		{id: 11, status: "running", owner: "boundary-owner", leaseUntil: now.Add(time.Hour).Format(time.RFC3339Nano)},
+		{id: 12, status: "pending"},
+	}
+	for _, fixture := range fixtures {
+		if _, err := db.ExecContext(ctx, `
+INSERT INTO telegram_update_attempts (
+	update_id, update_kind, action, chat_id, message_id, actor_id,
+	attempt_count, failure_count, status, owner_token, lease_until,
+	last_error, created_at, updated_at, finished_at
+) VALUES (?, 'message', 'queue', ?, 1, 42, 1, 0, ?, ?, ?, ?, ?, ?, NULL)
+`,
+			fixture.id,
+			testChatID,
+			fixture.status,
+			fixture.owner,
+			fixture.leaseUntil,
+			fixture.lastError,
+			created,
+			created,
+		); err != nil {
+			t.Fatalf("insert old attempt %d: %v", fixture.id, err)
+		}
+	}
+
+	firstBot := &fakeBotAPI{
+		updateResponses: []updateResponse{{updates: []tgbotapi.Update{
+			{UpdateID: 10, Message: commandMessage(42, "/queue")},
+		}}},
+		updateCalls: make(chan struct{}, 2),
+	}
+	first := newTestServiceWithJournal(t, firstBot, store)
+	first.now = time.Now
+	var handled atomic.Int32
+	first.updateHandler = func(context.Context, tgbotapi.Update) error {
+		handled.Add(1)
+		return nil
+	}
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstErr := make(chan error, 1)
+	go func() {
+		firstErr <- first.Run(firstCtx)
+	}()
+	waitForUpdateCalls(t, firstBot.updateCalls, 2)
+	cancelFirst()
+	if err := <-firstErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Run error = %v, want cancellation", err)
+	}
+	next, confirmed, err := store.LoadUpdateCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("load checkpoint before restart: %v", err)
+	}
+	if next != 11 || confirmed != 0 {
+		t.Fatalf("checkpoint before restart = (%d, %d), want (11, 0)", next, confirmed)
+	}
+
+	secondBot := &fakeBotAPI{
+		updateResponses: []updateResponse{{}},
+		updateCalls:     make(chan struct{}, 2),
+	}
+	second := newTestServiceWithJournal(t, secondBot, store)
+	second.now = time.Now
+	second.updateHandler = func(context.Context, tgbotapi.Update) error {
+		t.Fatal("restart unexpectedly executed an update")
+		return nil
+	}
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	secondErr := make(chan error, 1)
+	go func() {
+		secondErr <- second.Run(secondCtx)
+	}()
+	waitForUpdateCalls(t, secondBot.updateCalls, 2)
+	cancelSecond()
+	if err := <-secondErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("second Run error = %v, want cancellation", err)
+	}
+	if got := handled.Load(); got != 1 {
+		t.Fatalf("higher update handler executions = %d, want 1", got)
+	}
+
+	const abandonedError = "update abandoned after Telegram confirmed a higher offset"
+	for _, fixture := range []struct {
+		id        int
+		status    string
+		owner     string
+		lastError string
+	}{
+		{id: 5, status: "dead", lastError: abandonedError},
+		{id: 6, status: "dead", lastError: abandonedError},
+		{id: 7, status: "running", owner: "active-old-owner"},
+		{id: 11, status: "running", owner: "boundary-owner"},
+		{id: 12, status: "pending"},
+	} {
+		var status, owner, lastError string
+		var lease, finished sql.NullString
+		if err := db.QueryRowContext(ctx, `
+SELECT status, owner_token, lease_until, last_error, finished_at
+FROM telegram_update_attempts
+WHERE update_id = ?
+`, fixture.id).Scan(&status, &owner, &lease, &lastError, &finished); err != nil {
+			t.Fatalf("inspect reconciled update %d: %v", fixture.id, err)
+		}
+		if status != fixture.status || owner != fixture.owner || lastError != fixture.lastError {
+			t.Fatalf(
+				"update %d = status=%q owner=%q error=%q, want %q/%q/%q",
+				fixture.id,
+				status,
+				owner,
+				lastError,
+				fixture.status,
+				fixture.owner,
+				fixture.lastError,
+			)
+		}
+		if fixture.status == "dead" && (lease.Valid || !finished.Valid) {
+			t.Fatalf(
+				"abandoned update %d lease=%#v finished=%#v",
+				fixture.id,
+				lease,
+				finished,
+			)
+		}
+	}
+	next, confirmed, err = store.LoadUpdateCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("load checkpoint after restart: %v", err)
+	}
+	if next != 11 || confirmed != 11 {
+		t.Fatalf("checkpoint after restart = (%d, %d), want (11, 11)", next, confirmed)
+	}
+
+	oldFinished := now.Add(-100 * 24 * time.Hour).Format(time.RFC3339Nano)
+	if _, err := db.ExecContext(ctx, `
+UPDATE telegram_update_attempts
+SET finished_at = ?
+WHERE update_id IN (5, 6)
+`, oldFinished); err != nil {
+		t.Fatalf("age abandoned attempts: %v", err)
+	}
+	_, prunedDead, err := store.PruneTelegramUpdateJournal(ctx)
+	if err != nil {
+		t.Fatalf("prune abandoned attempts: %v", err)
+	}
+	if prunedDead != 2 || prunedDead > 256 {
+		t.Fatalf("pruned dead rows = %d, want 2 within batch", prunedDead)
+	}
+	for _, id := range []int{5, 6} {
+		var count int
+		if err := db.QueryRowContext(
+			ctx,
+			`SELECT COUNT(*) FROM telegram_update_attempts WHERE update_id = ?`,
+			id,
+		).Scan(&count); err != nil {
+			t.Fatalf("inspect pruned update %d: %v", id, err)
+		}
+		if count != 0 {
+			t.Fatalf("abandoned update %d was not pruned", id)
+		}
+	}
+}
+
+func TestRunReplaysAfterTerminalJournalWriteFailureOnRestart(t *testing.T) {
+	journal := newFakeUpdateJournal()
+	journal.completeErr = errors.New("injected commit failure")
+	var handled atomic.Int32
+
+	firstBot := &fakeBotAPI{
+		updateResponses: []updateResponse{
+			{updates: []tgbotapi.Update{
+				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			}},
+		},
+	}
+	first := newTestServiceWithJournal(t, firstBot, journal)
+	first.updateHandler = func(context.Context, tgbotapi.Update) error {
+		handled.Add(1)
+		return nil
+	}
+	err := first.Run(context.Background())
+	if !errors.Is(err, ErrUpdateJournalFailure) || !strings.Contains(err.Error(), "injected commit failure") {
+		t.Fatalf("first Run error = %v, want fail-closed journal error", err)
+	}
+	next, _, attempt, ok := journal.snapshot(10)
+	if !ok ||
+		next != 0 ||
+		attempt.status != "pending" ||
+		!attempt.leaseUntil.IsZero() {
+		t.Fatalf("failed commit state = next=%d attempt=%#v ok=%v", next, attempt, ok)
+	}
+
+	journal.mu.Lock()
+	journal.completeErr = nil
+	journal.mu.Unlock()
+	secondBot := &fakeBotAPI{
+		updateResponses: []updateResponse{
+			{updates: []tgbotapi.Update{
+				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			}},
+		},
+		updateCalls: make(chan struct{}, 2),
+	}
+	second := newTestServiceWithJournal(t, secondBot, journal)
+	second.updateHandler = func(context.Context, tgbotapi.Update) error {
+		handled.Add(1)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- second.Run(ctx)
+	}()
+	waitForUpdateCalls(t, secondBot.updateCalls, 2)
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("restart Run error = %v, want cancellation", err)
+	}
+
+	next, _, attempt, ok = journal.snapshot(10)
+	if !ok ||
+		next != 11 ||
+		attempt.status != "done" ||
+		attempt.attemptCount != 2 ||
+		attempt.failureCount != 0 {
+		t.Fatalf("restart state = next=%d attempt=%#v ok=%v", next, attempt, ok)
+	}
+	if got := handled.Load(); got != 2 {
+		t.Fatalf("handler executions = %d, want replay after uncertain commit", got)
+	}
+}
+
+func TestRunQuarantinesPanickingHandlerAfterThreeRestarts(t *testing.T) {
+	journal := newFakeUpdateJournal()
+	var handled atomic.Int32
+
+	for attemptNumber := 1; attemptNumber <= maxUpdateHandlerFailures; attemptNumber++ {
+		bot := &fakeBotAPI{
+			updateResponses: []updateResponse{
+				{updates: []tgbotapi.Update{
+					{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				}},
+			},
+		}
+		svc := newTestServiceWithJournal(t, bot, journal)
+		svc.updateHandler = func(context.Context, tgbotapi.Update) error {
+			handled.Add(1)
+			panic("deterministic panic")
+		}
+
+		err := svc.Run(context.Background())
+		if !errors.Is(err, ErrUpdateHandlerPanic) {
+			t.Fatalf("attempt %d error = %v, want panic sentinel", attemptNumber, err)
+		}
+		if got := len(bot.updateConfigs); got != 1 {
+			t.Fatalf("attempt %d GetUpdates calls = %d, want 1", attemptNumber, got)
+		}
+	}
+
+	next, _, attempt, ok := journal.snapshot(10)
+	if !ok ||
+		next != 11 ||
+		attempt.status != "dead" ||
+		attempt.attemptCount != maxUpdateHandlerFailures ||
+		attempt.failureCount != maxUpdateHandlerFailures {
+		t.Fatalf("poison state = next=%d attempt=%#v ok=%v", next, attempt, ok)
+	}
+	if got := handled.Load(); got != maxUpdateHandlerFailures {
+		t.Fatalf("handler executions = %d, want %d", got, maxUpdateHandlerFailures)
+	}
+
+	// Even the generation that atomically dead-letters the third panic must
+	// stop. Only a clean process generation may poll past the quarantined row.
+	restartBot := &fakeBotAPI{
+		updateResponses: []updateResponse{{}},
+		updateCalls:     make(chan struct{}, 2),
+	}
+	restart := newTestServiceWithJournal(t, restartBot, journal)
+	restart.updateHandler = func(context.Context, tgbotapi.Update) error {
+		t.Fatal("dead update was executed in the clean restart")
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- restart.Run(ctx)
+	}()
+	waitForUpdateCalls(t, restartBot.updateCalls, 2)
+	if got := restartBot.updateConfigs[0].Offset; got != 11 {
+		t.Fatalf("clean restart offset = %d, want 11", got)
+	}
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("clean restart error = %v, want cancellation", err)
+	}
+}
+
+func TestRunRecoversHandlerPanicWithoutAcknowledgingUpdate(t *testing.T) {
+	journal := newFakeUpdateJournal()
+	bot := &fakeBotAPI{
+		updateResponses: []updateResponse{
+			{updates: []tgbotapi.Update{
+				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			}},
+		},
+	}
+	svc := newTestServiceWithJournal(t, bot, journal)
+	svc.updateHandler = func(context.Context, tgbotapi.Update) error {
+		panic("boom")
+	}
+
+	err := svc.Run(context.Background())
+	if !errors.Is(err, ErrUpdateHandlerPanic) {
+		t.Fatalf("Run error = %v, want panic sentinel", err)
+	}
+	next, _, attempt, ok := journal.snapshot(10)
+	if !ok || next != 0 || attempt.status != "failed" || attempt.attemptCount != 1 {
+		t.Fatalf("panic state = next=%d attempt=%#v ok=%v", next, attempt, ok)
+	}
+}
+
+func TestRunJournalFailuresAreFailClosedBeforeAcknowledgement(t *testing.T) {
+	journalErr := errors.New("injected journal failure")
+	tests := []struct {
+		name      string
+		configure func(*fakeUpdateJournal)
+		wantCalls int
+		wantBegin bool
+	}{
+		{
+			name: "load",
+			configure: func(journal *fakeUpdateJournal) {
+				journal.loadErr = journalErr
+			},
+			wantCalls: 0,
+		},
+		{
+			name: "confirm",
+			configure: func(journal *fakeUpdateJournal) {
+				journal.confirmErr = journalErr
+			},
+			wantCalls: 1,
+		},
+		{
+			name: "begin",
+			configure: func(journal *fakeUpdateJournal) {
+				journal.beginErr = journalErr
+			},
+			wantCalls: 1,
+		},
+		{
+			name: "complete",
+			configure: func(journal *fakeUpdateJournal) {
+				journal.completeErr = journalErr
+			},
+			wantCalls: 1,
+			wantBegin: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			journal := newFakeUpdateJournal()
+			tt.configure(journal)
+			bot := &fakeBotAPI{
+				updateResponses: []updateResponse{
+					{updates: []tgbotapi.Update{
+						{UpdateID: 10, Message: commandMessage(42, "/queue")},
+					}},
+				},
+			}
+			svc := newTestServiceWithJournal(t, bot, journal)
+			var handled atomic.Bool
+			svc.updateHandler = func(context.Context, tgbotapi.Update) error {
+				handled.Store(true)
+				return nil
+			}
+
+			err := svc.Run(context.Background())
+			if !errors.Is(err, ErrUpdateJournalFailure) || !errors.Is(err, journalErr) {
+				t.Fatalf("Run error = %v, want fail-closed journal error", err)
+			}
+			if bot.updateCallCount != tt.wantCalls {
+				t.Fatalf("GetUpdates calls = %d, want %d", bot.updateCallCount, tt.wantCalls)
+			}
+			if handled.Load() != tt.wantBegin {
+				t.Fatalf("handler called = %v, want %v", handled.Load(), tt.wantBegin)
+			}
+			next, _, _, _ := journal.snapshot(10)
+			if next != 0 {
+				t.Fatalf("durable next offset = %d, want 0", next)
+			}
+		})
+	}
+}
+
+func TestRunCancellationDuringJournalConfirmationRemainsGraceful(t *testing.T) {
+	journal := &blockingConfirmJournal{
+		fakeUpdateJournal: newFakeUpdateJournal(),
+		started:           make(chan struct{}),
+	}
+	bot := &fakeBotAPI{
+		updateResponses: []updateResponse{{}},
+		updateCalls:     make(chan struct{}, 1),
+	}
+	svc := newTestServiceWithJournal(t, bot, journal)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+	select {
+	case <-journal.started:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("journal confirmation did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error = %v, want cancellation", err)
+		}
+		if errors.Is(err, ErrUpdateJournalFailure) {
+			t.Fatalf("normal cancellation was classified as journal failure: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not return after confirmation cancellation")
+	}
+}
+
+func TestRunBoundsEveryPollingJournalOperation(t *testing.T) {
+	tests := []struct {
+		operation   string
+		wantPolls   int
+		wantHandled bool
+	}{
+		{operation: "load"},
+		{operation: "confirm", wantPolls: 1},
+		{operation: "begin", wantPolls: 1},
+		{operation: "complete", wantPolls: 1, wantHandled: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.operation, func(t *testing.T) {
+			journal := &contextBlockingJournal{
+				fakeUpdateJournal: newFakeUpdateJournal(),
+				blockOperation:    tt.operation,
+			}
+			responses := []updateResponse{{}}
+			if tt.operation == "begin" || tt.operation == "complete" {
+				responses = []updateResponse{{updates: []tgbotapi.Update{
+					{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				}}}
+			}
+			bot := &fakeBotAPI{updateResponses: responses}
+			svc := newTestServiceWithJournal(t, bot, journal)
+			svc.journalWriteTimeout = 20 * time.Millisecond
+			var handled atomic.Bool
+			svc.updateHandler = func(context.Context, tgbotapi.Update) error {
+				handled.Store(true)
+				return nil
+			}
+
+			started := time.Now()
+			err := svc.Run(context.Background())
+			if !errors.Is(err, ErrUpdateJournalFailure) ||
+				!errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Run error = %v, want bounded journal deadline", err)
+			}
+			if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+				t.Fatalf("journal operation blocked for %s", elapsed)
+			}
+			if got := bot.updateCallCount; got != tt.wantPolls {
+				t.Fatalf("GetUpdates calls = %d, want %d", got, tt.wantPolls)
+			}
+			if got := handled.Load(); got != tt.wantHandled {
+				t.Fatalf("handler called = %v, want %v", got, tt.wantHandled)
+			}
+		})
+	}
+}
+
+func TestRunCancellationAfterHandlerSuccessStillCommitsTerminalAttempt(t *testing.T) {
+	journal := &blockingCompleteJournal{
+		fakeUpdateJournal: newFakeUpdateJournal(),
+		started:           make(chan struct{}),
+		release:           make(chan struct{}),
+	}
+	bot := &fakeBotAPI{
+		updateResponses: []updateResponse{{updates: []tgbotapi.Update{
+			{UpdateID: 10, Message: commandMessage(42, "/queue")},
+		}}},
+	}
+	svc := newTestServiceWithJournal(t, bot, journal)
+	svc.updateHandler = func(context.Context, tgbotapi.Update) error {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+	select {
+	case <-journal.started:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("terminal journal write did not start")
+	}
+	cancel()
+	close(journal.release)
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error = %v, want parent cancellation", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not stop after terminal write")
+	}
+	next, _, attempt, ok := journal.snapshot(10)
+	if !ok ||
+		next != 11 ||
+		attempt.status != "done" ||
+		attempt.failureCount != 0 {
+		t.Fatalf("terminal cancellation race = next=%d attempt=%#v ok=%v", next, attempt, ok)
+	}
+}
+
+func TestRunThreeCooperativeShutdownsDoNotPoisonUpdate(t *testing.T) {
+	journal := newFakeUpdateJournal()
+
+	for generation := 1; generation <= 3; generation++ {
+		bot := &fakeBotAPI{
+			updateResponses: []updateResponse{{updates: []tgbotapi.Update{
+				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			}}},
+		}
+		svc := newTestServiceWithJournal(t, bot, journal)
+		started := make(chan struct{})
+		svc.updateHandler = func(ctx context.Context, _ tgbotapi.Update) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- svc.Run(ctx)
+		}()
+		select {
+		case <-started:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("generation %d handler did not start", generation)
+		}
+		cancel()
+		select {
+		case err := <-errCh:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("generation %d Run error = %v, want cancellation", generation, err)
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("generation %d did not stop", generation)
+		}
+
+		next, _, attempt, ok := journal.snapshot(10)
+		if !ok ||
+			next != 0 ||
+			attempt.status != "pending" ||
+			attempt.failureCount != 0 ||
+			attempt.attemptCount != generation {
+			t.Fatalf(
+				"generation %d state = next=%d attempt=%#v ok=%v",
+				generation,
+				next,
+				attempt,
+				ok,
+			)
+		}
+	}
+}
+
 func TestRunAdvancesUpdateOffset(t *testing.T) {
 	bot := &fakeBotAPI{
 		updateResponses: []updateResponse{
@@ -1436,6 +2211,174 @@ func TestRunStuckUpdateHandlerReturnsSentinelWithoutNextPoll(t *testing.T) {
 	case <-handlerDone:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("stuck test handler did not drain after release")
+	}
+	journal := svc.updateJournal.(*fakeUpdateJournal)
+	next, _, attempt, ok := journal.snapshot(10)
+	if !ok || next != 0 || attempt.status != "stuck" || attempt.failureCount != 1 {
+		t.Fatalf("stuck handler journal = next=%d attempt=%#v ok=%v", next, attempt, ok)
+	}
+}
+
+func TestRunStuckHandlerConvergesToDeadAcrossProcessGenerations(t *testing.T) {
+	journal := newFakeUpdateJournal()
+	now := time.Date(2026, 6, 9, 12, 0, 0, 0, time.UTC)
+
+	for generation := 1; generation <= maxUpdateHandlerFailures; generation++ {
+		journal.mu.Lock()
+		journal.now = now
+		journal.mu.Unlock()
+		bot := &fakeBotAPI{
+			updateResponses: []updateResponse{{updates: []tgbotapi.Update{
+				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			}}},
+		}
+		svc := newTestServiceWithJournal(t, bot, journal)
+		svc.now = func() time.Time { return now }
+		svc.updateProcessingTimeout = 10 * time.Millisecond
+		svc.updateHandlerStopGrace = 10 * time.Millisecond
+		svc.stuckOwnerLease = time.Second
+		release := make(chan struct{})
+		svc.updateHandler = func(context.Context, tgbotapi.Update) error {
+			<-release
+			return nil
+		}
+
+		err := svc.Run(context.Background())
+		close(release)
+		if !errors.Is(err, ErrUpdateHandlerStuck) {
+			t.Fatalf("generation %d error = %v, want stuck sentinel", generation, err)
+		}
+		if got := len(bot.updateConfigs); got != 1 {
+			t.Fatalf("generation %d polls = %d, want 1", generation, got)
+		}
+
+		next, _, attempt, ok := journal.snapshot(10)
+		wantStatus := "stuck"
+		wantNext := 0
+		if generation == maxUpdateHandlerFailures {
+			wantStatus = "dead"
+			wantNext = 11
+		}
+		if !ok ||
+			next != wantNext ||
+			attempt.status != wantStatus ||
+			attempt.attemptCount != generation ||
+			attempt.failureCount != generation {
+			t.Fatalf(
+				"generation %d state = next=%d attempt=%#v ok=%v",
+				generation,
+				next,
+				attempt,
+				ok,
+			)
+		}
+		now = now.Add(2 * time.Second)
+	}
+
+	restartBot := &fakeBotAPI{
+		updateResponses: []updateResponse{{}},
+		updateCalls:     make(chan struct{}, 2),
+	}
+	restart := newTestServiceWithJournal(t, restartBot, journal)
+	restart.now = func() time.Time { return now }
+	restart.updateHandler = func(context.Context, tgbotapi.Update) error {
+		t.Fatal("dead stuck update was executed after restart")
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- restart.Run(ctx)
+	}()
+	waitForUpdateCalls(t, restartBot.updateCalls, 2)
+	if got := restartBot.updateConfigs[0].Offset; got != 11 {
+		t.Fatalf("restart poll offset = %d, want 11", got)
+	}
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("restart error = %v, want cancellation", err)
+	}
+}
+
+func TestRunBusyAttemptDoesNotExecuteHandler(t *testing.T) {
+	journal := newFakeUpdateJournal()
+	journal.attempts[10] = &fakeJournalAttempt{
+		kind:         "message",
+		action:       "queue",
+		attemptCount: 1,
+		status:       "running",
+		ownerToken:   "other-process",
+		leaseUntil:   journal.now.Add(time.Minute),
+	}
+	bot := &fakeBotAPI{
+		updateResponses: []updateResponse{{updates: []tgbotapi.Update{
+			{UpdateID: 10, Message: commandMessage(42, "/queue")},
+		}}},
+	}
+	svc := newTestServiceWithJournal(t, bot, journal)
+	var handled atomic.Bool
+	svc.updateHandler = func(context.Context, tgbotapi.Update) error {
+		handled.Store(true)
+		return nil
+	}
+
+	err := svc.Run(context.Background())
+	if !errors.Is(err, ErrUpdateAttemptBusy) {
+		t.Fatalf("Run error = %v, want busy sentinel", err)
+	}
+	if handled.Load() {
+		t.Fatal("busy update executed handler")
+	}
+	if got := len(bot.updateConfigs); got != 1 {
+		t.Fatalf("GetUpdates calls = %d, want 1", got)
+	}
+}
+
+func TestRunTerminalReplayRepairsCheckpointWithoutHandler(t *testing.T) {
+	journal := newFakeUpdateJournal()
+	journal.attempts[10] = &fakeJournalAttempt{
+		kind:         "message",
+		action:       "queue",
+		attemptCount: 1,
+		status:       "done",
+	}
+	bot := &fakeBotAPI{
+		updateResponses: []updateResponse{
+			{updates: []tgbotapi.Update{
+				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			}},
+			{},
+		},
+		updateCalls: make(chan struct{}, 2),
+	}
+	svc := newTestServiceWithJournal(t, bot, journal)
+	svc.updateHandler = func(context.Context, tgbotapi.Update) error {
+		t.Fatal("terminal replay executed handler")
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+	waitForUpdateCalls(t, bot.updateCalls, 2)
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want cancellation", err)
+	}
+	next, confirmed, attempt, ok := journal.snapshot(10)
+	if !ok ||
+		next != 11 ||
+		confirmed != 11 ||
+		attempt.status != "done" ||
+		attempt.attemptCount != 1 {
+		t.Fatalf(
+			"terminal replay state = next=%d confirmed=%d attempt=%#v ok=%v",
+			next,
+			confirmed,
+			attempt,
+			ok,
+		)
 	}
 }
 
@@ -1821,7 +2764,11 @@ func TestTruncateCallbackTextKeepsUTF8Valid(t *testing.T) {
 
 func newTestService(t *testing.T, bot *fakeBotAPI) *Service {
 	t.Helper()
+	return newTestServiceWithJournal(t, bot, newFakeUpdateJournal())
+}
 
+func newTestServiceWithJournal(t *testing.T, bot *fakeBotAPI, journal UpdateJournal) *Service {
+	t.Helper()
 	svc, err := New(Config{
 		Token:         "token",
 		APIBaseURL:    "http://127.0.0.1:8081",
@@ -1830,7 +2777,7 @@ func newTestService(t *testing.T, bot *fakeBotAPI) *Service {
 		Skip: func(context.Context) (string, error) {
 			return "skipped", nil
 		},
-	}, slog.Default(), WithBotAPI(bot))
+	}, slog.Default(), WithBotAPI(bot), WithUpdateJournal(journal))
 	if err != nil {
 		t.Fatalf("new service: %v", err)
 	}
@@ -1839,6 +2786,352 @@ func newTestService(t *testing.T, bot *fakeBotAPI) *Service {
 		return now
 	}
 	return svc
+}
+
+type fakeJournalAttempt struct {
+	kind         string
+	action       string
+	chatID       int64
+	messageID    int
+	actorID      int64
+	attemptCount int
+	failureCount int
+	status       string
+	ownerToken   string
+	leaseUntil   time.Time
+	lastError    string
+}
+
+type fakeUpdateJournal struct {
+	mu sync.Mutex
+
+	nextOffset      int
+	confirmedOffset int
+	attempts        map[int]*fakeJournalAttempt
+	now             time.Time
+
+	loadErr     error
+	confirmErr  error
+	beginErr    error
+	completeErr error
+	abortErr    error
+	failErr     error
+}
+
+type blockingConfirmJournal struct {
+	*fakeUpdateJournal
+	started chan struct{}
+}
+
+func (j *blockingConfirmJournal) ConfirmUpdateOffset(ctx context.Context, _ int) error {
+	close(j.started)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+type blockingCompleteJournal struct {
+	*fakeUpdateJournal
+	started chan struct{}
+	release chan struct{}
+}
+
+func (j *blockingCompleteJournal) CompleteUpdateAttempt(
+	ctx context.Context,
+	updateID int,
+	nextOffset int,
+	ownerToken string,
+) error {
+	close(j.started)
+	select {
+	case <-j.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return j.fakeUpdateJournal.CompleteUpdateAttempt(ctx, updateID, nextOffset, ownerToken)
+}
+
+type contextBlockingJournal struct {
+	*fakeUpdateJournal
+	blockOperation string
+}
+
+func (j *contextBlockingJournal) wait(ctx context.Context, operation string) error {
+	if operation != j.blockOperation {
+		return nil
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (j *contextBlockingJournal) LoadUpdateCheckpoint(ctx context.Context) (int, int, error) {
+	if err := j.wait(ctx, "load"); err != nil {
+		return 0, 0, err
+	}
+	return j.fakeUpdateJournal.LoadUpdateCheckpoint(ctx)
+}
+
+func (j *contextBlockingJournal) ConfirmUpdateOffset(ctx context.Context, offset int) error {
+	if err := j.wait(ctx, "confirm"); err != nil {
+		return err
+	}
+	return j.fakeUpdateJournal.ConfirmUpdateOffset(ctx, offset)
+}
+
+func (j *contextBlockingJournal) BeginUpdateAttempt(
+	ctx context.Context,
+	updateID int,
+	kind string,
+	action string,
+	chatID int64,
+	messageID int,
+	actorID int64,
+	ownerToken string,
+	leaseUntil time.Time,
+	maxFailures int,
+) (string, int, int, error) {
+	if err := j.wait(ctx, "begin"); err != nil {
+		return "", 0, 0, err
+	}
+	return j.fakeUpdateJournal.BeginUpdateAttempt(
+		ctx,
+		updateID,
+		kind,
+		action,
+		chatID,
+		messageID,
+		actorID,
+		ownerToken,
+		leaseUntil,
+		maxFailures,
+	)
+}
+
+func (j *contextBlockingJournal) CompleteUpdateAttempt(
+	ctx context.Context,
+	updateID int,
+	nextOffset int,
+	ownerToken string,
+) error {
+	if err := j.wait(ctx, "complete"); err != nil {
+		return err
+	}
+	return j.fakeUpdateJournal.CompleteUpdateAttempt(ctx, updateID, nextOffset, ownerToken)
+}
+
+func newFakeUpdateJournal() *fakeUpdateJournal {
+	return &fakeUpdateJournal{
+		attempts: make(map[int]*fakeJournalAttempt),
+		now:      time.Date(2026, 6, 9, 12, 0, 0, 0, time.UTC),
+	}
+}
+
+func (j *fakeUpdateJournal) LoadUpdateCheckpoint(context.Context) (int, int, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.nextOffset, j.confirmedOffset, j.loadErr
+}
+
+func (j *fakeUpdateJournal) ConfirmUpdateOffset(_ context.Context, offset int) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.confirmErr != nil {
+		return j.confirmErr
+	}
+	if offset > j.nextOffset {
+		return errors.New("confirmed offset exceeds next offset")
+	}
+	if offset > j.confirmedOffset {
+		j.confirmedOffset = offset
+	}
+	return nil
+}
+
+func (j *fakeUpdateJournal) BeginUpdateAttempt(
+	_ context.Context,
+	updateID int,
+	kind string,
+	action string,
+	chatID int64,
+	messageID int,
+	actorID int64,
+	ownerToken string,
+	leaseUntil time.Time,
+	maxFailures int,
+) (string, int, int, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.beginErr != nil {
+		return "", 0, 0, j.beginErr
+	}
+	attempt := j.attempts[updateID]
+	if attempt == nil {
+		attempt = &fakeJournalAttempt{
+			attemptCount: 1,
+			status:       "running",
+			ownerToken:   ownerToken,
+			leaseUntil:   leaseUntil,
+		}
+		j.attempts[updateID] = attempt
+		j.setMetadata(attempt, kind, action, chatID, messageID, actorID)
+		return updateBeginExecute, 1, 0, nil
+	}
+	switch attempt.status {
+	case "done":
+		j.advance(updateID + 1)
+		return updateBeginAlreadyTerminal, attempt.attemptCount, attempt.failureCount, nil
+	case "dead":
+		j.advance(updateID + 1)
+		return updateBeginDead, attempt.attemptCount, attempt.failureCount, nil
+	case "running", "stuck":
+		if attempt.leaseUntil.After(j.now) {
+			return updateBeginBusy, attempt.attemptCount, attempt.failureCount, nil
+		}
+		if attempt.status == "running" {
+			attempt.failureCount++
+			attempt.lastError = "update owner lease expired before completion"
+			if attempt.failureCount >= maxFailures {
+				attempt.status = "dead"
+				attempt.ownerToken = ""
+				attempt.leaseUntil = time.Time{}
+				j.advance(updateID + 1)
+				return updateBeginDead, attempt.attemptCount, attempt.failureCount, nil
+			}
+		}
+	case "pending":
+		attempt.lastError = ""
+	case "failed":
+	default:
+		return "", 0, 0, errors.New("unknown attempt status")
+	}
+	attempt.attemptCount++
+	j.setMetadata(attempt, kind, action, chatID, messageID, actorID)
+	attempt.status = "running"
+	attempt.ownerToken = ownerToken
+	attempt.leaseUntil = leaseUntil
+	return updateBeginExecute, attempt.attemptCount, attempt.failureCount, nil
+}
+
+func (j *fakeUpdateJournal) CompleteUpdateAttempt(
+	_ context.Context,
+	updateID int,
+	nextOffset int,
+	ownerToken string,
+) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.completeErr != nil {
+		return j.completeErr
+	}
+	attempt := j.attempts[updateID]
+	if attempt == nil || attempt.status != "running" || attempt.ownerToken != ownerToken {
+		return errors.New("attempt is not running")
+	}
+	attempt.status = "done"
+	attempt.ownerToken = ""
+	attempt.leaseUntil = time.Time{}
+	j.advance(nextOffset)
+	return nil
+}
+
+func (j *fakeUpdateJournal) AbortUpdateAttempt(
+	_ context.Context,
+	updateID int,
+	ownerToken string,
+) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.abortErr != nil {
+		return j.abortErr
+	}
+	attempt := j.attempts[updateID]
+	if attempt == nil || attempt.status != "running" || attempt.ownerToken != ownerToken {
+		return errors.New("attempt is not owned")
+	}
+	attempt.status = "pending"
+	attempt.ownerToken = ""
+	attempt.leaseUntil = time.Time{}
+	attempt.lastError = ""
+	return nil
+}
+
+func (j *fakeUpdateJournal) FailUpdateAttempt(
+	_ context.Context,
+	updateID int,
+	nextOffset int,
+	ownerToken string,
+	maxFailures int,
+	cause string,
+	holdLeaseUntil time.Time,
+) (bool, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.failErr != nil {
+		return false, j.failErr
+	}
+	attempt := j.attempts[updateID]
+	if attempt == nil || attempt.status != "running" || attempt.ownerToken != ownerToken {
+		return false, errors.New("attempt is not running")
+	}
+	attempt.failureCount++
+	attempt.lastError = cause
+	if attempt.failureCount >= maxFailures {
+		attempt.status = "dead"
+		attempt.ownerToken = ""
+		attempt.leaseUntil = time.Time{}
+		j.advance(nextOffset)
+		return true, nil
+	}
+	if holdLeaseUntil.IsZero() {
+		attempt.status = "failed"
+		attempt.ownerToken = ""
+		attempt.leaseUntil = time.Time{}
+	} else {
+		attempt.status = "stuck"
+		attempt.leaseUntil = holdLeaseUntil
+	}
+	return false, nil
+}
+
+func (j *fakeUpdateJournal) setMetadata(
+	attempt *fakeJournalAttempt,
+	kind string,
+	action string,
+	chatID int64,
+	messageID int,
+	actorID int64,
+) {
+	attempt.kind = kind
+	attempt.action = action
+	attempt.chatID = chatID
+	attempt.messageID = messageID
+	attempt.actorID = actorID
+}
+
+func (j *fakeUpdateJournal) advance(nextOffset int) {
+	if nextOffset > j.nextOffset {
+		j.nextOffset = nextOffset
+	}
+}
+
+func (j *fakeUpdateJournal) snapshot(updateID int) (int, int, fakeJournalAttempt, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	attempt, ok := j.attempts[updateID]
+	if !ok {
+		return j.nextOffset, j.confirmedOffset, fakeJournalAttempt{}, false
+	}
+	return j.nextOffset, j.confirmedOffset, *attempt, true
+}
+
+func waitForUpdateCalls(t *testing.T, calls <-chan struct{}, count int) {
+	t.Helper()
+	for call := 1; call <= count; call++ {
+		select {
+		case <-calls:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timed out waiting for GetUpdates call %d", call)
+		}
+	}
 }
 
 func cacheAdmin(svc *Service, userID int64) {

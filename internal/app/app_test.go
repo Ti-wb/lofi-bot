@@ -3211,6 +3211,216 @@ func TestRunNormalCancellationDrainsWorkersWithoutFatalError(t *testing.T) {
 	}
 }
 
+func TestWorkerDrainBudgetAllowsTelegramJournalFinalization(t *testing.T) {
+	if defaultWorkerStopGrace != telegram.RecommendedParentDrainGrace {
+		t.Fatalf(
+			"default worker grace = %s, want Telegram budget %s",
+			defaultWorkerStopGrace,
+			telegram.RecommendedParentDrainGrace,
+		)
+	}
+	if defaultWorkerStopGrace <= 9*time.Second {
+		t.Fatalf(
+			"default worker grace = %s, want more than 5s handler grace + 4s journal timeout",
+			defaultWorkerStopGrace,
+		)
+	}
+
+	svc, _, fakeBot := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	// Scale the production 5s + 4s + 1s composition down while preserving the
+	// ordering: handler stop grace, independent journal finalization, cushion.
+	svc.workerStopGrace = 150 * time.Millisecond
+	botStarted := make(chan struct{})
+	handlerGraceElapsed := make(chan struct{})
+	journalCommitted := make(chan struct{})
+	fakeBot.run = func(ctx context.Context) error {
+		close(botStarted)
+		<-ctx.Done()
+		time.Sleep(50 * time.Millisecond)
+		close(handlerGraceElapsed)
+		time.Sleep(50 * time.Millisecond)
+		close(journalCommitted)
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+	select {
+	case <-botStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Telegram worker did not start")
+	}
+	cancel()
+
+	select {
+	case <-handlerGraceElapsed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Telegram handler stop grace did not elapse")
+	}
+	select {
+	case <-journalCommitted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("outer worker drain ended before Telegram journal finalization")
+	}
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error = %v, want cancellation", err)
+		}
+		if errors.Is(err, ErrWorkerShutdownStuck) {
+			t.Fatalf("Telegram journal finalization exhausted worker drain: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not finish after Telegram journal finalization")
+	}
+}
+
+func TestPeriodicMaintenanceConvergesTelegramJournalInBoundedBatches(t *testing.T) {
+	const (
+		doneLimit     = 10_000
+		deadLimit     = 1_000
+		pruneBatch    = 256
+		unsafeDoneID  = 50_000
+		unsafeDeadID  = 50_001
+		oldDoneID     = 15_000
+		oldDeadID     = 30_000
+		checkpointMax = 60_000
+	)
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	svc, _, _ := newFallbackTestServiceAtDBPath(t, config.Config{}, dbPath)
+	now := time.Now().UTC()
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open maintenance fixture database: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin maintenance fixture transaction: %v", err)
+	}
+	stmt, err := tx.PrepareContext(ctx, `
+INSERT INTO telegram_update_attempts (
+	update_id, update_kind, action, chat_id, message_id, actor_id,
+	attempt_count, status, last_error, created_at, updated_at, finished_at
+) VALUES (?, 'message', '', 0, 0, 0, 1, ?, '', ?, ?, ?)
+`)
+	if err != nil {
+		t.Fatalf("prepare maintenance fixture insert: %v", err)
+	}
+	recent := now.Add(-time.Hour).Format(time.RFC3339Nano)
+	old := now.Add(-100 * 24 * time.Hour).Format(time.RFC3339Nano)
+	for id := 1; id <= doneLimit+pruneBatch+5; id++ {
+		if _, err := stmt.ExecContext(ctx, id, "done", recent, recent, recent); err != nil {
+			t.Fatalf("insert done row %d: %v", id, err)
+		}
+	}
+	for id := 20_001; id <= 20_000+deadLimit+pruneBatch+5; id++ {
+		if _, err := stmt.ExecContext(ctx, id, "dead", recent, recent, recent); err != nil {
+			t.Fatalf("insert dead row %d: %v", id, err)
+		}
+	}
+	for _, fixture := range []struct {
+		id       int
+		status   string
+		finished string
+	}{
+		{id: oldDoneID, status: "done", finished: old},
+		{id: oldDeadID, status: "dead", finished: old},
+		{id: unsafeDoneID, status: "done", finished: old},
+		{id: unsafeDeadID, status: "dead", finished: old},
+	} {
+		if _, err := stmt.ExecContext(
+			ctx,
+			fixture.id,
+			fixture.status,
+			fixture.finished,
+			fixture.finished,
+			fixture.finished,
+		); err != nil {
+			t.Fatalf("insert special terminal row %d: %v", fixture.id, err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		t.Fatalf("close maintenance fixture insert: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE telegram_poll_checkpoint
+SET next_offset = ?, confirmed_offset = ?
+WHERE singleton = 1
+`, checkpointMax, unsafeDoneID); err != nil {
+		t.Fatalf("set maintenance checkpoint: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit maintenance fixtures: %v", err)
+	}
+
+	countStatus := func(status string) int {
+		t.Helper()
+		var count int
+		if err := db.QueryRowContext(
+			ctx,
+			`SELECT COUNT(*) FROM telegram_update_attempts WHERE status = ?`,
+			status,
+		).Scan(&count); err != nil {
+			t.Fatalf("count %s attempts: %v", status, err)
+		}
+		return count
+	}
+	doneCount := countStatus("done")
+	deadCount := countStatus("dead")
+	for pass := 1; ; pass++ {
+		if err := svc.performMaintenance(ctx); err != nil {
+			t.Fatalf("maintenance pass %d: %v", pass, err)
+		}
+		nextDone := countStatus("done")
+		nextDead := countStatus("dead")
+		if removed := doneCount - nextDone; removed < 0 || removed > pruneBatch {
+			t.Fatalf("pass %d done removals = %d, want 0..%d", pass, removed, pruneBatch)
+		}
+		if removed := deadCount - nextDead; removed < 0 || removed > pruneBatch {
+			t.Fatalf("pass %d dead removals = %d, want 0..%d", pass, removed, pruneBatch)
+		}
+		doneCount, deadCount = nextDone, nextDead
+		if doneCount == doneLimit+1 && deadCount == deadLimit+1 {
+			break
+		}
+		if pass >= 10 {
+			t.Fatalf(
+				"maintenance did not converge: done=%d dead=%d",
+				doneCount,
+				deadCount,
+			)
+		}
+	}
+
+	for _, fixture := range []struct {
+		id   int
+		want bool
+	}{
+		{id: oldDoneID, want: false},
+		{id: oldDeadID, want: false},
+		{id: unsafeDoneID, want: true},
+		{id: unsafeDeadID, want: true},
+	} {
+		var count int
+		if err := db.QueryRowContext(
+			ctx,
+			`SELECT COUNT(*) FROM telegram_update_attempts WHERE update_id = ?`,
+			fixture.id,
+		).Scan(&count); err != nil {
+			t.Fatalf("inspect update %d: %v", fixture.id, err)
+		}
+		if got := count == 1; got != fixture.want {
+			t.Fatalf("update %d exists = %v, want %v", fixture.id, got, fixture.want)
+		}
+	}
+}
+
 func TestRunParentCancellationPropagatesLateTelegramStuckSentinel(t *testing.T) {
 	svc, _, fakeBot := newFallbackTestService(t, config.Config{FallbackMode: "off"})
 	svc.workerStopGrace = 500 * time.Millisecond

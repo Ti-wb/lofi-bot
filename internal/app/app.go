@@ -99,7 +99,7 @@ const (
 	mediaProgressGrace       = 2 * time.Minute
 	mediaProgressHardGrace   = 2 * mediaProgressGrace
 	mediaCursorEpsilonMillis = 1.0
-	defaultWorkerStopGrace   = 5 * time.Second
+	defaultWorkerStopGrace   = telegram.RecommendedParentDrainGrace
 	defaultMaintenancePeriod = 10 * time.Minute
 )
 
@@ -218,7 +218,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 		AllowedChatID:      cfg.AllowedChatID,
 		MaxUploadSizeBytes: cfg.MaxVideoSizeBytes,
 		PlayerMode:         cfg.PlayerMode,
-	}, service.telegramHooks(), logger.With("component", "telegram"))
+	}, service.telegramHooks(), logger.With("component", "telegram"), telegram.WithUpdateJournal(store))
 	if err != nil {
 		service.Close()
 		return nil, err
@@ -1455,8 +1455,9 @@ func (s *Service) recoverStartupState(ctx context.Context) error {
 func (s *Service) performMaintenance(ctx context.Context) error {
 	staleErr := s.failStaleDownloading(ctx, "periodic recovery: stale downloading item")
 	retentionErr := s.CleanupRetention(ctx)
+	_, _, journalErr := s.store.PruneTelegramUpdateJournal(ctx)
 	tempErr := s.sweepStaleLibraryImportTemps(ctx)
-	return errors.Join(staleErr, retentionErr, tempErr)
+	return errors.Join(staleErr, retentionErr, journalErr, tempErr)
 }
 
 func (s *Service) failStaleDownloading(ctx context.Context, cause string) error {
