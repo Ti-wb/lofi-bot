@@ -27,7 +27,7 @@
 7. Music-ended events choose another music asset while avoiding immediate repeats when possible.
 8. Period changes cause the next stored or newly selected loop plan to start.
 9. `/preview` materializes the next period's planned loop so the preview matches the later playback unless the asset is removed.
-10. Telegram admin uploads that match the library filename schema pass an actual-size destination-filesystem admission check, are copied and validated inside an app-owned staging subdirectory, then become visible through an atomic rename before scan/import.
+10. Before Local Bot API `getFile`, upload metadata passes application admission: positive declared size, cache-filesystem headroom, queue capacity in queue mode, and filename/collision/destination-headroom checks in library mode. Shared cache/library filesystems reserve room for both the cached source and staging copy. The returned local path and actual file size are then revalidated; library assets are copied and validated inside an app-owned staging subdirectory before atomic publication and scan/import.
 
 ## Management Authorization
 

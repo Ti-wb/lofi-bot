@@ -1473,6 +1473,13 @@ func (s *Service) StatusText(ctx context.Context, obsConnected bool) (string, er
 
 func (s *Service) telegramHooks() telegram.Hooks {
 	return telegram.Hooks{
+		PreflightUpload: func(ctx context.Context, upload telegram.Upload) error {
+			err := s.preflightUpload(ctx, upload.FileName, upload.SizeBytes)
+			if err != nil {
+				s.setLastErr(err)
+			}
+			return err
+		},
 		EnqueueUpload: func(ctx context.Context, upload telegram.Upload) (string, error) {
 			if s.libraryMode() {
 				return s.ImportLibraryUpload(ctx, UploadRequest{

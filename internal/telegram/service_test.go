@@ -2603,6 +2603,57 @@ func TestUploadUsesLocalBotAPIFilePath(t *testing.T) {
 	}
 }
 
+func TestUploadPreflightRejectionAvoidsGetFile(t *testing.T) {
+	preflightErr := testPublicError("upload is not admissible")
+	bot := &fakeBotAPI{
+		file: tgbotapi.File{FilePath: "/tmp/video.mp4", FileSize: 1},
+	}
+	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
+	var got Upload
+	svc.hooks.PreflightUpload = func(_ context.Context, upload Upload) error {
+		got = upload
+		return preflightErr
+	}
+	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("enqueue hook should not be called")
+		return "", nil
+	}
+
+	_, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 1))
+	if !errors.Is(err, preflightErr) {
+		t.Fatalf("err = %v, want %v", err, preflightErr)
+	}
+	if got.FileID != "file-id" || got.SizeBytes != 1 || got.LocalPath != "" {
+		t.Fatalf("preflight upload = %#v, want parsed metadata without a local path", got)
+	}
+	if bot.fileCallCount != 0 {
+		t.Fatalf("getFile calls = %d, want 0", bot.fileCallCount)
+	}
+}
+
+func TestUploadMissingPreflightFailsClosedBeforeGetFile(t *testing.T) {
+	bot := &fakeBotAPI{
+		file: tgbotapi.File{FilePath: "/tmp/video.mp4", FileSize: 1},
+	}
+	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
+	svc.hooks.PreflightUpload = nil
+	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("enqueue hook should not be called")
+		return "", nil
+	}
+
+	_, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 1))
+	var hookErr errHookNotConfigured
+	if !errors.As(err, &hookErr) || hookErr != "preflight upload" {
+		t.Fatalf("err = %v, want missing preflight hook", err)
+	}
+	if bot.fileCallCount != 0 {
+		t.Fatalf("getFile calls = %d, want 0", bot.fileCallCount)
+	}
+}
+
 func TestUploadRequiresAdmin(t *testing.T) {
 	bot := &fakeBotAPI{
 		adminResponses: []adminResponse{
@@ -2611,6 +2662,11 @@ func TestUploadRequiresAdmin(t *testing.T) {
 	}
 	svc := newTestService(t, bot)
 	cacheOnlyAdmin(svc, 42)
+	preflightCalls := 0
+	svc.hooks.PreflightUpload = func(context.Context, Upload) error {
+		preflightCalls++
+		return nil
+	}
 	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
 		t.Fatal("enqueue hook should not be called")
 		return "", nil
@@ -2622,6 +2678,9 @@ func TestUploadRequiresAdmin(t *testing.T) {
 	}
 	if bot.fileCallCount != 0 {
 		t.Fatalf("getFile calls = %d, want 0", bot.fileCallCount)
+	}
+	if preflightCalls != 0 {
+		t.Fatalf("preflight calls = %d, want 0 before fresh-admin authorization", preflightCalls)
 	}
 	if bot.adminCallCount != 1 {
 		t.Fatalf("admin API calls = %d, want exactly 1 fresh lookup", bot.adminCallCount)
@@ -2766,15 +2825,29 @@ func TestUploadRejectsGetFileSizeOverLimit(t *testing.T) {
 	svc := newTestService(t, bot)
 	cacheAdmin(svc, 42)
 	svc.cfg.MaxUploadSizeBytes = 10
+	preflightCalls := 0
+	svc.hooks.PreflightUpload = func(_ context.Context, upload Upload) error {
+		preflightCalls++
+		if upload.SizeBytes != 10 || upload.LocalPath != "" {
+			t.Fatalf("preflight upload = %#v, want declared size and no local path", upload)
+		}
+		return nil
+	}
 	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
 		t.Fatal("enqueue hook should not be called")
 		return "", nil
 	}
 
-	_, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 0))
+	_, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 10))
 
 	if !errors.Is(err, errUploadTooLarge) {
 		t.Fatalf("err = %v, want %v", err, errUploadTooLarge)
+	}
+	if preflightCalls != 1 {
+		t.Fatalf("preflight calls = %d, want 1", preflightCalls)
+	}
+	if bot.fileCallCount != 1 {
+		t.Fatalf("getFile calls = %d, want 1 for post-download size recheck", bot.fileCallCount)
 	}
 }
 
@@ -2858,6 +2931,9 @@ func newTestServiceWithJournal(t *testing.T, bot *fakeBotAPI, journal UpdateJour
 		APIBaseURL:    "http://127.0.0.1:8081",
 		AllowedChatID: testChatID,
 	}, Hooks{
+		PreflightUpload: func(ctx context.Context, _ Upload) error {
+			return ctx.Err()
+		},
 		Skip: func(context.Context) (string, error) {
 			return "skipped", nil
 		},

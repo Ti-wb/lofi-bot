@@ -39,14 +39,44 @@ type atomicCopyOps struct {
 	removeFile    func(string) error
 }
 
+func (s *Service) preflightUpload(ctx context.Context, fileName string, declaredSize int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if declaredSize <= 0 {
+		return publicError("無法確認檔案大小，請重新上傳。")
+	}
+	if s.libraryMode() {
+		return s.preflightLibraryUpload(ctx, fileName, declaredSize)
+	}
+
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	length, err := s.store.QueueLength(ctx)
+	if err != nil {
+		return err
+	}
+	if length >= s.cfg.MaxQueueLength {
+		return publicError(fmt.Sprintf("佇列已滿，目前上限是 %d 支", s.cfg.MaxQueueLength))
+	}
+	return s.ensureStorageHeadroom(s.cfg.TelegramBotAPIDir, declaredSize)
+}
+
 func (s *Service) ensureStorageHeadroom(path string, incomingBytes int64) error {
 	if incomingBytes < 0 {
 		return errors.New("incoming media size is invalid")
 	}
+	return s.ensureStorageHeadroomBytes(path, uint64(incomingBytes))
+}
+
+func (s *Service) ensureStorageHeadroomBytes(path string, incomingBytes uint64) error {
 	if s.cfg.MinFreeDiskBytes < 0 {
 		return errors.New("minimum free disk reserve is invalid")
 	}
-	required, err := requiredAvailableBytes(uint64(incomingBytes), uint64(s.cfg.MinFreeDiskBytes))
+	required, err := requiredAvailableBytes(incomingBytes, uint64(s.cfg.MinFreeDiskBytes))
 	if err != nil {
 		return err
 	}
@@ -62,6 +92,18 @@ func (s *Service) ensureStorageHeadroom(path string, incomingBytes int64) error 
 		return publicError("磁碟可用空間不足，請先清理空間再重試。")
 	}
 	return nil
+}
+
+func pathsShareFilesystem(left, right string) (bool, error) {
+	var leftStat syscall.Stat_t
+	if err := syscall.Stat(left, &leftStat); err != nil {
+		return false, fmt.Errorf("inspect media filesystem: %w", err)
+	}
+	var rightStat syscall.Stat_t
+	if err := syscall.Stat(right, &rightStat); err != nil {
+		return false, fmt.Errorf("inspect media filesystem: %w", err)
+	}
+	return leftStat.Dev == rightStat.Dev, nil
 }
 
 func requiredAvailableBytes(incomingBytes, reserveBytes uint64) (uint64, error) {

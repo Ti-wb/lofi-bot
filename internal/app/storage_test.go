@@ -17,7 +17,125 @@ import (
 	"github.com/tiwb/tg-obs-bot/internal/config"
 	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/media"
+	"github.com/tiwb/tg-obs-bot/internal/telegram"
 )
+
+func TestUploadPreflightRejectsUnknownDeclaredSize(t *testing.T) {
+	svc, _, _ := newLocalUploadTestService(t, config.Config{})
+	svc.diskUsage = func(string) (media.DiskUsage, error) {
+		t.Fatal("unknown size should fail before disk admission")
+		return media.DiskUsage{}, nil
+	}
+	preflight := svc.telegramHooks().PreflightUpload
+
+	for _, size := range []int64{0, -1} {
+		err := preflight(context.Background(), telegram.Upload{
+			FileName:  "video.mp4",
+			SizeBytes: size,
+		})
+		if err == nil || !strings.Contains(err.Error(), "無法確認檔案大小") {
+			t.Fatalf("declared size %d error = %v, want fail-closed rejection", size, err)
+		}
+	}
+}
+
+func TestQueueUploadPreflightRejectsFullQueueBeforeDiskAdmission(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newLocalUploadTestService(t, config.Config{MaxQueueLength: 1})
+	addReadyVideo(t, ctx, svc, "already-queued.mp4")
+	svc.diskUsage = func(string) (media.DiskUsage, error) {
+		t.Fatal("full queue should fail before disk admission")
+		return media.DiskUsage{}, nil
+	}
+
+	err := svc.telegramHooks().PreflightUpload(ctx, telegram.Upload{
+		FileName:  "next.mp4",
+		SizeBytes: 5,
+	})
+	if err == nil || !strings.Contains(err.Error(), "佇列已滿") {
+		t.Fatalf("preflight error = %v, want queue-full rejection", err)
+	}
+}
+
+func TestQueueUploadPreflightUsesConfiguredBotAPIDir(t *testing.T) {
+	svc, _, _ := newLocalUploadTestService(t, config.Config{
+		MinFreeDiskBytes: 100,
+	})
+	var probedPath string
+	available := uint64(104)
+	svc.diskUsage = func(path string) (media.DiskUsage, error) {
+		probedPath = path
+		return media.DiskUsage{AvailableBytes: available}, nil
+	}
+
+	preflight := svc.telegramHooks().PreflightUpload
+	upload := telegram.Upload{
+		FileName:  "next.mp4",
+		SizeBytes: 5,
+	}
+	err := preflight(context.Background(), upload)
+	if err == nil || !strings.Contains(err.Error(), "磁碟可用空間不足") {
+		t.Fatalf("preflight error = %v, want declared-size headroom rejection", err)
+	}
+	if filepath.Clean(probedPath) != filepath.Clean(svc.cfg.TelegramBotAPIDir) {
+		t.Fatalf("disk probe path = %q, want configured Bot API directory %q", probedPath, svc.cfg.TelegramBotAPIDir)
+	}
+	available = 105
+	if err := preflight(context.Background(), upload); err != nil {
+		t.Fatalf("admissible queue metadata rejected: %v", err)
+	}
+}
+
+func TestLibraryUploadPreflightRejectsInvalidNameAndExistingDestination(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newLibraryTestService(t)
+	svc.diskUsage = func(string) (media.DiskUsage, error) {
+		t.Fatal("invalid or duplicate name should fail before disk admission")
+		return media.DiskUsage{}, nil
+	}
+	preflight := svc.telegramHooks().PreflightUpload
+
+	err := preflight(ctx, telegram.Upload{FileName: "clip.mp4", SizeBytes: 5})
+	if err == nil || !strings.Contains(err.Error(), "檔名不符合素材規則") {
+		t.Fatalf("invalid-name error = %v, want library filename rejection", err)
+	}
+
+	const existing = "loop_morning_cafe_existing.mp4"
+	writeLibraryFile(t, svc.cfg.LoopMediaDir, existing)
+	err = preflight(ctx, telegram.Upload{FileName: existing, SizeBytes: 5})
+	if err == nil || !strings.Contains(err.Error(), "媒體庫已有同名素材") {
+		t.Fatalf("existing-destination error = %v, want duplicate rejection", err)
+	}
+}
+
+func TestLibraryUploadPreflightCombinesCacheAndCopyHeadroomOnSharedFilesystem(t *testing.T) {
+	svc, _ := newLibraryTestService(t)
+	svc.cfg.MinFreeDiskBytes = 100
+	var probedPaths []string
+	available := uint64(109)
+	svc.diskUsage = func(path string) (media.DiskUsage, error) {
+		probedPaths = append(probedPaths, filepath.Clean(path))
+		return media.DiskUsage{AvailableBytes: available}, nil
+	}
+
+	preflight := svc.telegramHooks().PreflightUpload
+	upload := telegram.Upload{
+		FileName:  "loop_morning_cafe_new.mp4",
+		SizeBytes: 5,
+	}
+	err := preflight(context.Background(), upload)
+	if err == nil || !strings.Contains(err.Error(), "磁碟可用空間不足") {
+		t.Fatalf("preflight error = %v, want combined cache-and-copy headroom rejection", err)
+	}
+	wantPaths := []string{filepath.Clean(svc.cfg.LoopMediaDir)}
+	if fmt.Sprint(probedPaths) != fmt.Sprint(wantPaths) {
+		t.Fatalf("disk probe paths = %q, want one shared-filesystem probe %q", probedPaths, wantPaths)
+	}
+	available = 110
+	if err := preflight(context.Background(), upload); err != nil {
+		t.Fatalf("admissible library metadata rejected: %v", err)
+	}
+}
 
 func TestQueueAdmissionUsesActualSizeAndSourceFilesystem(t *testing.T) {
 	ctx := context.Background()

@@ -83,21 +83,22 @@ type adminCacheEntry struct {
 }
 
 type Hooks struct {
-	EnqueueUpload EnqueueUploadFunc
-	Library       SimpleFunc
-	Scan          SimpleFunc
-	Preview       SimpleFunc
-	SetTheme      TextFunc
-	SelectLoop    TextFunc
-	SkipLoop      SimpleFunc
-	SkipMusic     SimpleFunc
-	ListQueue     SimpleFunc
-	Move          MoveFunc
-	Remove        IDFunc
-	Skip          SimpleFunc
-	Now           SimpleFunc
-	History       SimpleFunc
-	Status        SimpleFunc
+	PreflightUpload func(context.Context, Upload) error
+	EnqueueUpload   EnqueueUploadFunc
+	Library         SimpleFunc
+	Scan            SimpleFunc
+	Preview         SimpleFunc
+	SetTheme        TextFunc
+	SelectLoop      TextFunc
+	SkipLoop        SimpleFunc
+	SkipMusic       SimpleFunc
+	ListQueue       SimpleFunc
+	Move            MoveFunc
+	Remove          IDFunc
+	Skip            SimpleFunc
+	Now             SimpleFunc
+	History         SimpleFunc
+	Status          SimpleFunc
 }
 
 type EnqueueUploadFunc func(context.Context, Upload) (string, error)
@@ -872,6 +873,12 @@ func (s *Service) handleUpload(ctx context.Context, msg *tgbotapi.Message) (botR
 	}
 	if s.cfg.MaxUploadSizeBytes > 0 && upload.SizeBytes > s.cfg.MaxUploadSizeBytes {
 		return botResponse{}, fmt.Errorf("%w: %s is larger than the limit of %s", errUploadTooLarge, formatBytes(upload.SizeBytes), formatBytes(s.cfg.MaxUploadSizeBytes))
+	}
+	if s.hooks.PreflightUpload == nil {
+		return botResponse{}, errHookNotConfigured("preflight upload")
+	}
+	if err := s.hooks.PreflightUpload(ctx, upload); err != nil {
+		return botResponse{}, err
 	}
 
 	file, err := s.getFile(ctx, tgbotapi.FileConfig{FileID: upload.FileID})

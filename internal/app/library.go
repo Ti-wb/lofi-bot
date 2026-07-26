@@ -17,6 +17,13 @@ import (
 
 const librarySchedulerInterval = 15 * time.Second
 
+type libraryUploadPlan struct {
+	fileName string
+	kind     medialib.Kind
+	destDir  string
+	label    string
+}
+
 func (s *Service) libraryMode() bool {
 	return s.cfg.PlayerMode == "library"
 }
@@ -480,46 +487,84 @@ func (s *Service) ImportLibraryUpload(ctx context.Context, req UploadRequest) (s
 		s.setLastErr(err)
 		return "", err
 	}
-	fileName := CleanFileName(req.FileName)
-	if fileName == "" {
-		err := publicError("檔名不可為空，請使用新版素材命名規則。")
+	plan, err := s.planLibraryUpload(req.FileName)
+	if err != nil {
 		s.setLastErr(err)
 		return "", err
 	}
 
-	var (
-		kind    medialib.Kind
-		destDir string
-		label   string
-	)
-	if parsed, err := medialib.ParseLoopFilename(fileName); err == nil {
-		kind = medialib.KindLoop
-		destDir = s.cfg.LoopMediaDir
-		label = fmt.Sprintf("loop %s/%s", parsed.Period, parsed.Theme)
-	} else if parsed, musicErr := medialib.ParseMusicFilename(fileName); musicErr == nil {
-		kind = medialib.KindMusic
-		destDir = s.cfg.MusicMediaDir
-		label = fmt.Sprintf("music %s", parsed.Track)
-	} else {
-		err := publicError("檔名不符合素材規則。loop 請用 loop_<period>_<theme>_<variant>，音樂請用 music_<track>。")
+	if err := os.MkdirAll(plan.destDir, 0o755); err != nil {
 		s.setLastErr(err)
 		return "", err
 	}
-
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		s.setLastErr(err)
-		return "", err
-	}
-	destPath := filepath.Join(destDir, fileName)
-	if err := s.storeLibraryUpload(ctx, kind, destPath, req.LocalPath); err != nil {
+	destPath := filepath.Join(plan.destDir, plan.fileName)
+	if err := s.storeLibraryUpload(ctx, plan.kind, destPath, req.LocalPath); err != nil {
 		s.setLastErr(err)
 		return "", err
 	}
 
 	if err := s.ScanLibrary(ctx); err != nil {
-		return fmt.Sprintf("已匯入素材：%s（掃描時發現問題：%v）", label, err), nil
+		return fmt.Sprintf("已匯入素材：%s（掃描時發現問題：%v）", plan.label, err), nil
 	}
-	return fmt.Sprintf("已匯入素材：%s", label), nil
+	return fmt.Sprintf("已匯入素材：%s", plan.label), nil
+}
+
+func (s *Service) planLibraryUpload(rawFileName string) (libraryUploadPlan, error) {
+	fileName := CleanFileName(rawFileName)
+	if fileName == "" {
+		return libraryUploadPlan{}, publicError("檔名不可為空，請使用新版素材命名規則。")
+	}
+	if parsed, err := medialib.ParseLoopFilename(fileName); err == nil {
+		return libraryUploadPlan{
+			fileName: fileName,
+			kind:     medialib.KindLoop,
+			destDir:  s.cfg.LoopMediaDir,
+			label:    fmt.Sprintf("loop %s/%s", parsed.Period, parsed.Theme),
+		}, nil
+	}
+	if parsed, err := medialib.ParseMusicFilename(fileName); err == nil {
+		return libraryUploadPlan{
+			fileName: fileName,
+			kind:     medialib.KindMusic,
+			destDir:  s.cfg.MusicMediaDir,
+			label:    fmt.Sprintf("music %s", parsed.Track),
+		}, nil
+	}
+	return libraryUploadPlan{}, publicError("檔名不符合素材規則。loop 請用 loop_<period>_<theme>_<variant>，音樂請用 music_<track>。")
+}
+
+func (s *Service) preflightLibraryUpload(ctx context.Context, fileName string, declaredSize int64) error {
+	plan, err := s.planLibraryUpload(fileName)
+	if err != nil {
+		return err
+	}
+
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	destPath := filepath.Join(plan.destDir, plan.fileName)
+	if _, err := os.Stat(destPath); err == nil {
+		return publicError("媒體庫已有同名素材，請換一個 variant 或 track 名稱。")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	sharedFilesystem, err := pathsShareFilesystem(s.cfg.TelegramBotAPIDir, plan.destDir)
+	if err != nil {
+		return err
+	}
+	if sharedFilesystem {
+		combinedIncoming, err := requiredAvailableBytes(uint64(declaredSize), uint64(declaredSize))
+		if err != nil {
+			return err
+		}
+		return s.ensureStorageHeadroomBytes(plan.destDir, combinedIncoming)
+	}
+	if err := s.ensureStorageHeadroom(s.cfg.TelegramBotAPIDir, declaredSize); err != nil {
+		return err
+	}
+	return s.ensureStorageHeadroom(plan.destDir, declaredSize)
 }
 
 func (s *Service) storeLibraryUpload(ctx context.Context, kind medialib.Kind, destPath, sourcePath string) error {
