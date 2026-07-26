@@ -1243,7 +1243,7 @@ func TestRunAdvancesUpdateOffset(t *testing.T) {
 	}
 }
 
-func TestRunUpdateTimeoutPreservesSynchronousOrderAndNextOffsets(t *testing.T) {
+func TestRunCooperativeUpdateTimeoutPreservesOrderAndNextOffsets(t *testing.T) {
 	bot := &fakeBotAPI{
 		updateResponses: []updateResponse{
 			{updates: []tgbotapi.Update{
@@ -1258,9 +1258,25 @@ func TestRunUpdateTimeoutPreservesSynchronousOrderAndNextOffsets(t *testing.T) {
 	svc := newTestService(t, bot)
 	cacheOnlyAdmins(svc)
 	svc.updateProcessingTimeout = 20 * time.Millisecond
+	svc.updateHandlerStopGrace = 500 * time.Millisecond
 	events := make(chan string, 3)
 	releaseFirstHook := make(chan struct{})
+	var activeHandlers atomic.Int32
+	var maxActiveHandlers atomic.Int32
+	recordActive := func() func() {
+		active := activeHandlers.Add(1)
+		for {
+			maxActive := maxActiveHandlers.Load()
+			if active <= maxActive || maxActiveHandlers.CompareAndSwap(maxActive, active) {
+				break
+			}
+		}
+		return func() {
+			activeHandlers.Add(-1)
+		}
+	}
 	svc.hooks.ListQueue = func(ctx context.Context) (string, error) {
+		defer recordActive()()
 		events <- "first-start"
 		<-ctx.Done()
 		events <- "first-deadline"
@@ -1268,6 +1284,7 @@ func TestRunUpdateTimeoutPreservesSynchronousOrderAndNextOffsets(t *testing.T) {
 		return "", ctx.Err()
 	}
 	svc.hooks.Now = func(context.Context) (string, error) {
+		defer recordActive()()
 		events <- "second"
 		return "now", nil
 	}
@@ -1338,6 +1355,146 @@ func TestRunUpdateTimeoutPreservesSynchronousOrderAndNextOffsets(t *testing.T) {
 		if got := bot.updateConfigs[i].Limit; got != 1 {
 			t.Fatalf("poll %d limit = %d, want 1", i+1, got)
 		}
+	}
+	if got := maxActiveHandlers.Load(); got != 1 {
+		t.Fatalf("maximum active handlers = %d, want 1", got)
+	}
+}
+
+func TestRunStuckUpdateHandlerReturnsSentinelWithoutNextPoll(t *testing.T) {
+	bot := &fakeBotAPI{
+		updateResponses: []updateResponse{
+			{updates: []tgbotapi.Update{
+				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			}},
+			{updates: []tgbotapi.Update{
+				{UpdateID: 11, Message: commandMessage(42, "/now")},
+			}},
+		},
+		updateCalls: make(chan struct{}, 2),
+	}
+	svc := newTestService(t, bot)
+	cacheOnlyAdmins(svc)
+	svc.updateProcessingTimeout = 20 * time.Millisecond
+	svc.updateHandlerStopGrace = 20 * time.Millisecond
+
+	handlerStarted := make(chan struct{})
+	handlerDone := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	svc.hooks.ListQueue = func(context.Context) (string, error) {
+		close(handlerStarted)
+		defer close(handlerDone)
+		<-releaseHandler
+		return "", nil
+	}
+	svc.hooks.Now = func(context.Context) (string, error) {
+		t.Error("second update handler must not run after a stuck handler")
+		return "", nil
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(context.Background())
+	}()
+
+	select {
+	case <-handlerStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("stuck handler did not start")
+	}
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrUpdateHandlerStuck) {
+			t.Fatalf("err = %v, want %v", err, ErrUpdateHandlerStuck)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v, want deadline cause", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not return after update deadline and stop grace")
+	}
+
+	if got := len(bot.updateConfigs); got != 1 {
+		t.Fatalf("GetUpdates calls = %d, want exactly 1", got)
+	}
+	if got := bot.updateConfigs[0].Offset; got != 0 {
+		t.Fatalf("first poll offset = %d, want 0", got)
+	}
+	select {
+	case <-bot.updateCalls:
+	default:
+		t.Fatal("first GetUpdates call was not observed")
+	}
+	select {
+	case <-bot.updateCalls:
+		t.Fatal("next GetUpdates started after a stuck handler")
+	default:
+	}
+
+	close(releaseHandler)
+	select {
+	case <-handlerDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("stuck test handler did not drain after release")
+	}
+}
+
+func TestRunParentCancellationWaitsOnlyForHandlerStopGrace(t *testing.T) {
+	bot := &fakeBotAPI{
+		updateResponses: []updateResponse{
+			{updates: []tgbotapi.Update{
+				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			}},
+		},
+		updateCalls: make(chan struct{}, 1),
+	}
+	svc := newTestService(t, bot)
+	cacheOnlyAdmins(svc)
+	svc.updateProcessingTimeout = time.Hour
+	svc.updateHandlerStopGrace = 20 * time.Millisecond
+
+	handlerStarted := make(chan struct{})
+	handlerDone := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	svc.hooks.ListQueue = func(context.Context) (string, error) {
+		close(handlerStarted)
+		defer close(handlerDone)
+		<-releaseHandler
+		return "", nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+	select {
+	case <-handlerStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("handler did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want parent cancellation", err)
+		}
+		if !errors.Is(err, ErrUpdateHandlerStuck) {
+			t.Fatalf("err = %v, want %v", err, ErrUpdateHandlerStuck)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not bound parent-cancel handler drain")
+	}
+	if got := len(bot.updateConfigs); got != 1 {
+		t.Fatalf("GetUpdates calls = %d, want exactly 1", got)
+	}
+
+	close(releaseHandler)
+	select {
+	case <-handlerDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("test handler did not drain after release")
 	}
 }
 

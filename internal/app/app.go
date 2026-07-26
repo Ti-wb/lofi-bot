@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,9 @@ type Service struct {
 	mediaProgressByInput  map[string]mediaProgress
 	obsRecoveryInProgress atomic.Bool
 	shutdown              []func() error
+	workerStopGrace       time.Duration
+	maintenanceInterval   time.Duration
+	maintenanceFn         func(context.Context) error
 }
 
 type obsController interface {
@@ -95,6 +99,13 @@ const (
 	mediaProgressGrace       = 2 * time.Minute
 	mediaProgressHardGrace   = 2 * mediaProgressGrace
 	mediaCursorEpsilonMillis = 1.0
+	defaultWorkerStopGrace   = 5 * time.Second
+	defaultMaintenancePeriod = 10 * time.Minute
+)
+
+var (
+	ErrRequiredWorkerStopped = errors.New("required service worker stopped unexpectedly")
+	ErrWorkerShutdownStuck   = errors.New("service workers did not stop after cancellation")
 )
 
 type mediaProgress struct {
@@ -182,18 +193,20 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 	}
 
 	service := &Service{
-		cfg:        cfg,
-		logger:     logger,
-		store:      store,
-		libDB:      libDB,
-		media:      manager,
-		obs:        obsClient,
-		now:        time.Now,
-		rng:        rand.New(rand.NewSource(time.Now().UnixNano())),
-		removeFile: media.RemoveFile,
-		diskUsage:  media.DiskUsageForPath,
-		playback:   playbackIdle,
-		shutdown:   []func() error{obsClient.Close, store.Close},
+		cfg:                 cfg,
+		logger:              logger,
+		store:               store,
+		libDB:               libDB,
+		media:               manager,
+		obs:                 obsClient,
+		now:                 time.Now,
+		rng:                 rand.New(rand.NewSource(time.Now().UnixNano())),
+		removeFile:          media.RemoveFile,
+		diskUsage:           media.DiskUsageForPath,
+		playback:            playbackIdle,
+		workerStopGrace:     defaultWorkerStopGrace,
+		maintenanceInterval: defaultMaintenancePeriod,
+		shutdown:            []func() error{obsClient.Close, store.Close},
 	}
 	if libDB != nil {
 		service.shutdown = append(service.shutdown, libDB.Close)
@@ -222,65 +235,171 @@ func (s *Service) Close() {
 	}
 }
 
-func (s *Service) Run(ctx context.Context) error {
+func (s *Service) Run(parentCtx context.Context) error {
 	s.logger.Info("tg-obs-bot starting", "database", s.redactString(s.cfg.DatabasePath), "media_dir", s.redactString(s.cfg.MediaDir), "player_mode", s.cfg.PlayerMode)
-	ctx, cancel := context.WithCancel(ctx)
-	var wg sync.WaitGroup
-	defer func() {
-		cancel()
-		wg.Wait()
-	}()
+	runCtx, cancel := context.WithCancel(parentCtx)
 
-	if err := s.recoverStartupState(ctx); err != nil {
+	if err := s.recoverStartupState(runCtx); err != nil {
+		cancel()
 		return err
 	}
 
-	errCh := make(chan error, 1)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		err := s.bot.Run(ctx)
-		select {
-		case errCh <- err:
-		case <-ctx.Done():
-		}
-	}()
-	startLoop := func(loop func(context.Context)) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			loop(ctx)
-		}()
-	}
-	startLoop(s.obsReconnectLoop)
-	startLoop(s.obsEventLoop)
 	if s.libraryMode() {
-		if err := s.ScanLibrary(ctx); err != nil {
+		if err := s.ScanLibrary(runCtx); err != nil {
 			s.logger.Warn("initial media library scan found issues", "error", s.redactError(err))
 		}
-		startLoop(s.librarySchedulerLoop)
-	} else {
-		startLoop(s.playbackWatchdogLoop)
 	}
 
-	cleanupTicker := time.NewTicker(10 * time.Minute)
-	defer cleanupTicker.Stop()
+	workers := []serviceWorker{
+		{name: "telegram", run: s.bot.Run},
+		{name: "obs-reconnect", run: s.obsReconnectLoop},
+		{name: "obs-events", run: s.obsEventLoop},
+		{name: "maintenance", run: s.maintenanceLoop},
+	}
+	if s.libraryMode() {
+		workers = append(workers, serviceWorker{name: "library-scheduler", run: s.librarySchedulerLoop})
+	} else {
+		workers = append(workers, serviceWorker{name: "playback-watchdog", run: s.playbackWatchdogLoop})
+	}
+
+	workerResults := make(chan serviceWorkerResult, len(workers))
+	pendingWorkers := make(map[string]struct{}, len(workers))
+	for _, worker := range workers {
+		pendingWorkers[worker.name] = struct{}{}
+		go func(worker serviceWorker) {
+			workerResults <- serviceWorkerResult{name: worker.name, err: worker.run(runCtx)}
+		}(worker)
+	}
+
+	var runErr error
+run:
+	for {
+		select {
+		case <-parentCtx.Done():
+			runErr = parentCtx.Err()
+			break run
+		case result := <-workerResults:
+			delete(pendingWorkers, result.name)
+			if err := parentCtx.Err(); err != nil {
+				runErr = err
+				if !onlyContextTermination(result.err) {
+					runErr = errors.Join(runErr, requiredWorkerError(result))
+				}
+			} else {
+				runErr = requiredWorkerError(result)
+			}
+			break run
+		}
+	}
+
+	cancel()
+	return errors.Join(runErr, s.waitForWorkers(workerResults, pendingWorkers))
+}
+
+type serviceWorker struct {
+	name string
+	run  func(context.Context) error
+}
+
+type serviceWorkerResult struct {
+	name string
+	err  error
+}
+
+func requiredWorkerError(result serviceWorkerResult) error {
+	stopped := fmt.Errorf("%w: %s", ErrRequiredWorkerStopped, result.name)
+	if result.err == nil {
+		return stopped
+	}
+	return errors.Join(stopped, fmt.Errorf("%s worker: %w", result.name, result.err))
+}
+
+func (s *Service) waitForWorkers(results <-chan serviceWorkerResult, pending map[string]struct{}) error {
+	if len(pending) == 0 {
+		return nil
+	}
+	grace := s.workerStopGrace
+	if grace <= 0 {
+		grace = defaultWorkerStopGrace
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+
+	var drainErr error
+	for len(pending) > 0 {
+		select {
+		case result := <-results:
+			delete(pending, result.name)
+			if !onlyContextTermination(result.err) {
+				drainErr = errors.Join(drainErr, requiredWorkerError(result))
+			}
+		case <-timer.C:
+			names := make([]string, 0, len(pending))
+			for name := range pending {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			return errors.Join(
+				drainErr,
+				fmt.Errorf(
+					"%w: grace=%s pending=%s",
+					ErrWorkerShutdownStuck,
+					grace,
+					strings.Join(names, ","),
+				),
+			)
+		}
+	}
+	return drainErr
+}
+
+func onlyContextTermination(err error) bool {
+	if err == nil {
+		return true
+	}
+	if err == context.Canceled || err == context.DeadlineExceeded {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		causes := joined.Unwrap()
+		if len(causes) == 0 {
+			return false
+		}
+		for _, cause := range causes {
+			if !onlyContextTermination(cause) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		cause := wrapped.Unwrap()
+		return cause != nil && onlyContextTermination(cause)
+	}
+	return false
+}
+
+func (s *Service) maintenanceLoop(ctx context.Context) error {
+	interval := s.maintenanceInterval
+	if interval <= 0 {
+		interval = defaultMaintenancePeriod
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case err := <-errCh:
-			if ctx.Err() != nil {
-				return ctx.Err()
+		case <-ticker.C:
+			maintenance := s.maintenanceFn
+			if maintenance == nil {
+				maintenance = s.performMaintenance
 			}
-			if err == nil {
-				return errors.New("telegram service stopped unexpectedly")
-			}
-			cancel()
-			return err
-		case <-cleanupTicker.C:
-			if err := s.performMaintenance(ctx); err != nil {
+			if err := maintenance(ctx); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
 				s.setLastErr(err)
 				s.logger.Warn("periodic maintenance failed", "error", s.redactError(err))
 			}
@@ -1089,7 +1208,7 @@ func (s *Service) telegramHooks() telegram.Hooks {
 	}
 }
 
-func (s *Service) obsReconnectLoop(ctx context.Context) {
+func (s *Service) obsReconnectLoop(ctx context.Context) error {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -1097,7 +1216,7 @@ func (s *Service) obsReconnectLoop(ctx context.Context) {
 
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-ticker.C:
 		}
 	}
@@ -1161,13 +1280,13 @@ func (s *Service) maintainOBSConnection(ctx context.Context) {
 	}
 }
 
-func (s *Service) playbackWatchdogLoop(ctx context.Context) {
+func (s *Service) playbackWatchdogLoop(ctx context.Context) error {
 	ticker := time.NewTicker(playbackWatchdogInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-ticker.C:
 			if err := s.checkPlaybackWatchdog(ctx); err != nil {
 				s.setLastErr(err)
@@ -1233,14 +1352,18 @@ func (s *Service) checkPlaybackWatchdog(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) obsEventLoop(ctx context.Context) {
+func (s *Service) obsEventLoop(ctx context.Context) error {
+	events := s.obs.Events()
 	for {
 		select {
 		case <-ctx.Done():
-			return
-		case event, ok := <-s.obs.Events():
+			return ctx.Err()
+		case event, ok := <-events:
 			if !ok {
-				return
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return errors.New("OBS event stream closed")
 			}
 			if event.Type != obs.EventMediaEnded {
 				continue

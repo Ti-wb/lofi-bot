@@ -49,13 +49,13 @@ func (s *Service) scanLibraryLocked(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) librarySchedulerLoop(ctx context.Context) {
+func (s *Service) librarySchedulerLoop(ctx context.Context) error {
 	ticker := time.NewTicker(librarySchedulerInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-ticker.C:
 			if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
 				continue

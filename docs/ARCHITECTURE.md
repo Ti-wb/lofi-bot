@@ -77,6 +77,8 @@ On restart:
 
 ## Failure Handling
 
+- Telegram updates are handled one at a time. Each handler receives a five-minute processing deadline and then a bounded five-second cancellation grace. A cooperative timeout is logged and reaches a terminal outcome before polling continues; a handler that ignores cancellation makes the process fail fast so the external supervisor can replace the complete process generation. The next Telegram polling offset is not advanced for that stuck update.
+- Telegram polling, OBS reconnect, OBS events, periodic maintenance, and the active library scheduler or queue watchdog are mandatory workers. An unexpected worker return is fatal. Maintenance runs outside the coordinator so a stuck cleanup cannot hide another worker's failure. After any fatal result or process cancellation, sibling workers receive cancellation and have five seconds to drain; failure to drain is reported as an internal stall instead of blocking shutdown indefinitely.
 - OBS connection loss does not delete queue state.
 - OBS heartbeat and input reconciliation preserve matching healthy playback, replay an unhealthy persisted current item, and leave queue advancement to authoritative post-reconnect playback reconciliation.
 - OBS playback failure leaves the next `ready` item in the queue instead of marking it played.

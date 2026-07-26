@@ -20,6 +20,7 @@ import (
 	"github.com/tiwb/tg-obs-bot/internal/media"
 	"github.com/tiwb/tg-obs-bot/internal/obs"
 	"github.com/tiwb/tg-obs-bot/internal/queue"
+	"github.com/tiwb/tg-obs-bot/internal/telegram"
 )
 
 func TestLibraryPreviewMaterializesNextPeriodPlan(t *testing.T) {
@@ -3028,8 +3029,236 @@ func TestRunReturnsWhenBotStopsUnexpectedly(t *testing.T) {
 
 	err := svc.Run(ctx)
 
-	if err == nil || !strings.Contains(err.Error(), "telegram service stopped unexpectedly") {
-		t.Fatalf("err = %v, want unexpected telegram stop", err)
+	if !errors.Is(err, ErrRequiredWorkerStopped) || !strings.Contains(err.Error(), "telegram") {
+		t.Fatalf("err = %v, want unexpected telegram worker stop", err)
+	}
+	if errors.Is(err, ErrWorkerShutdownStuck) {
+		t.Fatalf("cooperative sibling shutdown reported stuck: %v", err)
+	}
+}
+
+func TestRunReturnsWhenOBSEventStreamCloses(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, fakeBot := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	events := make(chan obs.Event)
+	close(events)
+	fakeOBS.events = events
+	fakeBot.run = func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	err := svc.Run(ctx)
+
+	if !errors.Is(err, ErrRequiredWorkerStopped) {
+		t.Fatalf("err = %v, want %v", err, ErrRequiredWorkerStopped)
+	}
+	for _, want := range []string{"obs-events", "OBS event stream closed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %v, want %q", err, want)
+		}
+	}
+	if errors.Is(err, ErrWorkerShutdownStuck) {
+		t.Fatalf("cooperative sibling shutdown reported stuck: %v", err)
+	}
+}
+
+func TestRunBoundsWorkerDrainAfterFatalResult(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, fakeBot := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	svc.workerStopGrace = 20 * time.Millisecond
+	events := make(chan obs.Event)
+	close(events)
+	fakeOBS.events = events
+
+	botStarted := make(chan struct{})
+	botDone := make(chan struct{})
+	releaseBot := make(chan struct{})
+	fakeBot.run = func(context.Context) error {
+		close(botStarted)
+		defer close(botDone)
+		<-releaseBot
+		return nil
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+	select {
+	case <-botStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("telegram worker did not start")
+	}
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrRequiredWorkerStopped) {
+			t.Fatalf("err = %v, want required worker failure", err)
+		}
+		if !errors.Is(err, ErrWorkerShutdownStuck) {
+			t.Fatalf("err = %v, want bounded worker shutdown failure", err)
+		}
+		if !strings.Contains(err.Error(), "telegram") {
+			t.Fatalf("err = %v, want pending telegram worker", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run remained blocked on a worker that ignored cancellation")
+	}
+
+	close(releaseBot)
+	select {
+	case <-botDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("test telegram worker did not drain after release")
+	}
+}
+
+func TestRunReportsBlockedMaintenanceDuringFatalShutdown(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, fakeBot := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	svc.workerStopGrace = 50 * time.Millisecond
+	svc.maintenanceInterval = time.Millisecond
+
+	events := make(chan obs.Event)
+	fakeOBS.events = events
+	fakeBot.run = func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	maintenanceStarted := make(chan struct{})
+	releaseMaintenance := make(chan struct{})
+	maintenanceDone := make(chan struct{})
+	firstMaintenance := true
+	svc.maintenanceFn = func(ctx context.Context) error {
+		if !firstMaintenance {
+			return ctx.Err()
+		}
+		firstMaintenance = false
+		close(maintenanceStarted)
+		<-releaseMaintenance
+		close(maintenanceDone)
+		return nil
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+	select {
+	case <-maintenanceStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("maintenance worker did not start")
+	}
+
+	close(events)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrRequiredWorkerStopped) {
+			t.Fatalf("err = %v, want required worker failure", err)
+		}
+		if !errors.Is(err, ErrWorkerShutdownStuck) {
+			t.Fatalf("err = %v, want bounded worker shutdown failure", err)
+		}
+		if !strings.Contains(err.Error(), "maintenance") {
+			t.Fatalf("err = %v, want pending maintenance worker", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run remained blocked behind maintenance")
+	}
+
+	close(releaseMaintenance)
+	select {
+	case <-maintenanceDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("test maintenance worker did not drain after release")
+	}
+}
+
+func TestRunNormalCancellationDrainsWorkersWithoutFatalError(t *testing.T) {
+	svc, _, fakeBot := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	svc.workerStopGrace = 100 * time.Millisecond
+	botStarted := make(chan struct{})
+	fakeBot.run = func(ctx context.Context) error {
+		close(botStarted)
+		<-ctx.Done()
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+	select {
+	case <-botStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("telegram worker did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want normal cancellation", err)
+		}
+		if errors.Is(err, ErrRequiredWorkerStopped) || errors.Is(err, ErrWorkerShutdownStuck) {
+			t.Fatalf("normal cancellation was classified fatal: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not drain cooperative workers after cancellation")
+	}
+}
+
+func TestRunParentCancellationPropagatesLateTelegramStuckSentinel(t *testing.T) {
+	svc, _, fakeBot := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	svc.workerStopGrace = 500 * time.Millisecond
+	botStarted := make(chan struct{})
+	botSawCancellation := make(chan struct{})
+	releaseBot := make(chan struct{})
+	fakeBot.run = func(ctx context.Context) error {
+		close(botStarted)
+		<-ctx.Done()
+		close(botSawCancellation)
+		<-releaseBot
+		return errors.Join(ctx.Err(), telegram.ErrUpdateHandlerStuck)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+	select {
+	case <-botStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("telegram worker did not start")
+	}
+	cancel()
+	select {
+	case <-botSawCancellation:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("telegram worker did not observe parent cancellation")
+	}
+	close(releaseBot)
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want parent cancellation", err)
+		}
+		if !errors.Is(err, telegram.ErrUpdateHandlerStuck) {
+			t.Fatalf("err = %v, want late Telegram stuck sentinel", err)
+		}
+		if !errors.Is(err, ErrRequiredWorkerStopped) {
+			t.Fatalf("err = %v, want required worker failure", err)
+		}
+		if errors.Is(err, ErrWorkerShutdownStuck) {
+			t.Fatalf("released Telegram worker was incorrectly reported pending: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not propagate late Telegram stuck sentinel")
 	}
 }
 
@@ -3425,6 +3654,7 @@ var (
 
 type fakeOBS struct {
 	state            obs.State
+	events           <-chan obs.Event
 	lastPlayed       string
 	lastSource       string
 	sourcePlayed     map[string]string
@@ -3457,7 +3687,7 @@ func (f *fakeOBS) Connect(context.Context) error {
 	return nil
 }
 func (f *fakeOBS) Close() error             { return nil }
-func (f *fakeOBS) Events() <-chan obs.Event { return nil }
+func (f *fakeOBS) Events() <-chan obs.Event { return f.events }
 func (f *fakeOBS) Probe(context.Context) error {
 	f.probeCalls++
 	return f.probeErr
@@ -3554,9 +3784,15 @@ func (f *fakeOBS) Status() obs.Status { return obs.Status{State: f.state} }
 
 type fakeBot struct {
 	messages []string
+	run      func(context.Context) error
 }
 
-func (f *fakeBot) Run(context.Context) error { return nil }
+func (f *fakeBot) Run(ctx context.Context) error {
+	if f.run != nil {
+		return f.run(ctx)
+	}
+	return nil
+}
 func (f *fakeBot) SendMessage(_ context.Context, _ int64, text string) error {
 	f.messages = append(f.messages, text)
 	return nil

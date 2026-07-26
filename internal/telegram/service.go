@@ -23,11 +23,14 @@ const (
 	defaultRequestTimeout          = time.Duration(defaultUpdateTimeout)*time.Second + 5*time.Second
 	defaultPollRetryDelay          = 3 * time.Second
 	defaultUpdateProcessingTimeout = 5 * time.Minute
+	defaultUpdateHandlerStopGrace  = 5 * time.Second
 	defaultAdminLookupTimeout      = 5 * time.Second
 	adminCacheTTL                  = 60 * time.Second
 )
 
 var queueItemPattern = regexp.MustCompile(`#([0-9]+).*第 ([0-9]+) 位`)
+
+var ErrUpdateHandlerStuck = errors.New("telegram update handler did not stop after cancellation")
 
 type Config struct {
 	Token              string
@@ -48,6 +51,7 @@ type Service struct {
 	now                     func() time.Time
 	pollRetryDelay          time.Duration
 	updateProcessingTimeout time.Duration
+	updateHandlerStopGrace  time.Duration
 	adminLookupTimeout      time.Duration
 	adminCacheMutex         sync.Mutex
 	adminCache              map[int64]adminCacheEntry
@@ -144,6 +148,7 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 		now:                     time.Now,
 		pollRetryDelay:          defaultPollRetryDelay,
 		updateProcessingTimeout: defaultUpdateProcessingTimeout,
+		updateHandlerStopGrace:  defaultUpdateHandlerStopGrace,
 		adminLookupTimeout:      defaultAdminLookupTimeout,
 		adminCache:              make(map[int64]adminCacheEntry),
 	}
@@ -255,19 +260,67 @@ func (s *Service) Run(ctx context.Context) error {
 			if update.UpdateID < updateConfig.Offset {
 				continue
 			}
-			updateConfig.Offset = update.UpdateID + 1
-			updateTimeout := s.updateProcessingTimeout
-			if updateTimeout <= 0 {
-				updateTimeout = defaultUpdateProcessingTimeout
+			timedOut, err := s.handleUpdateBounded(ctx, update)
+			if err != nil {
+				return err
 			}
-			updateCtx, cancel := context.WithTimeout(ctx, updateTimeout)
-			s.handleUpdate(updateCtx, update)
-			timedOut := errors.Is(updateCtx.Err(), context.DeadlineExceeded)
-			cancel()
 			if timedOut {
 				s.logger.Warn("telegram update processing timed out", "update_id", update.UpdateID)
 			}
+			// Telegram confirms an update only when the next GetUpdates request
+			// reaches it with an offset greater than this update ID. Advance the
+			// in-memory offset only after the handler has reached a terminal
+			// outcome; a stuck handler returns above without acknowledging it.
+			updateConfig.Offset = update.UpdateID + 1
 		}
+	}
+}
+
+func (s *Service) handleUpdateBounded(ctx context.Context, update tgbotapi.Update) (bool, error) {
+	updateTimeout := s.updateProcessingTimeout
+	if updateTimeout <= 0 {
+		updateTimeout = defaultUpdateProcessingTimeout
+	}
+	stopGrace := s.updateHandlerStopGrace
+	if stopGrace <= 0 {
+		stopGrace = defaultUpdateHandlerStopGrace
+	}
+
+	updateCtx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.handleUpdate(updateCtx, update)
+	}()
+
+	select {
+	case <-done:
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		return errors.Is(updateCtx.Err(), context.DeadlineExceeded), nil
+	case <-updateCtx.Done():
+	}
+
+	stopTimer := time.NewTimer(stopGrace)
+	defer stopTimer.Stop()
+	select {
+	case <-done:
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		return errors.Is(updateCtx.Err(), context.DeadlineExceeded), nil
+	case <-stopTimer.C:
+		cause := updateCtx.Err()
+		if cause == nil {
+			cause = context.Canceled
+		}
+		return false, errors.Join(
+			cause,
+			fmt.Errorf("%w: update_id=%d grace=%s", ErrUpdateHandlerStuck, update.UpdateID, stopGrace),
+		)
 	}
 }
 
