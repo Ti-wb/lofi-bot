@@ -13,6 +13,7 @@ import (
 	"github.com/tiwb/tg-obs-bot/internal/app"
 	"github.com/tiwb/tg-obs-bot/internal/asynclog"
 	"github.com/tiwb/tg-obs-bot/internal/config"
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/secret"
 	"github.com/tiwb/tg-obs-bot/internal/singleton"
 	"github.com/tiwb/tg-obs-bot/internal/telegram"
@@ -37,10 +38,17 @@ func main() {
 	}
 	logLevel.Set(cfg.LogLevel)
 
+	livenessSink, err := liveness.OpenSupervisorFD3FromEnv()
+	if err != nil {
+		logger.Error("initialize liveness", "error", secret.RedactError(err))
+		exitWithLogFlush(logHandler, genericInitializationFailure)
+		return
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	service, err := app.New(cfg, logger)
+	service, err := app.New(cfg, logger, app.WithLivenessSink(livenessSink))
 	if err != nil {
 		logger.Error("initialize service", "error", secret.RedactError(err, cfg.SensitiveValues()...))
 		exitWithLogFlush(logHandler, initializationExitCode(err))
@@ -101,9 +109,11 @@ func serviceExitCode(err error, parentErr error) int {
 	case err == nil:
 		return 0
 	case errors.Is(err, telegram.ErrUpdateHandlerStuck),
-		errors.Is(err, app.ErrWorkerShutdownStuck):
+		errors.Is(err, app.ErrWorkerShutdownStuck),
+		errors.Is(err, app.ErrInfrastructureShutdownStuck):
 		return internalStallExitCode
-	case errors.Is(err, app.ErrRequiredWorkerStopped):
+	case errors.Is(err, app.ErrRequiredWorkerStopped),
+		errors.Is(err, app.ErrRequiredInfrastructureStopped):
 		return 1
 	case parentErr != nil && errors.Is(err, parentErr):
 		return 0

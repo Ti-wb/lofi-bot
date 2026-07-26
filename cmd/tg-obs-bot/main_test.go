@@ -111,8 +111,18 @@ func TestServiceExitCode(t *testing.T) {
 			want: internalStallExitCode,
 		},
 		{
+			name: "stuck infrastructure shutdown",
+			err:  errors.Join(errors.New("reporter failed"), app.ErrInfrastructureShutdownStuck),
+			want: internalStallExitCode,
+		},
+		{
 			name: "worker canceled without parent cancellation",
 			err:  errors.Join(context.Canceled, app.ErrRequiredWorkerStopped),
+			want: 1,
+		},
+		{
+			name: "required infrastructure failure",
+			err:  errors.Join(errors.New("pipe broke"), app.ErrRequiredInfrastructureStopped),
 			want: 1,
 		},
 		{

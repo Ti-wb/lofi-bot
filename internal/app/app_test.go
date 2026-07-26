@@ -57,6 +57,68 @@ func TestNewFailsBeforeSQLiteWhenBackendLockIsHeld(t *testing.T) {
 	}
 }
 
+func TestNewDirectCallerDoesNotInspectSupervisorFD3(t *testing.T) {
+	isolateSingletonUserDirectory(t)
+	t.Setenv(liveness.SupervisorMarkerEnv, liveness.SupervisorMarkerValue)
+	root := t.TempDir()
+	databasePath := filepath.Join(root, "runtime", "queue.db")
+	const token = "123456789:direct-no-fd3"
+	lock, err := singleton.Acquire(databasePath, token)
+	if err != nil {
+		t.Fatalf("hold backend lock: %v", err)
+	}
+	defer lock.Close()
+
+	service, err := New(config.Config{
+		TelegramBotToken: token,
+		DataDir:          filepath.Join(root, "data"),
+		DatabasePath:     databasePath,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if service != nil {
+		service.Close()
+		t.Fatal("New returned a service while the backend lock was held")
+	}
+	if !errors.Is(err, singleton.ErrAlreadyRunning) {
+		t.Fatalf("direct New error = %v, want singleton contention without FD3 probing", err)
+	}
+	if errors.Is(err, liveness.ErrInvalidSupervisorFIFO) {
+		t.Fatalf("direct New unexpectedly inspected process descriptor 3: %v", err)
+	}
+}
+
+func TestNewClosesTransferredLivenessSinkOnInitializationFailure(t *testing.T) {
+	isolateSingletonUserDirectory(t)
+	root := t.TempDir()
+	databasePath := filepath.Join(root, "runtime", "queue.db")
+	const token = "123456789:liveness-option-cleanup"
+	lock, err := singleton.Acquire(databasePath, token)
+	if err != nil {
+		t.Fatalf("hold backend lock: %v", err)
+	}
+	defer lock.Close()
+
+	sink := &appTestFrameSink{}
+	service, err := New(
+		config.Config{
+			TelegramBotToken: token,
+			DataDir:          filepath.Join(root, "data"),
+			DatabasePath:     databasePath,
+		},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithLivenessSink(sink),
+	)
+	if service != nil {
+		service.Close()
+		t.Fatal("New returned a service while the backend lock was held")
+	}
+	if !errors.Is(err, singleton.ErrAlreadyRunning) {
+		t.Fatalf("New error = %v, want singleton contention", err)
+	}
+	if !sink.closed {
+		t.Fatal("failed New did not close transferred liveness sink")
+	}
+}
+
 func TestNewFencesTelegramIdentityAcrossDifferentRuntimeRoots(t *testing.T) {
 	isolateSingletonUserDirectory(t)
 	root := t.TempDir()
@@ -3577,6 +3639,145 @@ func TestRunReturnsWhenBotStopsUnexpectedly(t *testing.T) {
 	}
 }
 
+func TestRunFailsFastWhenLivenessReporterReturns(t *testing.T) {
+	svc, _, fakeBot := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	botStarted := make(chan struct{})
+	botStopped := make(chan struct{})
+	fakeBot.run = func(ctx context.Context) error {
+		close(botStarted)
+		<-ctx.Done()
+		close(botStopped)
+		return ctx.Err()
+	}
+	wantErr := errors.New("supervisor pipe broke")
+	reporterResult := make(chan error, 1)
+	reporterResult <- wantErr
+	svc.livenessReporter = &fakeRequiredReporter{
+		start: func(context.Context) (<-chan error, error) {
+			return reporterResult, nil
+		},
+	}
+
+	err := svc.Run(context.Background())
+	if !errors.Is(err, ErrRequiredInfrastructureStopped) ||
+		!errors.Is(err, wantErr) {
+		t.Fatalf("Run error = %v, want required reporter failure %v", err, wantErr)
+	}
+	if errors.Is(err, ErrWorkerShutdownStuck) ||
+		errors.Is(err, ErrInfrastructureShutdownStuck) {
+		t.Fatalf("cooperative sibling shutdown reported stuck: %v", err)
+	}
+	select {
+	case <-botStarted:
+	default:
+		t.Fatal("reporter started before the Telegram worker was launched")
+	}
+	select {
+	case <-botStopped:
+	default:
+		t.Fatal("reporter failure did not cancel and drain Telegram worker")
+	}
+}
+
+func TestRunFailsFastWhenInitialLivenessFrameFails(t *testing.T) {
+	svc, _, fakeBot := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	svc.workerStopGrace = 100 * time.Millisecond
+	botStopped := make(chan struct{})
+	fakeBot.run = func(ctx context.Context) error {
+		<-ctx.Done()
+		close(botStopped)
+		return ctx.Err()
+	}
+	wantErr := errors.New("initial liveness write failed")
+	svc.livenessReporter = &fakeRequiredReporter{
+		start: func(context.Context) (<-chan error, error) {
+			return nil, wantErr
+		},
+	}
+
+	err := svc.Run(context.Background())
+	if !errors.Is(err, ErrRequiredInfrastructureStopped) ||
+		!errors.Is(err, wantErr) {
+		t.Fatalf("Run error = %v, want synchronous reporter failure %v", err, wantErr)
+	}
+	if errors.Is(err, ErrWorkerShutdownStuck) {
+		t.Fatalf("initial reporter failure did not drain siblings: %v", err)
+	}
+	select {
+	case <-botStopped:
+	default:
+		t.Fatal("initial reporter failure did not cancel Telegram worker")
+	}
+}
+
+func TestRunBoundsReporterDrainAfterWorkerFailure(t *testing.T) {
+	svc, _, _ := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	svc.workerStopGrace = 20 * time.Millisecond
+	neverReturns := make(chan error)
+	svc.livenessReporter = &fakeRequiredReporter{
+		start: func(context.Context) (<-chan error, error) {
+			return neverReturns, nil
+		},
+	}
+
+	start := time.Now()
+	err := svc.Run(context.Background())
+	if !errors.Is(err, ErrRequiredWorkerStopped) {
+		t.Fatalf("Run error = %v, want worker failure", err)
+	}
+	if !errors.Is(err, ErrInfrastructureShutdownStuck) {
+		t.Fatalf("Run error = %v, want bounded reporter drain failure", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("reporter drain remained blocked for %s", elapsed)
+	}
+}
+
+func TestRunCancellationDrainsRequiredReporterWithoutFatalClassification(t *testing.T) {
+	svc, _, fakeBot := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	fakeBot.run = func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	reporterStarted := make(chan struct{})
+	svc.livenessReporter = &fakeRequiredReporter{
+		start: func(ctx context.Context) (<-chan error, error) {
+			result := make(chan error, 1)
+			close(reporterStarted)
+			go func() {
+				<-ctx.Done()
+				result <- ctx.Err()
+			}()
+			return result, nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- svc.Run(ctx)
+	}()
+	select {
+	case <-reporterStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("required reporter did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error = %v, want cancellation", err)
+		}
+		if errors.Is(err, ErrRequiredInfrastructureStopped) ||
+			errors.Is(err, ErrInfrastructureShutdownStuck) {
+			t.Fatalf("normal reporter cancellation classified fatal: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not drain required reporter")
+	}
+}
+
 func TestRequiredWorkerBindingsKeepFixedPlaybackWireIDAcrossModes(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -4828,5 +5029,32 @@ func (f *fakeBot) Run(ctx context.Context) error {
 }
 func (f *fakeBot) SendMessage(_ context.Context, _ int64, text string) error {
 	f.messages = append(f.messages, text)
+	return nil
+}
+
+type appTestFrameSink struct {
+	closed bool
+}
+
+func (sink *appTestFrameSink) WriteFrame([]byte) (bool, error) {
+	return true, nil
+}
+
+func (sink *appTestFrameSink) Close() error {
+	sink.closed = true
+	return nil
+}
+
+type fakeRequiredReporter struct {
+	start  func(context.Context) (<-chan error, error)
+	closed bool
+}
+
+func (reporter *fakeRequiredReporter) Start(ctx context.Context) (<-chan error, error) {
+	return reporter.start(ctx)
+}
+
+func (reporter *fakeRequiredReporter) Close() error {
+	reporter.closed = true
 	return nil
 }

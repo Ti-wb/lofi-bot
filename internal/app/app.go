@@ -70,6 +70,7 @@ type Service struct {
 	libraryScanLogMu      sync.Mutex
 	libraryScanLog        *eventErrorSampler
 	livenessRegistry      *liveness.Registry
+	livenessReporter      requiredLivenessReporter
 }
 
 type obsController interface {
@@ -117,9 +118,39 @@ const (
 )
 
 var (
-	ErrRequiredWorkerStopped = errors.New("required service worker stopped unexpectedly")
-	ErrWorkerShutdownStuck   = errors.New("service workers did not stop after cancellation")
+	ErrRequiredWorkerStopped         = errors.New("required service worker stopped unexpectedly")
+	ErrRequiredInfrastructureStopped = errors.New("required service infrastructure stopped unexpectedly")
+	ErrWorkerShutdownStuck           = errors.New("service workers did not stop after cancellation")
+	ErrInfrastructureShutdownStuck   = errors.New("service infrastructure did not stop after cancellation")
 )
+
+type requiredLivenessReporter interface {
+	Start(context.Context) (<-chan error, error)
+	Close() error
+}
+
+type newOptions struct {
+	livenessSink liveness.FrameSink
+}
+
+// Option applies one optional process-level dependency while preserving the
+// existing New call shape for direct and unit-level callers.
+type Option func(*newOptions) error
+
+// WithLivenessSink transfers ownership of the prevalidated supervisor sink to
+// the service. A nil sink keeps direct, unsupervised operation unchanged.
+func WithLivenessSink(sink liveness.FrameSink) Option {
+	return func(options *newOptions) error {
+		if sink == nil {
+			return nil
+		}
+		if options.livenessSink != nil {
+			return errors.New("liveness sink already configured")
+		}
+		options.livenessSink = sink
+		return nil
+	}
+}
 
 type mediaProgress struct {
 	Path                     string
@@ -166,7 +197,38 @@ func (e publicError) PublicMessage() string {
 	return string(e)
 }
 
-func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
+func New(cfg config.Config, logger *slog.Logger, options ...Option) (*Service, error) {
+	var settings newOptions
+	releaseUnownedSink := true
+	defer func() {
+		if releaseUnownedSink && settings.livenessSink != nil {
+			_ = settings.livenessSink.Close()
+		}
+	}()
+	for _, option := range options {
+		if option == nil {
+			continue
+		}
+		if err := option(&settings); err != nil {
+			return nil, fmt.Errorf("apply app option: %w", err)
+		}
+	}
+
+	registry := liveness.NewRegistry(liveness.Options{})
+	var reporter requiredLivenessReporter
+	if settings.livenessSink != nil {
+		configured, err := liveness.NewReporter(
+			registry,
+			settings.livenessSink,
+			logger.With("component", "liveness"),
+			liveness.DefaultReportInterval,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("configure liveness reporter: %w", err)
+		}
+		reporter = configured
+	}
+
 	instanceLock, err := singleton.Acquire(cfg.DatabasePath, cfg.TelegramBotToken)
 	if err != nil {
 		return nil, fmt.Errorf("acquire backend singleton: %w", err)
@@ -240,10 +302,15 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 		playback:            playbackIdle,
 		workerStopGrace:     defaultWorkerStopGrace,
 		maintenanceInterval: defaultMaintenancePeriod,
-		livenessRegistry:    liveness.NewRegistry(liveness.Options{}),
+		livenessRegistry:    registry,
+		livenessReporter:    reporter,
 		shutdown:            []func() error{instanceLock.Close, obsClient.Close, store.Close},
 	}
 	releaseUnownedLock = false
+	releaseUnownedSink = false
+	if reporter != nil {
+		service.shutdown = append(service.shutdown, reporter.Close)
+	}
 	if libDB != nil {
 		service.shutdown = append(service.shutdown, libDB.Close)
 	}
@@ -302,9 +369,26 @@ func (s *Service) Run(parentCtx context.Context) error {
 			workerResults <- serviceWorkerResult{name: worker.name, err: worker.run(workerCtx)}
 		}(worker)
 	}
-	// Phase 12b starts the reporter here, after all five worker goroutines have
-	// been launched. Until its first complete frame, the supervisor uses only
-	// a bounded no-frame startup grace; worker progress is never synthesized.
+
+	var reporterResults <-chan error
+	reporterPending := false
+	if s.livenessReporter != nil {
+		reporterResults, err = s.livenessReporter.Start(runCtx)
+		if err != nil {
+			cancel()
+			runErr := requiredInfrastructureError(err)
+			return errors.Join(
+				runErr,
+				s.waitForRuntime(
+					workerResults,
+					pendingWorkers,
+					nil,
+					false,
+				),
+			)
+		}
+		reporterPending = true
+	}
 
 	var runErr error
 run:
@@ -324,11 +408,33 @@ run:
 				runErr = requiredWorkerError(result)
 			}
 			break run
+		case result, ok := <-reporterResults:
+			reporterPending = false
+			if !ok {
+				result = nil
+			}
+			if err := parentCtx.Err(); err != nil {
+				runErr = err
+				if !onlyContextTermination(result) {
+					runErr = errors.Join(runErr, requiredInfrastructureError(result))
+				}
+			} else {
+				runErr = requiredInfrastructureError(result)
+			}
+			break run
 		}
 	}
 
 	cancel()
-	return errors.Join(runErr, s.waitForWorkers(workerResults, pendingWorkers))
+	return errors.Join(
+		runErr,
+		s.waitForRuntime(
+			workerResults,
+			pendingWorkers,
+			reporterResults,
+			reporterPending,
+		),
+	)
 }
 
 type serviceWorker struct {
@@ -416,9 +522,25 @@ func requiredWorkerError(result serviceWorkerResult) error {
 	return errors.Join(stopped, fmt.Errorf("%s worker: %w", result.name, result.err))
 }
 
-func (s *Service) waitForWorkers(results <-chan serviceWorkerResult, pending map[string]struct{}) error {
-	if len(pending) == 0 {
+func requiredInfrastructureError(err error) error {
+	stopped := fmt.Errorf("%w: liveness-reporter", ErrRequiredInfrastructureStopped)
+	if err == nil {
+		return stopped
+	}
+	return errors.Join(stopped, fmt.Errorf("liveness reporter: %w", err))
+}
+
+func (s *Service) waitForRuntime(
+	results <-chan serviceWorkerResult,
+	pending map[string]struct{},
+	reporterResults <-chan error,
+	reporterPending bool,
+) error {
+	if len(pending) == 0 && !reporterPending {
 		return nil
+	}
+	if !reporterPending {
+		reporterResults = nil
 	}
 	grace := s.workerStopGrace
 	if grace <= 0 {
@@ -428,28 +550,48 @@ func (s *Service) waitForWorkers(results <-chan serviceWorkerResult, pending map
 	defer timer.Stop()
 
 	var drainErr error
-	for len(pending) > 0 {
+	for len(pending) > 0 || reporterPending {
 		select {
 		case result := <-results:
 			delete(pending, result.name)
 			if !onlyContextTermination(result.err) {
 				drainErr = errors.Join(drainErr, requiredWorkerError(result))
 			}
-		case <-timer.C:
-			names := make([]string, 0, len(pending))
-			for name := range pending {
-				names = append(names, name)
+		case result, ok := <-reporterResults:
+			reporterPending = false
+			reporterResults = nil
+			if !ok {
+				result = nil
 			}
-			sort.Strings(names)
-			return errors.Join(
-				drainErr,
-				fmt.Errorf(
+			if !onlyContextTermination(result) {
+				drainErr = errors.Join(drainErr, requiredInfrastructureError(result))
+			}
+		case <-timer.C:
+			var stuckErr error
+			if len(pending) > 0 {
+				names := make([]string, 0, len(pending))
+				for name := range pending {
+					names = append(names, name)
+				}
+				sort.Strings(names)
+				stuckErr = fmt.Errorf(
 					"%w: grace=%s pending=%s",
 					ErrWorkerShutdownStuck,
 					grace,
 					strings.Join(names, ","),
-				),
-			)
+				)
+			}
+			if reporterPending {
+				stuckErr = errors.Join(
+					stuckErr,
+					fmt.Errorf(
+						"%w: grace=%s pending=liveness-reporter",
+						ErrInfrastructureShutdownStuck,
+						grace,
+					),
+				)
+			}
+			return errors.Join(drainErr, stuckErr)
 		}
 	}
 	return drainErr

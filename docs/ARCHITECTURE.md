@@ -13,7 +13,7 @@
 - `internal/singleton`: canonical database and hashed Telegram identities with process-lifetime kernel locks.
 - `internal/media`: local Telegram file probing/import support, `ffprobe` metadata, disk usage.
 - `internal/library`: media filename parsing, library scanning, period helpers, and selection primitives.
-- `internal/liveness`: fixed required-worker ownership and in-process progress snapshots.
+- `internal/liveness`: fixed required-worker ownership, progress snapshots, and the local FD3 reporter protocol.
 - Telegram Local Bot API Server: local Bot API endpoint configured by `TELEGRAM_API_BASE_URL`.
 
 ## Runtime Flow
@@ -86,7 +86,9 @@ The in-process registry has exactly five stable worker IDs: `telegram`, `obs-rec
 
 Only the bound worker execution path advances its monotonic sequence: when it actually starts, crosses a real operation or successful checkpoint boundary, or remains schedulable in its own event, scheduled, or retry wait. A reporter or coordinator must not pulse on a worker's behalf. Long media copy, probe, durability sync, and library scan operations use fixed, bounded, tokenized scopes. Arbitrary close order leaves the newest active scope effective, the final close returns to the base phase, and an authoritative phase change such as cancellation invalidates older restores.
 
-This registry is internal only at this stage. `run.sh` does not yet receive liveness frames, and no liveness-based supervisor restart is active. The follow-up reporter/watchdog contract starts reporting only after all five worker goroutines have been launched, allows one bounded no-frame startup grace, then requires the complete fixed ID set and evaluates each worker independently. That contract assumes the Go backend and its shell supervisor run on the same host.
+An opt-in reporter snapshots all five entries every ten seconds and writes one bounded `TGOBS1` line to a fixed, write-only FIFO inherited as descriptor 3. The process enables it only when `TG_OBS_LIVENESS_FD3=1` is present; absence leaves direct execution unchanged, while a malformed marker or invalid descriptor fails startup. The descriptor is validated, made nonblocking and close-on-exec before app initialization, so startup media probes cannot inherit it. Full-pipe backpressure drops a complete frame; partial writes, a lost reader, or other permanent write failures stop the required reporter and fail the service. The reporter starts only after all five worker goroutines have been launched and never advances worker progress itself.
+
+`run.sh` does not yet create or monitor this FD3 channel, so liveness-based supervisor restart is not active in this phase. The follow-up shell watchdog must require the complete fixed ID set and evaluate each worker independently; frame arrival alone is not worker progress. The contract assumes the Go backend and its shell supervisor run on the same host.
 
 ## Failure Handling
 
