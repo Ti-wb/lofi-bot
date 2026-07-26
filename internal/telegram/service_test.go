@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -54,7 +57,6 @@ func TestAdminRegularMemberRejected(t *testing.T) {
 	bot := &fakeBotAPI{
 		adminResponses: []adminResponse{
 			{admins: []tgbotapi.ChatMember{chatMember(42, "member")}},
-			{admins: []tgbotapi.ChatMember{chatMember(42, "member")}},
 		},
 	}
 	svc := newTestService(t, bot)
@@ -63,31 +65,52 @@ func TestAdminRegularMemberRejected(t *testing.T) {
 	if !errors.Is(err, errAdminOnly) {
 		t.Fatalf("err = %v, want %v", err, errAdminOnly)
 	}
-	if bot.adminCallCount != 2 {
-		t.Fatalf("admin API calls = %d, want 2", bot.adminCallCount)
+	if bot.adminCallCount != 1 {
+		t.Fatalf("admin API calls = %d, want 1", bot.adminCallCount)
 	}
 }
 
-func TestAdminStaleDenyForceRefreshes(t *testing.T) {
+func TestReadOnlyAdminCheckHonorsNegativeCache(t *testing.T) {
 	bot := &fakeBotAPI{
 		adminResponses: []adminResponse{
-			{admins: []tgbotapi.ChatMember{chatMember(7, "administrator")}},
+			{admins: []tgbotapi.ChatMember{}},
+		},
+	}
+	svc := newTestService(t, bot)
+	svc.hooks.ListQueue = func(context.Context) (string, error) {
+		return "queue", nil
+	}
+
+	for i := 0; i < 2; i++ {
+		response, err := svc.handleCommand(context.Background(), commandMessage(42, "/queue"))
+		if err != nil {
+			t.Fatalf("queue command %d: %v", i+1, err)
+		}
+		assertNoButton(t, response.markup, "Skip")
+	}
+	if bot.adminCallCount != 1 {
+		t.Fatalf("admin API calls = %d, want 1", bot.adminCallCount)
+	}
+}
+
+func TestMutationFreshAdminLookupAllowsPromotionAndUpdatesCache(t *testing.T) {
+	bot := &fakeBotAPI{
+		adminResponses: []adminResponse{
+			{admins: []tgbotapi.ChatMember{}},
 			{admins: []tgbotapi.ChatMember{chatMember(42, "administrator")}},
 		},
 	}
 	svc := newTestService(t, bot)
-
-	response, err := svc.handleCommand(context.Background(), commandMessage(7, "/skip"))
-	if err != nil {
-		t.Fatalf("prime cache command: %v", err)
-	}
-	if response.text != "skipped" {
-		t.Fatalf("prime response = %q, want skipped", response.text)
+	svc.hooks.ListQueue = func(context.Context) (string, error) {
+		return "queue", nil
 	}
 
-	response, err = svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
+	if _, err := svc.handleCommand(context.Background(), commandMessage(42, "/queue")); err != nil {
+		t.Fatalf("prime negative cache: %v", err)
+	}
+	response, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
 	if err != nil {
-		t.Fatalf("second handle command: %v", err)
+		t.Fatalf("fresh mutation command: %v", err)
 	}
 	if response.text != "skipped" {
 		t.Fatalf("response = %q, want skipped", response.text)
@@ -95,12 +118,51 @@ func TestAdminStaleDenyForceRefreshes(t *testing.T) {
 	if bot.adminCallCount != 2 {
 		t.Fatalf("admin API calls = %d, want 2", bot.adminCallCount)
 	}
+	if !svc.isAdmin(context.Background(), testChatID, &tgbotapi.User{ID: 42}) {
+		t.Fatal("successful fresh lookup did not update positive cache")
+	}
+	if bot.adminCallCount != 2 {
+		t.Fatalf("cached admin check made another API call: got %d, want 2", bot.adminCallCount)
+	}
+}
+
+func TestMutationFreshAdminLookupDeniesRevocationAndUpdatesCache(t *testing.T) {
+	bot := &fakeBotAPI{
+		adminResponses: []adminResponse{
+			{admins: []tgbotapi.ChatMember{chatMember(42, "administrator")}},
+			{admins: []tgbotapi.ChatMember{}},
+		},
+	}
+	svc := newTestService(t, bot)
+	svc.hooks.ListQueue = func(context.Context) (string, error) {
+		return "queue", nil
+	}
+	svc.hooks.Skip = func(context.Context) (string, error) {
+		t.Fatal("skip hook should not be called after admin revocation")
+		return "", nil
+	}
+
+	if _, err := svc.handleCommand(context.Background(), commandMessage(42, "/queue")); err != nil {
+		t.Fatalf("prime positive cache: %v", err)
+	}
+	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
+	if !errors.Is(err, errAdminOnly) {
+		t.Fatalf("err = %v, want %v", err, errAdminOnly)
+	}
+	if bot.adminCallCount != 2 {
+		t.Fatalf("admin API calls = %d, want 2", bot.adminCallCount)
+	}
+	if svc.isAdmin(context.Background(), testChatID, &tgbotapi.User{ID: 42}) {
+		t.Fatal("successful fresh lookup did not update negative cache")
+	}
+	if bot.adminCallCount != 2 {
+		t.Fatalf("cached negative check made another API call: got %d, want 2", bot.adminCallCount)
+	}
 }
 
 func TestAdminBotAdministratorIgnored(t *testing.T) {
 	bot := &fakeBotAPI{
 		adminResponses: []adminResponse{
-			{admins: []tgbotapi.ChatMember{botChatMember(42, "administrator")}},
 			{admins: []tgbotapi.ChatMember{botChatMember(42, "administrator")}},
 		},
 	}
@@ -123,6 +185,53 @@ func TestAdminLookupErrorDenies(t *testing.T) {
 	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
 	if !errors.Is(err, errAdminOnly) {
 		t.Fatalf("err = %v, want %v", err, errAdminOnly)
+	}
+}
+
+func TestMutationAdminLookupErrorDoesNotTrustStalePositiveCache(t *testing.T) {
+	bot := &fakeBotAPI{
+		adminResponses: []adminResponse{
+			{err: errors.New("telegram unavailable")},
+		},
+	}
+	svc := newTestService(t, bot)
+	cacheOnlyAdmin(svc, 42)
+	svc.hooks.Skip = func(context.Context) (string, error) {
+		t.Fatal("skip hook should not be called when fresh admin lookup fails")
+		return "", nil
+	}
+
+	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
+	if !errors.Is(err, errAdminOnly) {
+		t.Fatalf("err = %v, want %v", err, errAdminOnly)
+	}
+	if bot.adminCallCount != 1 {
+		t.Fatalf("admin API calls = %d, want 1", bot.adminCallCount)
+	}
+}
+
+func TestMutationAdminLookupTimeoutFailsClosed(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	bot := &fakeBotAPI{adminBlock: block}
+	svc := newTestService(t, bot)
+	cacheOnlyAdmin(svc, 42)
+	svc.adminLookupTimeout = 20 * time.Millisecond
+	svc.hooks.Skip = func(context.Context) (string, error) {
+		t.Fatal("skip hook should not be called when fresh admin lookup times out")
+		return "", nil
+	}
+
+	start := time.Now()
+	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
+	if !errors.Is(err, errAdminOnly) {
+		t.Fatalf("err = %v, want %v", err, errAdminOnly)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("admin lookup took %s, want bounded timeout", elapsed)
+	}
+	if bot.adminCallCount != 1 {
+		t.Fatalf("admin API calls = %d, want 1", bot.adminCallCount)
 	}
 }
 
@@ -386,7 +495,6 @@ func TestAdminOnlyLibraryCallbackRejectedForNonAdmin(t *testing.T) {
 	bot := &fakeBotAPI{
 		adminResponses: []adminResponse{
 			{admins: []tgbotapi.ChatMember{}},
-			{admins: []tgbotapi.ChatMember{}},
 		},
 	}
 	svc := newTestService(t, bot)
@@ -398,6 +506,67 @@ func TestAdminOnlyLibraryCallbackRejectedForNonAdmin(t *testing.T) {
 	_, err := svc.routeAction(context.Background(), testChatID, &tgbotapi.User{ID: 42}, "skip:music")
 	if !errors.Is(err, errAdminOnly) {
 		t.Fatalf("err = %v, want %v", err, errAdminOnly)
+	}
+	if bot.adminCallCount != 1 {
+		t.Fatalf("admin API calls = %d, want 1", bot.adminCallCount)
+	}
+}
+
+func TestMutationCommandsAlwaysUseOneFreshAdminLookup(t *testing.T) {
+	for _, command := range []string{
+		"/scan",
+		"/theme random",
+		"/select clear",
+		"/skip loop",
+		"/remove 1",
+		"/move 1 2",
+	} {
+		t.Run(command, func(t *testing.T) {
+			bot := &fakeBotAPI{
+				adminResponses: []adminResponse{
+					{admins: []tgbotapi.ChatMember{}},
+				},
+			}
+			svc := newTestService(t, bot)
+			cacheOnlyAdmin(svc, 42)
+
+			_, err := svc.handleCommand(context.Background(), commandMessage(42, command))
+			if !errors.Is(err, errAdminOnly) {
+				t.Fatalf("err = %v, want %v", err, errAdminOnly)
+			}
+			if bot.adminCallCount != 1 {
+				t.Fatalf("admin API calls = %d, want exactly 1", bot.adminCallCount)
+			}
+		})
+	}
+}
+
+func TestMutationCallbacksAlwaysUseOneFreshAdminLookup(t *testing.T) {
+	for _, action := range []string{
+		"scan",
+		"theme:random",
+		"select:clear",
+		"skip:loop",
+		"remove:1",
+		"move:1:2",
+	} {
+		t.Run(action, func(t *testing.T) {
+			bot := &fakeBotAPI{
+				adminResponses: []adminResponse{
+					{admins: []tgbotapi.ChatMember{}},
+				},
+			}
+			svc := newTestService(t, bot)
+			cacheOnlyAdmin(svc, 42)
+
+			_, err := svc.routeAction(context.Background(), testChatID, &tgbotapi.User{ID: 42}, action)
+			if !errors.Is(err, errAdminOnly) {
+				t.Fatalf("err = %v, want %v", err, errAdminOnly)
+			}
+			if bot.adminCallCount != 1 {
+				t.Fatalf("admin API calls = %d, want exactly 1", bot.adminCallCount)
+			}
+		})
 	}
 }
 
@@ -598,13 +767,16 @@ func TestNewDefaultsRequestTimeoutExceedsUpdateTimeout(t *testing.T) {
 	}
 }
 
-func TestProductionBotAPIUpdateAndRequestLocksAreIndependent(t *testing.T) {
+func TestProductionBotAPIUpdateAndRequestGatesAreIndependent(t *testing.T) {
 	api := &productionBotAPI{
-		updateClient:  &contextHTTPClient{},
-		requestClient: &contextHTTPClient{},
+		updateClient:   &contextHTTPClient{},
+		updateGate:     newContextGate(),
+		requestClient:  &contextHTTPClient{},
+		requestGate:    newContextGate(),
+		requestTimeout: time.Second,
 	}
 
-	api.updateMu.Lock()
+	<-api.updateGate
 	requestDone := make(chan struct{})
 	go func() {
 		_ = api.withRequestContext(context.Background(), func() error {
@@ -615,11 +787,11 @@ func TestProductionBotAPIUpdateAndRequestLocksAreIndependent(t *testing.T) {
 	select {
 	case <-requestDone:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("request context blocked behind update lock")
+		t.Fatal("request context blocked behind update gate")
 	}
-	api.updateMu.Unlock()
+	api.updateGate <- struct{}{}
 
-	api.requestMu.Lock()
+	<-api.requestGate
 	updateDone := make(chan struct{})
 	go func() {
 		_ = api.withUpdateContext(context.Background(), func() error {
@@ -630,9 +802,141 @@ func TestProductionBotAPIUpdateAndRequestLocksAreIndependent(t *testing.T) {
 	select {
 	case <-updateDone:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("update context blocked behind request lock")
+		t.Fatal("update context blocked behind request gate")
 	}
-	api.requestMu.Unlock()
+	api.requestGate <- struct{}{}
+}
+
+func TestProductionBotAPIRequestGateWaitUsesTotalTimeoutAndRecovers(t *testing.T) {
+	api := &productionBotAPI{
+		requestClient:  &contextHTTPClient{},
+		requestGate:    newContextGate(),
+		requestTimeout: 20 * time.Millisecond,
+	}
+	<-api.requestGate
+
+	called := false
+	start := time.Now()
+	err := api.withRequestContext(context.Background(), func() error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want %v", err, context.DeadlineExceeded)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("gate wait took %s, want configured total timeout", elapsed)
+	}
+	if called {
+		t.Fatal("timed-out gate waiter executed its callback")
+	}
+
+	api.requestGate <- struct{}{}
+	if err := api.withRequestContext(context.Background(), func() error {
+		called = true
+		return nil
+	}); err != nil {
+		t.Fatalf("request after timeout: %v", err)
+	}
+	if !called {
+		t.Fatal("request after timeout did not execute")
+	}
+	if got := len(api.requestGate); got != 1 {
+		t.Fatalf("request gate tokens = %d, want 1", got)
+	}
+}
+
+func TestProductionBotAPIWaitingRequestCanCancelAndGateRecovers(t *testing.T) {
+	var sendCalls atomic.Int32
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseFirst:
+		default:
+			close(releaseFirst)
+		}
+	}()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/getMe"):
+			_, _ = io.WriteString(w, `{"ok":true,"result":{"id":1,"is_bot":true,"first_name":"test","username":"test_bot"}}`)
+		case strings.HasSuffix(req.URL.Path, "/sendMessage"):
+			call := sendCalls.Add(1)
+			if call == 1 {
+				close(firstStarted)
+				select {
+				case <-releaseFirst:
+				case <-req.Context().Done():
+					return
+				}
+			}
+			_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1,"date":0,"chat":{"id":1,"type":"private"},"text":"ok"}}`)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer server.Close()
+
+	api, err := newProductionBotAPI(Config{
+		Token:          "test-token",
+		APIBaseURL:     server.URL,
+		UpdateTimeout:  1,
+		RequestTimeout: 6 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new production bot API: %v", err)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := api.Send(context.Background(), tgbotapi.NewMessage(1, "first"))
+		firstDone <- err
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("first request did not reach blocking server")
+	}
+
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := api.Send(secondCtx, tgbotapi.NewMessage(1, "second"))
+		secondDone <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	cancelSecond()
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("second request err = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("canceled gate waiter did not return promptly")
+	}
+	if got := sendCalls.Load(); got != 1 {
+		t.Fatalf("HTTP send calls = %d, want 1 while first request holds gate", got)
+	}
+
+	close(releaseFirst)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first request: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("first request did not finish after release")
+	}
+	if _, err := api.Send(context.Background(), tgbotapi.NewMessage(1, "third")); err != nil {
+		t.Fatalf("third request after cancellation: %v", err)
+	}
+	if got := sendCalls.Load(); got != 2 {
+		t.Fatalf("HTTP send calls = %d, want 2 after third request", got)
+	}
+	if got := len(api.requestGate); got != 1 {
+		t.Fatalf("request gate tokens = %d, want 1", got)
+	}
 }
 
 func TestContextHTTPClientAttachesCallerContext(t *testing.T) {
@@ -640,7 +944,7 @@ func TestContextHTTPClientAttachesCallerContext(t *testing.T) {
 	client := &contextHTTPClient{base: base}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	client.ctx = ctx
+	client.setContext(ctx)
 	req, err := http.NewRequest(http.MethodPost, "http://telegram.local/bot/test", nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
@@ -934,6 +1238,107 @@ func TestRunAdvancesUpdateOffset(t *testing.T) {
 	if got := bot.updateConfigs[1].Offset; got != 12 {
 		t.Fatalf("second poll offset = %d, want 12", got)
 	}
+	if got := bot.updateConfigs[0].Limit; got != 1 {
+		t.Fatalf("update limit = %d, want 1", got)
+	}
+}
+
+func TestRunUpdateTimeoutPreservesSynchronousOrderAndNextOffsets(t *testing.T) {
+	bot := &fakeBotAPI{
+		updateResponses: []updateResponse{
+			{updates: []tgbotapi.Update{
+				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			}},
+			{updates: []tgbotapi.Update{
+				{UpdateID: 11, Message: commandMessage(42, "/now")},
+			}},
+		},
+		updateCalls: make(chan struct{}, 3),
+	}
+	svc := newTestService(t, bot)
+	cacheOnlyAdmins(svc)
+	svc.updateProcessingTimeout = 20 * time.Millisecond
+	events := make(chan string, 3)
+	releaseFirstHook := make(chan struct{})
+	svc.hooks.ListQueue = func(ctx context.Context) (string, error) {
+		events <- "first-start"
+		<-ctx.Done()
+		events <- "first-deadline"
+		<-releaseFirstHook
+		return "", ctx.Err()
+	}
+	svc.hooks.Now = func(context.Context) (string, error) {
+		events <- "second"
+		return "now", nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+
+	select {
+	case <-bot.updateCalls:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("first poll did not start")
+	}
+	for _, want := range []string{"first-start", "first-deadline"} {
+		select {
+		case got := <-events:
+			if got != want {
+				t.Fatalf("event = %q, want %q", got, want)
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timed out waiting for %q", want)
+		}
+	}
+	select {
+	case <-bot.updateCalls:
+		t.Fatal("second poll started before first update handler returned")
+	default:
+	}
+	close(releaseFirstHook)
+
+	select {
+	case <-bot.updateCalls:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("second poll did not start after first handler returned")
+	}
+	select {
+	case got := <-events:
+		if got != "second" {
+			t.Fatalf("event = %q, want second", got)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("second update was not processed")
+	}
+	select {
+	case <-bot.updateCalls:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("third poll did not start after second update")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not stop after cancellation")
+	}
+	if len(bot.updateConfigs) < 3 {
+		t.Fatalf("update configs = %d, want at least 3", len(bot.updateConfigs))
+	}
+	for i, wantOffset := range []int{0, 11, 12} {
+		if got := bot.updateConfigs[i].Offset; got != wantOffset {
+			t.Fatalf("poll %d offset = %d, want %d", i+1, got, wantOffset)
+		}
+		if got := bot.updateConfigs[i].Limit; got != 1 {
+			t.Fatalf("poll %d limit = %d, want 1", i+1, got)
+		}
+	}
 }
 
 func TestRunSkipsStaleUpdates(t *testing.T) {
@@ -1018,10 +1423,10 @@ func TestUploadRequiresAdmin(t *testing.T) {
 	bot := &fakeBotAPI{
 		adminResponses: []adminResponse{
 			{admins: []tgbotapi.ChatMember{}},
-			{admins: []tgbotapi.ChatMember{}},
 		},
 	}
 	svc := newTestService(t, bot)
+	cacheOnlyAdmin(svc, 42)
 	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
 		t.Fatal("enqueue hook should not be called")
 		return "", nil
@@ -1033,6 +1438,15 @@ func TestUploadRequiresAdmin(t *testing.T) {
 	}
 	if bot.fileCallCount != 0 {
 		t.Fatalf("getFile calls = %d, want 0", bot.fileCallCount)
+	}
+	if bot.adminCallCount != 1 {
+		t.Fatalf("admin API calls = %d, want exactly 1 fresh lookup", bot.adminCallCount)
+	}
+	if svc.isAdmin(context.Background(), testChatID, &tgbotapi.User{ID: 42}) {
+		t.Fatal("library upload fresh lookup did not replace stale positive cache")
+	}
+	if bot.adminCallCount != 1 {
+		t.Fatalf("cached negative check made another API call: got %d, want 1", bot.adminCallCount)
 	}
 }
 
@@ -1271,8 +1685,23 @@ func newTestService(t *testing.T, bot *fakeBotAPI) *Service {
 }
 
 func cacheAdmin(svc *Service, userID int64) {
+	cacheOnlyAdmin(svc, userID)
+	if bot, ok := svc.bot.(*fakeBotAPI); ok {
+		bot.defaultAdmins = []tgbotapi.ChatMember{chatMember(userID, "administrator")}
+	}
+}
+
+func cacheOnlyAdmin(svc *Service, userID int64) {
+	cacheOnlyAdmins(svc, userID)
+}
+
+func cacheOnlyAdmins(svc *Service, userIDs ...int64) {
+	adminIDs := make(map[int64]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		adminIDs[userID] = struct{}{}
+	}
 	svc.adminCache[testChatID] = adminCacheEntry{
-		adminIDs:  map[int64]struct{}{userID: {}},
+		adminIDs:  adminIDs,
 		expiresAt: svc.now().Add(adminCacheTTL),
 	}
 }
@@ -1368,6 +1797,7 @@ func (b *blockingHTTPClient) Do(req *http.Request) (*http.Response, error) {
 
 type fakeBotAPI struct {
 	adminResponses   []adminResponse
+	defaultAdmins    []tgbotapi.ChatMember
 	updateResponses  []updateResponse
 	adminCallCount   int
 	updateCallCount  int
@@ -1478,7 +1908,7 @@ func (f *fakeBotAPI) GetChatAdministrators(ctx context.Context, _ tgbotapi.ChatA
 		}
 	}
 	if len(f.adminResponses) == 0 {
-		return nil, nil
+		return f.defaultAdmins, nil
 	}
 	response := f.adminResponses[0]
 	f.adminResponses = f.adminResponses[1:]

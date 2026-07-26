@@ -19,10 +19,12 @@ import (
 )
 
 const (
-	defaultUpdateTimeout  = 30
-	defaultRequestTimeout = time.Duration(defaultUpdateTimeout)*time.Second + 5*time.Second
-	defaultPollRetryDelay = 3 * time.Second
-	adminCacheTTL         = 60 * time.Second
+	defaultUpdateTimeout           = 30
+	defaultRequestTimeout          = time.Duration(defaultUpdateTimeout)*time.Second + 5*time.Second
+	defaultPollRetryDelay          = 3 * time.Second
+	defaultUpdateProcessingTimeout = 5 * time.Minute
+	defaultAdminLookupTimeout      = 5 * time.Second
+	adminCacheTTL                  = 60 * time.Second
 )
 
 var queueItemPattern = regexp.MustCompile(`#([0-9]+).*第 ([0-9]+) 位`)
@@ -39,14 +41,16 @@ type Config struct {
 }
 
 type Service struct {
-	bot             botAPI
-	cfg             Config
-	hooks           Hooks
-	logger          *slog.Logger
-	now             func() time.Time
-	pollRetryDelay  time.Duration
-	adminCacheMutex sync.Mutex
-	adminCache      map[int64]adminCacheEntry
+	bot                     botAPI
+	cfg                     Config
+	hooks                   Hooks
+	logger                  *slog.Logger
+	now                     func() time.Time
+	pollRetryDelay          time.Duration
+	updateProcessingTimeout time.Duration
+	adminLookupTimeout      time.Duration
+	adminCacheMutex         sync.Mutex
+	adminCache              map[int64]adminCacheEntry
 }
 
 type adminCacheEntry struct {
@@ -134,12 +138,14 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 	}
 
 	s := &Service{
-		cfg:            cfg,
-		hooks:          hooks,
-		logger:         logger,
-		now:            time.Now,
-		pollRetryDelay: defaultPollRetryDelay,
-		adminCache:     make(map[int64]adminCacheEntry),
+		cfg:                     cfg,
+		hooks:                   hooks,
+		logger:                  logger,
+		now:                     time.Now,
+		pollRetryDelay:          defaultPollRetryDelay,
+		updateProcessingTimeout: defaultUpdateProcessingTimeout,
+		adminLookupTimeout:      defaultAdminLookupTimeout,
+		adminCache:              make(map[int64]adminCacheEntry),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -223,6 +229,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	updateConfig := tgbotapi.NewUpdate(0)
 	updateConfig.Timeout = s.cfg.UpdateTimeout
+	updateConfig.Limit = 1
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -249,7 +256,17 @@ func (s *Service) Run(ctx context.Context) error {
 				continue
 			}
 			updateConfig.Offset = update.UpdateID + 1
-			s.handleUpdate(ctx, update)
+			updateTimeout := s.updateProcessingTimeout
+			if updateTimeout <= 0 {
+				updateTimeout = defaultUpdateProcessingTimeout
+			}
+			updateCtx, cancel := context.WithTimeout(ctx, updateTimeout)
+			s.handleUpdate(updateCtx, update)
+			timedOut := errors.Is(updateCtx.Err(), context.DeadlineExceeded)
+			cancel()
+			if timedOut {
+				s.logger.Warn("telegram update processing timed out", "update_id", update.UpdateID)
+			}
 		}
 	}
 }
@@ -321,7 +338,12 @@ func (s *Service) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery
 func (s *Service) handleCommand(ctx context.Context, msg *tgbotapi.Message) (botResponse, error) {
 	command := strings.ToLower(msg.Command())
 	args := strings.Fields(msg.CommandArguments())
-	admin := s.isAdmin(ctx, msg.Chat.ID, msg.From)
+	admin := false
+	if requiresFreshAdmin(command, s.libraryMode()) {
+		admin = s.isAdminFresh(ctx, msg.Chat.ID, msg.From)
+	} else {
+		admin = s.isAdmin(ctx, msg.Chat.ID, msg.From)
+	}
 	switch command {
 	case "start", "help":
 		return botResponse{text: helpTextForMode(admin, s.libraryMode()), markup: homeKeyboardForMode(admin, s.libraryMode())}, nil
@@ -413,7 +435,12 @@ func (s *Service) routeAction(ctx context.Context, chatID int64, user *tgbotapi.
 	}
 
 	action := strings.ToLower(parts[0])
-	admin := s.isAdmin(ctx, chatID, user)
+	admin := false
+	if requiresFreshAdmin(action, s.libraryMode()) {
+		admin = s.isAdminFresh(ctx, chatID, user)
+	} else {
+		admin = s.isAdmin(ctx, chatID, user)
+	}
 	switch action {
 	case "library":
 		if !s.libraryMode() {
@@ -494,7 +521,10 @@ func (s *Service) routeAction(ctx context.Context, chatID int64, user *tgbotapi.
 }
 
 func (s *Service) handleUpload(ctx context.Context, msg *tgbotapi.Message) (botResponse, error) {
-	if s.libraryMode() && !s.isAdmin(ctx, msg.Chat.ID, msg.From) {
+	if s.libraryMode() && !s.isAdminFresh(ctx, msg.Chat.ID, msg.From) {
+		if err := ctx.Err(); err != nil {
+			return botResponse{}, err
+		}
 		return botResponse{}, errAdminOnly
 	}
 	if s.hooks.EnqueueUpload == nil {
@@ -755,17 +785,39 @@ func (s *Service) isAdmin(ctx context.Context, chatID int64, user *tgbotapi.User
 		s.logger.Warn("get telegram chat administrators", "chat_id", chatID, "error", s.redactError(err))
 		return false
 	}
-	if _, ok := adminIDs[userID]; ok {
-		return true
-	}
+	_, ok := adminIDs[userID]
+	return ok
+}
 
-	adminIDs, _, err = s.getAdminIDs(ctx, chatID, true)
+func (s *Service) isAdminFresh(ctx context.Context, chatID int64, user *tgbotapi.User) bool {
+	if user == nil {
+		return false
+	}
+	timeout := s.adminLookupTimeout
+	if timeout <= 0 {
+		timeout = defaultAdminLookupTimeout
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	adminIDs, _, err := s.getAdminIDs(lookupCtx, chatID, true)
 	if err != nil {
 		s.logger.Warn("refresh telegram chat administrators", "chat_id", chatID, "error", s.redactError(err))
 		return false
 	}
-	_, ok := adminIDs[userID]
+	_, ok := adminIDs[int64(user.ID)]
 	return ok
+}
+
+func requiresFreshAdmin(action string, libraryMode bool) bool {
+	switch action {
+	case "remove", "move", "skip":
+		return true
+	case "scan", "theme", "select":
+		return libraryMode
+	default:
+		return false
+	}
 }
 
 func (s *Service) getAdminIDs(ctx context.Context, chatID int64, force bool) (map[int64]struct{}, bool, error) {
@@ -1328,16 +1380,18 @@ type botAPI interface {
 }
 
 type productionBotAPI struct {
-	updates       *tgbotapi.BotAPI
-	requests      *tgbotapi.BotAPI
-	updateClient  *contextHTTPClient
-	updateMu      sync.Mutex
-	requestClient *contextHTTPClient
-	requestMu     sync.Mutex
+	updates        *tgbotapi.BotAPI
+	requests       *tgbotapi.BotAPI
+	updateClient   *contextHTTPClient
+	updateGate     chan struct{}
+	requestClient  *contextHTTPClient
+	requestGate    chan struct{}
+	requestTimeout time.Duration
 }
 
 type contextHTTPClient struct {
 	base    tgbotapi.HTTPClient
+	mu      sync.RWMutex
 	ctx     context.Context
 	secrets []string
 }
@@ -1363,10 +1417,13 @@ func newProductionBotAPI(cfg Config) (*productionBotAPI, error) {
 	updates.Debug = cfg.Debug
 	requests.Debug = cfg.Debug
 	return &productionBotAPI{
-		updates:       updates,
-		requests:      &requests,
-		updateClient:  updateClient,
-		requestClient: requestClient,
+		updates:        updates,
+		requests:       &requests,
+		updateClient:   updateClient,
+		updateGate:     newContextGate(),
+		requestClient:  requestClient,
+		requestGate:    newContextGate(),
+		requestTimeout: cfg.RequestTimeout,
 	}, nil
 }
 
@@ -1421,39 +1478,64 @@ func (b *productionBotAPI) GetChatAdministrators(ctx context.Context, config tgb
 }
 
 func (b *productionBotAPI) withUpdateContext(ctx context.Context, call func() error) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	b.updateMu.Lock()
-	defer b.updateMu.Unlock()
-	b.updateClient.ctx = ctx
-	defer func() {
-		b.updateClient.ctx = nil
-	}()
-	return call()
+	return withContextGate(ctx, b.requestTimeout, b.updateGate, b.updateClient, call)
 }
 
 func (b *productionBotAPI) withRequestContext(ctx context.Context, call func() error) error {
+	return withContextGate(ctx, b.requestTimeout, b.requestGate, b.requestClient, call)
+}
+
+func newContextGate() chan struct{} {
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
+	return gate
+}
+
+func withContextGate(ctx context.Context, timeout time.Duration, gate chan struct{}, client *contextHTTPClient, call func() error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if gate == nil {
+		return errors.New("telegram context gate is not initialized")
+	}
+	if timeout <= 0 {
+		timeout = defaultRequestTimeout
+	}
+	boundedCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-	b.requestMu.Lock()
-	defer b.requestMu.Unlock()
-	b.requestClient.ctx = ctx
+	select {
+	case <-boundedCtx.Done():
+		return boundedCtx.Err()
+	case <-gate:
+	}
 	defer func() {
-		b.requestClient.ctx = nil
+		gate <- struct{}{}
 	}()
+	if err := boundedCtx.Err(); err != nil {
+		return err
+	}
+
+	client.setContext(boundedCtx)
+	defer client.setContext(nil)
 	return call()
 }
 
 func (c *contextHTTPClient) Do(req *http.Request) (*http.Response, error) {
-	if c.ctx != nil {
-		req = req.WithContext(c.ctx)
+	c.mu.RLock()
+	ctx := c.ctx
+	c.mu.RUnlock()
+	if ctx != nil {
+		req = req.WithContext(ctx)
 	}
 	resp, err := c.base.Do(req)
 	return resp, secret.RedactError(err, c.secrets...)
+}
+
+func (c *contextHTTPClient) setContext(ctx context.Context) {
+	c.mu.Lock()
+	c.ctx = ctx
+	c.mu.Unlock()
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) error {
