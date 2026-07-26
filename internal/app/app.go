@@ -23,18 +23,20 @@ import (
 )
 
 type Service struct {
-	cfg    config.Config
-	logger *slog.Logger
-	store  *queue.Store
-	libDB  *medialib.StateStore
-	media  *media.Manager
-	obs    obsController
-	bot    telegramMessenger
-	now    func() time.Time
-	rng    *rand.Rand
+	cfg        config.Config
+	logger     *slog.Logger
+	store      *queue.Store
+	libDB      *medialib.StateStore
+	media      *media.Manager
+	obs        obsController
+	bot        telegramMessenger
+	now        func() time.Time
+	rng        *rand.Rand
+	removeFile func(string) error
 
 	mu                    sync.Mutex
 	playbackMu            sync.Mutex
+	storageMu             sync.Mutex
 	lastErr               string
 	playback              playbackKind
 	randomFallbackID      int64
@@ -88,6 +90,7 @@ const (
 	obsConnectAttemptTimeout = 15 * time.Second
 	uploadProbeTimeout       = 2 * time.Minute
 	uploadFailureTimeout     = 5 * time.Second
+	retentionBatchSize       = 256
 	mediaProgressGrace       = 2 * time.Minute
 	mediaProgressHardGrace   = 2 * mediaProgressGrace
 	mediaCursorEpsilonMillis = 1.0
@@ -178,16 +181,17 @@ func New(cfg config.Config, logger *slog.Logger) (*Service, error) {
 	}
 
 	service := &Service{
-		cfg:      cfg,
-		logger:   logger,
-		store:    store,
-		libDB:    libDB,
-		media:    manager,
-		obs:      obsClient,
-		now:      time.Now,
-		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
-		playback: playbackIdle,
-		shutdown: []func() error{obsClient.Close, store.Close},
+		cfg:        cfg,
+		logger:     logger,
+		store:      store,
+		libDB:      libDB,
+		media:      manager,
+		obs:        obsClient,
+		now:        time.Now,
+		rng:        rand.New(rand.NewSource(time.Now().UnixNano())),
+		removeFile: media.RemoveFile,
+		playback:   playbackIdle,
+		shutdown:   []func() error{obsClient.Close, store.Close},
 	}
 	if libDB != nil {
 		service.shutdown = append(service.shutdown, libDB.Close)
@@ -274,12 +278,9 @@ func (s *Service) Run(ctx context.Context) error {
 			cancel()
 			return err
 		case <-cleanupTicker.C:
-			if s.libraryMode() {
-				continue
-			}
-			if err := s.CleanupRetention(ctx); err != nil {
+			if err := s.performMaintenance(ctx); err != nil {
 				s.setLastErr(err)
-				s.logger.Warn("retention cleanup failed", "error", s.redactError(err))
+				s.logger.Warn("periodic maintenance failed", "error", s.redactError(err))
 			}
 		}
 	}
@@ -301,34 +302,9 @@ func (s *Service) EnqueueUpload(ctx context.Context, req UploadRequest) (queue.V
 		s.setLastErr(err)
 		return queue.Video{}, err
 	}
-	if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, req.LocalPath); err != nil {
-		s.setLastErr(err)
-		return queue.Video{}, err
-	}
-
-	length, err := s.store.QueueLength(ctx)
-	if err != nil {
-		s.setLastErr(err)
-		return queue.Video{}, err
-	}
-	if length >= s.cfg.MaxQueueLength {
-		err := publicError(fmt.Sprintf("佇列已滿，目前上限是 %d 支", s.cfg.MaxQueueLength))
-		s.setLastErr(err)
-		return queue.Video{}, err
-	}
-
-	fileName := CleanFileName(req.FileName)
-	video, err := s.store.AddDownloading(ctx, queue.Video{
-		TelegramFileID:   req.TelegramFileID,
-		TelegramUniqueID: req.TelegramUniqueID,
-		SubmitterID:      req.SubmitterID,
-		SubmitterName:    req.SubmitterName,
-		ChatID:           req.ChatID,
-		MessageID:        req.MessageID,
-		FileName:         fileName,
-		MimeType:         req.MimeType,
-		SizeBytes:        req.SizeBytes,
-	})
+	s.storageMu.Lock()
+	video, err := s.addDownloadingUpload(ctx, req)
+	s.storageMu.Unlock()
 	if err != nil {
 		s.setLastErr(err)
 		return queue.Video{}, err
@@ -350,6 +326,7 @@ func (s *Service) EnqueueUpload(ctx context.Context, req UploadRequest) (queue.V
 
 	ready, err := s.store.MarkReady(ctx, video.ID, req.LocalPath, meta.SizeBytes, meta.DurationSeconds)
 	if err != nil {
+		s.markUploadFailed(ctx, video.ID, err)
 		s.setLastErr(err)
 		return queue.Video{}, err
 	}
@@ -357,6 +334,31 @@ func (s *Service) EnqueueUpload(ctx context.Context, req UploadRequest) (queue.V
 		s.logger.Warn("play after enqueue failed", "error", s.redactError(err))
 	}
 	return ready, nil
+}
+
+func (s *Service) addDownloadingUpload(ctx context.Context, req UploadRequest) (queue.Video, error) {
+	if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, req.LocalPath); err != nil {
+		return queue.Video{}, err
+	}
+	length, err := s.store.QueueLength(ctx)
+	if err != nil {
+		return queue.Video{}, err
+	}
+	if length >= s.cfg.MaxQueueLength {
+		return queue.Video{}, publicError(fmt.Sprintf("佇列已滿，目前上限是 %d 支", s.cfg.MaxQueueLength))
+	}
+	return s.store.AddDownloading(ctx, queue.Video{
+		TelegramFileID:   req.TelegramFileID,
+		TelegramUniqueID: req.TelegramUniqueID,
+		SubmitterID:      req.SubmitterID,
+		SubmitterName:    req.SubmitterName,
+		ChatID:           req.ChatID,
+		MessageID:        req.MessageID,
+		FileName:         CleanFileName(req.FileName),
+		LocalPath:        req.LocalPath,
+		MimeType:         req.MimeType,
+		SizeBytes:        req.SizeBytes,
+	})
 }
 
 func (s *Service) advancePlayback(ctx context.Context) (*queue.Video, error) {
@@ -409,7 +411,7 @@ func (s *Service) advancePlaybackLockedAfter(ctx context.Context, expectedCurren
 			return nil, s.advanceFallbackLocked(ctx)
 		}
 		if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, video.LocalPath); err != nil {
-			if markErr := s.store.MarkFailed(ctx, video.ID, err.Error()); markErr != nil {
+			if _, markErr := s.store.FailReady(ctx, video.ID, err.Error()); markErr != nil {
 				s.setLastErr(markErr)
 				return nil, markErr
 			}
@@ -484,7 +486,7 @@ func (s *Service) recoverPlaybackAfterOBSConnect(ctx context.Context) error {
 	}
 	if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, current.LocalPath); err != nil {
 		recoveryErr := fmt.Errorf("current video #%d media path is invalid: %w", current.ID, err)
-		if markErr := s.store.MarkFailed(ctx, current.ID, recoveryErr.Error()); markErr != nil {
+		if _, markErr := s.store.FailPlaying(ctx, current.ID, recoveryErr.Error()); markErr != nil {
 			return markErr
 		}
 		s.setLastErr(recoveryErr)
@@ -860,16 +862,22 @@ func (s *Service) playFallbackFileLocked(ctx context.Context) error {
 }
 
 func (s *Service) playRandomFallbackLocked(ctx context.Context) (*queue.Video, error) {
-	candidates, err := s.store.PlayedFallbackCandidates(ctx, 0)
+	candidates, err := s.store.PlayedFallbackCandidates(ctx, queue.MaxFallbackCandidates)
 	if err != nil {
 		s.setLastErr(err)
 		return nil, err
 	}
-	for len(candidates) > 0 {
-		idx := rand.Intn(len(candidates))
+	order := rand.Perm(len(candidates))
+	if s.rng != nil {
+		order = s.rng.Perm(len(candidates))
+	}
+	for _, idx := range order {
 		video := candidates[idx]
-		candidates = append(candidates[:idx], candidates[idx+1:]...)
 		if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, video.LocalPath); err != nil {
+			if _, markErr := s.store.QuarantinePlayed(ctx, video.ID, err.Error()); markErr != nil {
+				s.setLastErr(markErr)
+				return nil, markErr
+			}
 			s.logger.Warn("skip invalid random fallback file", "video_id", video.ID, "path", s.redactString(video.LocalPath), "error", s.redactError(err))
 			continue
 		}
@@ -1302,7 +1310,17 @@ func (s *Service) queueEndedEventIsTooEarly(event obs.Event, current queue.Video
 }
 
 func (s *Service) recoverStartupState(ctx context.Context) error {
-	count, err := s.store.FailStaleDownloading(ctx, staleDownloadingAge, "startup recovery: stale downloading item")
+	return s.failStaleDownloading(ctx, "startup recovery: stale downloading item")
+}
+
+func (s *Service) performMaintenance(ctx context.Context) error {
+	staleErr := s.failStaleDownloading(ctx, "periodic recovery: stale downloading item")
+	retentionErr := s.CleanupRetention(ctx)
+	return errors.Join(staleErr, retentionErr)
+}
+
+func (s *Service) failStaleDownloading(ctx context.Context, cause string) error {
+	count, err := s.store.FailStaleDownloading(ctx, staleDownloadingAge, cause)
 	if err != nil {
 		return err
 	}
@@ -1313,65 +1331,157 @@ func (s *Service) recoverStartupState(ctx context.Context) error {
 }
 
 func (s *Service) CleanupRetention(ctx context.Context) error {
-	if s.cfg.RetentionMaxAge() <= 0 && s.cfg.RetentionMaxFiles <= 0 {
+	maxAge := s.cfg.RetentionMaxAge()
+	maxFiles := s.cfg.RetentionMaxFiles
+	if maxAge <= 0 && maxFiles <= 0 {
 		return nil
 	}
-	videos, err := s.store.Played(ctx)
+	s.playbackMu.Lock()
+	defer s.playbackMu.Unlock()
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+
+	fallbackID, fallbackPath := s.randomFallbackLock()
+	playedCount, err := s.store.TerminalCount(ctx, queue.StatusPlayed)
 	if err != nil {
 		return err
 	}
-	deleteIDs := make(map[int64]queue.Video)
-	fallbackID, fallbackPath := s.randomFallbackLock()
-	if maxAge := s.cfg.RetentionMaxAge(); maxAge > 0 {
-		cutoff := time.Now().UTC().Add(-maxAge)
-		for _, video := range videos {
-			if video.FinishedAt != nil && video.FinishedAt.Before(cutoff) {
-				deleteIDs[video.ID] = video
-			}
-		}
+	failedCanceledCount, err := s.store.TerminalCount(ctx, queue.StatusFailed, queue.StatusCanceled)
+	if err != nil {
+		return err
 	}
-	if s.cfg.RetentionMaxFiles > 0 && len(videos) > s.cfg.RetentionMaxFiles {
-		for _, video := range videos[:len(videos)-s.cfg.RetentionMaxFiles] {
-			deleteIDs[video.ID] = video
-		}
+	var cutoff time.Time
+	if maxAge > 0 {
+		cutoff = s.nowUTC().Add(-maxAge)
 	}
-	for _, video := range deleteIDs {
-		if video.ID == fallbackID || (fallbackPath != "" && video.LocalPath == fallbackPath) {
+
+	remaining := retentionBatchSize
+	scanned, deleted, err := s.cleanupTerminalGroup(
+		ctx,
+		[]queue.Status{queue.StatusPlayed},
+		playedCount,
+		maxFiles,
+		cutoff,
+		fallbackID,
+		fallbackPath,
+		remaining/2,
+	)
+	if err != nil {
+		return err
+	}
+	remaining -= scanned
+	playedCount -= deleted
+	scanned, _, err = s.cleanupTerminalGroup(
+		ctx,
+		[]queue.Status{queue.StatusFailed, queue.StatusCanceled},
+		failedCanceledCount,
+		maxFiles,
+		cutoff,
+		0,
+		"",
+		remaining,
+	)
+	if err != nil {
+		return err
+	}
+	remaining -= scanned
+	if remaining == 0 {
+		return nil
+	}
+	_, _, err = s.cleanupTerminalGroup(
+		ctx,
+		[]queue.Status{queue.StatusPlayed},
+		playedCount,
+		maxFiles,
+		cutoff,
+		fallbackID,
+		fallbackPath,
+		remaining,
+	)
+	return err
+}
+
+func (s *Service) cleanupTerminalGroup(
+	ctx context.Context,
+	statuses []queue.Status,
+	count int,
+	maxFiles int,
+	cutoff time.Time,
+	protectedID int64,
+	protectedPath string,
+	limit int,
+) (int, int, error) {
+	if limit <= 0 || (cutoff.IsZero() && (maxFiles <= 0 || count <= maxFiles)) {
+		return 0, 0, nil
+	}
+	videos, err := s.store.OldestTerminal(ctx, statuses, limit)
+	if err != nil {
+		return 0, 0, err
+	}
+	deletedCount := 0
+	for _, video := range videos {
+		expired := !cutoff.IsZero() && terminalTime(video).Before(cutoff)
+		excess := maxFiles > 0 && count > maxFiles
+		if !expired && !excess {
 			continue
 		}
+		if video.ID == protectedID {
+			continue
+		}
+
 		deleteLocalFile := false
-		if s.cfg.RetentionDeleteLocalFiles {
+		if s.cfg.RetentionDeleteLocalFiles && (protectedPath == "" || video.LocalPath != protectedPath) {
 			referenced, err := s.store.LocalPathReferenced(ctx, video.LocalPath, video.ID)
 			if err != nil {
-				return err
+				return 0, 0, err
 			}
 			deleteLocalFile = !referenced
 		}
-		if err := s.store.Delete(ctx, video.ID); err != nil {
-			return err
-		}
 		if deleteLocalFile {
 			if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, video.LocalPath); err != nil {
-				s.logger.Warn("skip retention local file delete", "video_id", video.ID, "path", s.redactString(video.LocalPath), "error", s.redactError(err))
-				continue
-			}
-			if err := media.RemoveFile(video.LocalPath); err != nil {
-				return err
+				if !errors.Is(err, os.ErrNotExist) {
+					s.logger.Warn("skip retention local file delete", "video_id", video.ID, "path", s.redactString(video.LocalPath), "error", s.redactError(err))
+				}
+			} else {
+				removeFile := s.removeFile
+				if removeFile == nil {
+					removeFile = media.RemoveFile
+				}
+				if err := removeFile(video.LocalPath); err != nil {
+					return 0, 0, err
+				}
 			}
 		}
+		deleted, err := s.store.DeleteTerminal(ctx, video.ID, video.Status)
+		if err != nil {
+			return 0, 0, err
+		}
+		if !deleted {
+			continue
+		}
+		count--
+		deletedCount++
 	}
-	return nil
+	return len(videos), deletedCount, nil
+}
+
+func terminalTime(video queue.Video) time.Time {
+	if video.FinishedAt != nil {
+		return *video.FinishedAt
+	}
+	return video.UpdatedAt
 }
 
 func (s *Service) markUploadFailed(ctx context.Context, id int64, cause error) {
-	failCtx := ctx
-	cancel := func() {}
-	if ctx.Err() != nil {
-		failCtx, cancel = context.WithTimeout(context.Background(), uploadFailureTimeout)
-	}
+	failCtx, cancel := context.WithTimeout(context.Background(), uploadFailureTimeout)
 	defer cancel()
-	if err := s.store.MarkFailed(failCtx, id, cause.Error()); err != nil {
+	changed, err := s.store.MarkFailed(failCtx, id, cause.Error())
+	if err != nil {
 		s.logger.Warn("mark upload failed", "video_id", id, "error", s.redactError(err))
+		return
+	}
+	if !changed && ctx.Err() == nil {
+		s.logger.Debug("upload failure state already changed", "video_id", id)
 	}
 }
 

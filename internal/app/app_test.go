@@ -959,6 +959,43 @@ func TestCleanupRetentionDeletesLocalBotAPIFileWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestCleanupRetentionKeepsRowWhenOptInFileDeleteFailsAndRetries(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newFallbackTestService(t, config.Config{
+		FallbackMode:              "random_played",
+		RetentionMaxFiles:         1,
+		RetentionDays:             0,
+		RetentionDeleteLocalFiles: true,
+	})
+	removeCandidate := addPlayedVideo(t, ctx, svc, "retry-old.mp4", true)
+	_ = addPlayedVideo(t, ctx, svc, "retry-new.mp4", true)
+	removeErr := errors.New("simulated remove permission error")
+	svc.removeFile = func(string) error {
+		return removeErr
+	}
+
+	if err := svc.CleanupRetention(ctx); !errors.Is(err, removeErr) {
+		t.Fatalf("first cleanup error = %v, want %v", err, removeErr)
+	}
+	if _, err := svc.store.Get(ctx, removeCandidate.ID); err != nil {
+		t.Fatalf("row must remain after file removal failure: %v", err)
+	}
+	if !fileExists(removeCandidate.LocalPath) {
+		t.Fatal("file should remain after simulated removal failure")
+	}
+
+	svc.removeFile = media.RemoveFile
+	if err := svc.CleanupRetention(ctx); err != nil {
+		t.Fatalf("retry cleanup: %v", err)
+	}
+	if _, err := svc.store.Get(ctx, removeCandidate.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("row after retry error = %v, want sql.ErrNoRows", err)
+	}
+	if fileExists(removeCandidate.LocalPath) {
+		t.Fatal("file should be removed after successful retry")
+	}
+}
+
 func TestCleanupRetentionDoesNotDeleteSharedLocalPath(t *testing.T) {
 	ctx := context.Background()
 	svc, _, _ := newFallbackTestService(t, config.Config{
@@ -984,6 +1021,150 @@ func TestCleanupRetentionDoesNotDeleteSharedLocalPath(t *testing.T) {
 	}
 	if !fileExists(sharedPath) {
 		t.Fatalf("shared local bot api file should remain while another row references it")
+	}
+}
+
+func TestCleanupRetentionSerializesWithFallbackSelectionAndProtectsSharedActivePath(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newFallbackTestService(t, config.Config{
+		FallbackMode:              "random_played",
+		RetentionMaxFiles:         1,
+		RetentionDays:             0,
+		RetentionDeleteLocalFiles: true,
+	})
+	sharedPath := filepath.Join(svc.cfg.TelegramBotAPIDir, "active-shared.mp4")
+	writeTestFile(t, sharedPath)
+	active := addPlayedVideoWithPath(t, ctx, svc, "active.mp4", sharedPath)
+	duplicate := addPlayedVideoWithPath(t, ctx, svc, "duplicate.mp4", sharedPath)
+	removeCandidate := addPlayedVideo(t, ctx, svc, "remove.mp4", true)
+
+	svc.playbackMu.Lock()
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		done <- svc.CleanupRetention(ctx)
+	}()
+	<-started
+	select {
+	case err := <-done:
+		svc.playbackMu.Unlock()
+		t.Fatalf("cleanup bypassed playback lock: %v", err)
+	default:
+	}
+	svc.setPlaybackState(playbackRandom, active.ID, active.LocalPath)
+	svc.playbackMu.Unlock()
+
+	if err := <-done; err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if _, err := svc.store.Get(ctx, active.ID); err != nil {
+		t.Fatalf("active row should remain: %v", err)
+	}
+	for _, video := range []queue.Video{duplicate, removeCandidate} {
+		if _, err := svc.store.Get(ctx, video.ID); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("unprotected row #%d get error = %v, want sql.ErrNoRows", video.ID, err)
+		}
+	}
+	if !fileExists(sharedPath) {
+		t.Fatal("active fallback path should remain")
+	}
+}
+
+func TestCleanupRetentionDuplicateActivePathsDoNotStarveNewerRows(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newFallbackTestService(t, config.Config{
+		FallbackMode:              "random_played",
+		RetentionMaxFiles:         1,
+		RetentionDays:             0,
+		RetentionDeleteLocalFiles: true,
+	})
+	sharedPath := filepath.Join(svc.cfg.TelegramBotAPIDir, "many-active-shared.mp4")
+	writeTestFile(t, sharedPath)
+	active := addPlayedVideoWithPath(t, ctx, svc, "many-active.mp4", sharedPath)
+	for i := 0; i < retentionBatchSize/2+12; i++ {
+		_ = addPlayedVideoWithPath(t, ctx, svc, fmt.Sprintf("duplicate-active-%03d.mp4", i), sharedPath)
+	}
+	svc.setPlaybackState(playbackRandom, active.ID, active.LocalPath)
+
+	if err := svc.CleanupRetention(ctx); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	count, err := svc.store.TerminalCount(ctx, queue.StatusPlayed)
+	if err != nil {
+		t.Fatalf("played count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("duplicate active paths blocked retention: played count=%d, want 1", count)
+	}
+	if _, err := svc.store.Get(ctx, active.ID); err != nil {
+		t.Fatalf("active row should remain: %v", err)
+	}
+	if !fileExists(sharedPath) {
+		t.Fatal("shared active file must not be deleted with duplicate rows")
+	}
+}
+
+func TestCleanupRetentionHardCapsEachMaintenanceAndEventuallyBoundsFailedCanceled(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	svc, _, _ := newFallbackTestServiceAtDBPath(t, config.Config{
+		RetentionMaxFiles: 10,
+		RetentionDays:     0,
+	}, dbPath)
+	seedTerminalRowsAtDBPath(t, ctx, dbPath, queue.StatusFailed, 300)
+	seedTerminalRowsAtDBPath(t, ctx, dbPath, queue.StatusCanceled, 300)
+
+	if err := svc.CleanupRetention(ctx); err != nil {
+		t.Fatalf("first cleanup: %v", err)
+	}
+	count, err := svc.store.TerminalCount(ctx, queue.StatusFailed, queue.StatusCanceled)
+	if err != nil {
+		t.Fatalf("terminal count after first cleanup: %v", err)
+	}
+	if count != 600-retentionBatchSize {
+		t.Fatalf("first cleanup removed %d rows, want hard cap %d", 600-count, retentionBatchSize)
+	}
+	for i := 0; i < 2; i++ {
+		if err := svc.CleanupRetention(ctx); err != nil {
+			t.Fatalf("cleanup pass %d: %v", i+2, err)
+		}
+	}
+	count, err = svc.store.TerminalCount(ctx, queue.StatusFailed, queue.StatusCanceled)
+	if err != nil {
+		t.Fatalf("terminal count after convergence: %v", err)
+	}
+	if count != 10 {
+		t.Fatalf("terminal count after convergence = %d, want 10", count)
+	}
+}
+
+func TestCleanupRetentionGroupsCannotStarveEachOther(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	svc, _, _ := newFallbackTestServiceAtDBPath(t, config.Config{
+		RetentionMaxFiles: 300,
+		RetentionDays:     0,
+	}, dbPath)
+	seedTerminalRowsAtDBPath(t, ctx, dbPath, queue.StatusFailed, 256)
+	seedTerminalRowsAtDBPath(t, ctx, dbPath, queue.StatusPlayed, 400)
+
+	if err := svc.CleanupRetention(ctx); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	failedCount, err := svc.store.TerminalCount(ctx, queue.StatusFailed, queue.StatusCanceled)
+	if err != nil {
+		t.Fatalf("failed count: %v", err)
+	}
+	if failedCount != 256 {
+		t.Fatalf("ineligible failed rows changed: got %d, want 256", failedCount)
+	}
+	playedCount, err := svc.store.TerminalCount(ctx, queue.StatusPlayed)
+	if err != nil {
+		t.Fatalf("played count: %v", err)
+	}
+	if playedCount >= 400 {
+		t.Fatalf("older ineligible failed rows starved played cleanup: played count=%d", playedCount)
 	}
 }
 
@@ -1023,6 +1204,41 @@ func TestRandomFallbackSearchesPastNewestInvalidCandidates(t *testing.T) {
 	}
 	if video == nil || video.ID != validOlder.ID {
 		t.Fatalf("fallback video = %#v, want older valid id %d", video, validOlder.ID)
+	}
+	if fakeOBS.lastPlayed != validOlder.LocalPath {
+		t.Fatalf("played path = %q, want %q", fakeOBS.lastPlayed, validOlder.LocalPath)
+	}
+}
+
+func TestRandomFallbackQuarantinesAtMostOneBoundedBatchPerAttempt(t *testing.T) {
+	ctx := context.Background()
+	svc, fakeOBS, _ := newFallbackTestService(t, config.Config{FallbackMode: "random_played"})
+	validOlder := addPlayedVideo(t, ctx, svc, "valid-beyond-first-batch.mp4", true)
+	for i := 0; i < queue.MaxFallbackCandidates+44; i++ {
+		_ = addPlayedVideo(t, ctx, svc, fmt.Sprintf("missing-bounded-%03d.mp4", i), false)
+	}
+
+	video, err := svc.playRandomFallbackLocked(ctx)
+	if err != nil {
+		t.Fatalf("first bounded fallback attempt: %v", err)
+	}
+	if video != nil {
+		t.Fatalf("first bounded fallback attempt = %#v, want nil", video)
+	}
+	failedCount, err := svc.store.TerminalCount(ctx, queue.StatusFailed)
+	if err != nil {
+		t.Fatalf("failed count: %v", err)
+	}
+	if failedCount != queue.MaxFallbackCandidates {
+		t.Fatalf("quarantined %d rows, want one bounded batch of %d", failedCount, queue.MaxFallbackCandidates)
+	}
+
+	video, err = svc.playRandomFallbackLocked(ctx)
+	if err != nil {
+		t.Fatalf("second bounded fallback attempt: %v", err)
+	}
+	if video == nil || video.ID != validOlder.ID {
+		t.Fatalf("second fallback = %#v, want older valid id %d", video, validOlder.ID)
 	}
 	if fakeOBS.lastPlayed != validOlder.LocalPath {
 		t.Fatalf("played path = %q, want %q", fakeOBS.lastPlayed, validOlder.LocalPath)
@@ -1127,6 +1343,132 @@ func TestEnqueueUploadMarksFailedWhenValidateFails(t *testing.T) {
 		t.Fatalf("enqueue upload should fail")
 	}
 	assertFailedUploadVisible(t, ctx, svc, "too-long.mp4", "video exceeds max duration")
+}
+
+func TestUploadFailureFinalizationIgnoresCallerCancellationAndCannotOverwriteCancel(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newLocalUploadTestService(t, config.Config{})
+	path := writeBotAPIFile(t, svc, "finalize.mp4")
+	downloading, err := svc.store.AddDownloading(ctx, queue.Video{
+		TelegramFileID:   "finalize",
+		TelegramUniqueID: "finalize",
+		FileName:         "finalize.mp4",
+		LocalPath:        path,
+	})
+	if err != nil {
+		t.Fatalf("add downloading: %v", err)
+	}
+
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	svc.markUploadFailed(canceledCtx, downloading.ID, errors.New("caller canceled"))
+	failed, err := svc.store.Get(ctx, downloading.ID)
+	if err != nil {
+		t.Fatalf("get finalized upload: %v", err)
+	}
+	if failed.Status != queue.StatusFailed || failed.FinishedAt == nil {
+		t.Fatalf("finalized upload = %#v, want failed with finished_at", failed)
+	}
+
+	canceledUpload, err := svc.store.AddDownloading(ctx, queue.Video{
+		TelegramFileID:   "already-canceled",
+		TelegramUniqueID: "already-canceled",
+		FileName:         "already-canceled.mp4",
+		LocalPath:        path,
+	})
+	if err != nil {
+		t.Fatalf("add canceled upload: %v", err)
+	}
+	if err := svc.store.Cancel(ctx, canceledUpload.ID); err != nil {
+		t.Fatalf("cancel upload: %v", err)
+	}
+	svc.markUploadFailed(ctx, canceledUpload.ID, errors.New("late probe failure"))
+	storedCanceled, err := svc.store.Get(ctx, canceledUpload.ID)
+	if err != nil {
+		t.Fatalf("get canceled upload: %v", err)
+	}
+	if storedCanceled.Status != queue.StatusCanceled || storedCanceled.Error != "" {
+		t.Fatalf("late failure overwrote canceled row: %#v", storedCanceled)
+	}
+}
+
+func TestEnqueueUploadFinalizesDownloadingWhenSQLiteMarkReadyFails(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	svc, _, _ := newLocalUploadTestServiceAtDBPath(t, config.Config{
+		MaxVideoSizeBytes:       1024,
+		MaxVideoDurationSeconds: 120,
+	}, dbPath)
+	path := writeBotAPIFile(t, svc, "sqlite-full.mp4")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite trigger connection: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TRIGGER fail_mark_ready
+BEFORE UPDATE OF status ON videos
+WHEN OLD.status = 'downloading' AND NEW.status = 'ready'
+BEGIN
+	SELECT RAISE(ABORT, 'database or disk is full');
+END;
+`); err != nil {
+		_ = db.Close()
+		t.Fatalf("create mark-ready failure trigger: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close sqlite trigger connection: %v", err)
+	}
+
+	_, err = svc.EnqueueUpload(ctx, UploadRequest{
+		LocalPath:        path,
+		TelegramFileID:   "sqlite-full",
+		TelegramUniqueID: "sqlite-full",
+		FileName:         "sqlite-full.mp4",
+		SizeBytes:        5,
+	})
+	if err == nil || !strings.Contains(err.Error(), "database or disk is full") {
+		t.Fatalf("enqueue error = %v, want simulated SQLITE_FULL", err)
+	}
+	assertFailedUploadVisible(t, ctx, svc, "sqlite-full.mp4", "constraint failed: database or disk is full")
+}
+
+func TestPeriodicMaintenanceFailsStaleDownloadingRows(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	svc, _, _ := newFallbackTestServiceAtDBPath(t, config.Config{}, dbPath)
+	video, err := svc.store.AddDownloading(ctx, queue.Video{
+		TelegramFileID:   "stale-periodic",
+		TelegramUniqueID: "stale-periodic",
+		FileName:         "stale-periodic.mp4",
+		LocalPath:        filepath.Join(svc.cfg.TelegramBotAPIDir, "stale-periodic.mp4"),
+	})
+	if err != nil {
+		t.Fatalf("add downloading: %v", err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite maintenance connection: %v", err)
+	}
+	old := time.Now().UTC().Add(-staleDownloadingAge - time.Hour).Format(time.RFC3339Nano)
+	if _, err := db.ExecContext(ctx, `UPDATE videos SET created_at = ?, updated_at = ? WHERE id = ?`, old, old, video.ID); err != nil {
+		_ = db.Close()
+		t.Fatalf("age downloading row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close maintenance connection: %v", err)
+	}
+
+	if err := svc.performMaintenance(ctx); err != nil {
+		t.Fatalf("perform maintenance: %v", err)
+	}
+	stored, err := svc.store.Get(ctx, video.ID)
+	if err != nil {
+		t.Fatalf("get stale row: %v", err)
+	}
+	if stored.Status != queue.StatusFailed || !strings.Contains(stored.Error, "periodic recovery") {
+		t.Fatalf("stale row = %#v, want periodic failed transition", stored)
+	}
 }
 
 func TestEnqueueUploadRejectsPathOutsideLocalBotAPIDir(t *testing.T) {
@@ -2740,6 +3082,9 @@ func assertFailedUploadVisible(t *testing.T, ctx context.Context, svc *Service, 
 	if video.Status != queue.StatusFailed {
 		t.Fatalf("status = %s, want %s", video.Status, queue.StatusFailed)
 	}
+	if video.LocalPath == "" {
+		t.Fatal("failed upload must retain its Local Bot API path")
+	}
 	if !strings.Contains(video.Error, errText) {
 		t.Fatalf("row error = %q, want %q", video.Error, errText)
 	}
@@ -2771,6 +3116,7 @@ func newFallbackTestService(t *testing.T, cfg config.Config) (*Service, *fakeOBS
 func newFallbackTestServiceAtDBPath(t *testing.T, cfg config.Config, dbPath string) (*Service, *fakeOBS, *fakeBot) {
 	t.Helper()
 	ctx := context.Background()
+	cfg.DatabasePath = dbPath
 	store, err := queue.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -2803,13 +3149,19 @@ func newFallbackTestServiceAtDBPath(t *testing.T, cfg config.Config, dbPath stri
 		obs:      fakeOBS,
 		bot:      fakeBot,
 		now:      time.Now,
+		rng:      rand.New(rand.NewSource(1)),
 		playback: playbackIdle,
 	}, fakeOBS, fakeBot
 }
 
 func newLocalUploadTestService(t *testing.T, cfg config.Config) (*Service, *fakeOBS, *fakeBot) {
 	t.Helper()
-	svc, fakeOBS, fakeBot := newFallbackTestService(t, cfg)
+	return newLocalUploadTestServiceAtDBPath(t, cfg, filepath.Join(t.TempDir(), "queue.db"))
+}
+
+func newLocalUploadTestServiceAtDBPath(t *testing.T, cfg config.Config, dbPath string) (*Service, *fakeOBS, *fakeBot) {
+	t.Helper()
+	svc, fakeOBS, fakeBot := newFallbackTestServiceAtDBPath(t, cfg, dbPath)
 	manager, err := media.NewManager(t.TempDir(), fakeFFProbe(t, 60))
 	if err != nil {
 		t.Fatalf("new media manager: %v", err)
@@ -2957,6 +3309,45 @@ func markReadyVideoPlayed(t *testing.T, ctx context.Context, svc *Service, ready
 		t.Fatalf("get played: %v", err)
 	}
 	return played
+}
+
+func seedTerminalRowsAtDBPath(t *testing.T, ctx context.Context, dbPath string, status queue.Status, count int) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open terminal seed database: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin terminal seed: %v", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx, `
+INSERT INTO videos (
+	telegram_file_id, telegram_unique_id, submitter_id, submitter_name, chat_id, message_id,
+	file_name, local_path, mime_type, size_bytes, duration_seconds, queue_position, status,
+	error, created_at, updated_at, finished_at
+) VALUES (?, ?, 0, '', 0, 0, ?, '', 'video/mp4', 100, 60, 0, ?, '', ?, ?, ?)
+`)
+	if err != nil {
+		t.Fatalf("prepare terminal seed: %v", err)
+	}
+	base := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < count; i++ {
+		name := fmt.Sprintf("%s-seed-%06d.mp4", status, i)
+		at := base.Add(time.Duration(i) * time.Second).Format(time.RFC3339Nano)
+		if _, err := stmt.ExecContext(ctx, name, name, name, string(status), at, at, at); err != nil {
+			_ = stmt.Close()
+			t.Fatalf("seed terminal row %d: %v", i, err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		t.Fatalf("close terminal seed statement: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit terminal seed: %v", err)
+	}
 }
 
 func writeTestFile(t *testing.T, path string) {
