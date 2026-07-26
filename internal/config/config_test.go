@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadReadsDotEnvAndDefaults(t *testing.T) {
@@ -298,7 +300,46 @@ func TestLoadAllowsZeroDurationAndRetentionLimits(t *testing.T) {
 	}
 }
 
-func TestRunShDoctorStorageRangesMatchGoConfig(t *testing.T) {
+func TestLoadRetentionDaysBoundaries(t *testing.T) {
+	tests := []struct {
+		name    string
+		days    int
+		wantErr string
+	}{
+		{name: "zero", days: 0},
+		{name: "maximum", days: maxRetentionDays},
+		{name: "above maximum", days: maxRetentionDays + 1, wantErr: "RETENTION_DAYS must be at most 106751"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			chdirTemp(t)
+			setValidConfigEnv(t)
+			t.Setenv("RETENTION_DAYS", strconv.Itoa(tt.days))
+
+			cfg, err := Load()
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if cfg.RetentionDays != tt.days {
+				t.Fatalf("retention days = %d, want %d", cfg.RetentionDays, tt.days)
+			}
+			wantAge := time.Duration(tt.days) * 24 * time.Hour
+			if got := cfg.RetentionMaxAge(); got != wantAge {
+				t.Fatalf("retention max age = %s, want %s", got, wantAge)
+			}
+		})
+	}
+}
+
+func TestRunShDoctorNumericRangesMatchGoConfig(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join("..", "..", "run.sh"))
 	if err != nil {
 		t.Fatalf("read run.sh: %v", err)
@@ -306,6 +347,7 @@ func TestRunShDoctorStorageRangesMatchGoConfig(t *testing.T) {
 	for _, want := range []string{
 		fmt.Sprintf(`"MAX_VIDEO_SIZE_MB:2000:1:%d"`, maxStorageMiB),
 		fmt.Sprintf(`"MIN_FREE_DISK_MB:512:0:%d"`, maxStorageMiB),
+		fmt.Sprintf(`"RETENTION_DAYS:7:0:%d"`, maxRetentionDays),
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("run.sh doctor range does not match Go limit; missing %q", want)

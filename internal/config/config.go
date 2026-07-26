@@ -16,6 +16,8 @@ const (
 	currentEnvSchemaVersion = 5
 	bytesPerMiB             = int64(1024 * 1024)
 	maxStorageMiB           = int64(^uint64(0)>>1) / bytesPerMiB
+	// maxRetentionDays is the largest whole-day window representable by time.Duration.
+	maxRetentionDays = int((1<<63 - 1) / (24 * time.Hour))
 )
 
 type Config struct {
@@ -174,6 +176,9 @@ func Load() (Config, error) {
 	}
 	if cfg.RetentionDays < 0 {
 		return cfg, errors.New("RETENTION_DAYS must be non-negative")
+	}
+	if cfg.RetentionDays > maxRetentionDays {
+		return cfg, fmt.Errorf("RETENTION_DAYS must be at most %d", maxRetentionDays)
 	}
 	if cfg.RetentionMaxFiles < 0 {
 		return cfg, errors.New("RETENTION_MAX_FILES must be non-negative")
