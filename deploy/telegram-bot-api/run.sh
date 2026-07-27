@@ -69,7 +69,9 @@ case "$TELEGRAM_BOT_API_DIR" in
   *) BOT_API_DIR="$REPO_ROOT/$TELEGRAM_BOT_API_DIR" ;;
 esac
 
-mkdir -p "$BOT_API_DIR"
+umask 077
+mkdir -p "$BOT_API_DIR" || die "could not create Telegram Bot API directory"
+chmod 700 "$BOT_API_DIR" || die "could not secure Telegram Bot API directory"
 
 exec "$TELEGRAM_BOT_API_BIN" \
   --api-id="$TELEGRAM_API_ID" \

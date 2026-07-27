@@ -1377,7 +1377,7 @@ doctor() {
 
   if has_value TELEGRAM_BOT_API_DIR; then
     dir=$(bot_api_dir_abs)
-    if mkdir -p "$dir" 2>/dev/null; then
+    if (umask 077 && mkdir -p "$dir" && chmod 700 "$dir") 2>/dev/null; then
       printf 'ok   TELEGRAM_BOT_API_DIR: %s\n' "$dir"
     else
       printf 'fail TELEGRAM_BOT_API_DIR is not writable\n'

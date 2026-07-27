@@ -62,6 +62,10 @@ TELEGRAM_BOT_API_PORT=8081
 TELEGRAM_BOT_API_DIR=./data/telegram-bot-api
 ALLOWED_CHAT_ID=1
 OBS_PASSWORD=permission-test-secret-do-not-log
+OBS_MEDIA_SOURCE_NAME=Queue
+OBS_LOOP_SOURCE_NAME=Loop
+OBS_MUSIC_SOURCE_NAME=Music
+FFPROBE_PATH=./bin/fake-ffprobe
 EOF
 
   cat >"$FIXTURE/bin/curl" <<'EOF'
@@ -72,9 +76,25 @@ printf '{"ok":true}\n'
 EOF
   cat >"$FIXTURE/bin/fake-bot-api" <<'EOF'
 #!/bin/sh
+set -eu
+bot_api_dir=
+for argument do
+  case "$argument" in
+    --dir=*) bot_api_dir=${argument#--dir=} ;;
+  esac
+done
+[ -n "$bot_api_dir" ] || exit 1
+mkdir -p "$bot_api_dir/daemon-child"
+: >"$bot_api_dir/daemon-file"
+EOF
+  cat >"$FIXTURE/bin/fake-ffprobe" <<'EOF'
+#!/bin/sh
 exit 0
 EOF
-  chmod +x "$FIXTURE/bin/curl" "$FIXTURE/bin/fake-bot-api"
+  chmod +x \
+    "$FIXTURE/bin/curl" \
+    "$FIXTURE/bin/fake-bot-api" \
+    "$FIXTURE/bin/fake-ffprobe"
 }
 
 run_fixture() {
@@ -108,6 +128,31 @@ for helper in healthcheck.sh logout-public.sh run.sh; do
   assert_no_secret "$output"
 done
 printf 'ok - every shell .env source secures current-schema config without logging secrets\n'
+
+bot_api_dir="$current_fixture/data/telegram-bot-api"
+assert_mode "$bot_api_dir" 700
+assert_mode "$bot_api_dir/daemon-child" 700
+assert_mode "$bot_api_dir/daemon-file" 600
+chmod 777 "$bot_api_dir"
+run_fixture \
+  "$current_fixture" \
+  "$current_fixture/resecure-bot-api.log" \
+  ./deploy/telegram-bot-api/run.sh
+assert_mode "$bot_api_dir" 700
+assert_no_secret "$current_fixture/resecure-bot-api.log"
+printf 'ok - bot-api cache and daemon files stay private under umask 000\n'
+
+new_fixture doctor
+doctor_fixture=$FIXTURE
+doctor_bot_api_dir="$doctor_fixture/data/telegram-bot-api"
+run_fixture "$doctor_fixture" "$doctor_fixture/doctor-new.log" ./run.sh doctor
+assert_mode "$doctor_bot_api_dir" 700
+assert_no_secret "$doctor_fixture/doctor-new.log"
+chmod 777 "$doctor_bot_api_dir"
+run_fixture "$doctor_fixture" "$doctor_fixture/doctor-existing.log" ./run.sh doctor
+assert_mode "$doctor_bot_api_dir" 700
+assert_no_secret "$doctor_fixture/doctor-existing.log"
+printf 'ok - doctor creates and resecures the bot-api cache under umask 000\n'
 
 new_fixture migration
 migration_fixture=$FIXTURE
