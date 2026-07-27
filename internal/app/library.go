@@ -492,10 +492,6 @@ func (s *Service) ImportLibraryUpload(ctx context.Context, req UploadRequest) (s
 		s.setLastErr(err)
 		return "", err
 	}
-	if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, req.LocalPath); err != nil {
-		s.setLastErr(err)
-		return "", err
-	}
 	plan, err := s.planLibraryUpload(req.FileName)
 	if err != nil {
 		s.setLastErr(err)
@@ -605,6 +601,21 @@ func (s *Service) storeLibraryUploadWithLimit(
 	sourcePath string,
 	limit int,
 ) error {
+	source, err := openLocalBotAPIFile(s.cfg.TelegramBotAPIDir, sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	return s.storeOpenedLibraryUploadWithLimit(ctx, kind, destPath, source, limit)
+}
+
+func (s *Service) storeOpenedLibraryUploadWithLimit(
+	ctx context.Context,
+	kind medialib.Kind,
+	destPath string,
+	source *os.File,
+	limit int,
+) error {
 	s.storageMu.Lock()
 	defer s.storageMu.Unlock()
 
@@ -631,10 +642,10 @@ func (s *Service) storeLibraryUploadWithLimit(
 			return s.media.Validate(meta, s.cfg.MaxVideoSizeBytes, s.cfg.MaxVideoDurationSeconds)
 		}
 	}
-	_, err := copyFileAtomic(
+	_, err := copyOpenedFileAtomic(
 		ctx,
 		destPath,
-		sourcePath,
+		source,
 		s.cfg.MaxVideoSizeBytes,
 		func(actualSize int64) error {
 			return s.ensureStorageHeadroom(filepath.Dir(destPath), actualSize)

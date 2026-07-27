@@ -162,7 +162,38 @@ func copyFileAtomicWith(
 		return 0, err
 	}
 	defer in.Close()
-	info, err := in.Stat()
+	return copyOpenedFileAtomicWith(ctx, dst, in, maxBytes, admit, prePublish, ops)
+}
+
+func copyOpenedFileAtomic(
+	ctx context.Context,
+	dst string,
+	src *os.File,
+	maxBytes int64,
+	admit func(int64) error,
+	prePublish prePublishFunc,
+) (int64, error) {
+	return copyOpenedFileAtomicWith(ctx, dst, src, maxBytes, admit, prePublish, atomicCopyOps{})
+}
+
+// copyOpenedFileAtomicWith copies from the exact file identity supplied by the
+// caller. Ownership of src remains with the caller.
+func copyOpenedFileAtomicWith(
+	ctx context.Context,
+	dst string,
+	src *os.File,
+	maxBytes int64,
+	admit func(int64) error,
+	prePublish prePublishFunc,
+	ops atomicCopyOps,
+) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if src == nil {
+		return 0, errors.New("source media file is required")
+	}
+	info, err := src.Stat()
 	if err != nil {
 		return 0, err
 	}
@@ -209,7 +240,7 @@ func copyFileAtomicWith(
 	func() {
 		copyScope := tracker.Scope(liveness.PhaseMediaCopy)
 		defer copyScope.Close()
-		written, err = copyData(ctx, tmp, io.LimitReader(in, info.Size()+1))
+		written, err = copyData(ctx, tmp, io.LimitReader(src, info.Size()+1))
 	}()
 	if err != nil {
 		_ = tmp.Close()
