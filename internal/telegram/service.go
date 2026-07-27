@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -110,6 +111,11 @@ type MoveFunc func(context.Context, int64, int) (string, error)
 type botResponse struct {
 	text   string
 	markup *tgbotapi.InlineKeyboardMarkup
+}
+
+type actionableUpdate struct {
+	update     tgbotapi.Update
+	nextOffset int
 }
 
 type Upload struct {
@@ -307,6 +313,11 @@ func (s *Service) Run(ctx context.Context) error {
 
 		tracker.Advance(liveness.PhaseOperation)
 		updates, err := s.bot.GetUpdates(ctx, updateConfig)
+		var actionableUpdates []actionableUpdate
+		if err == nil {
+			tracker.Advance(liveness.PhaseOperation)
+			actionableUpdates, err = validateActionableUpdates(updates, updateConfig.Offset)
+		}
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				tracker.Advance(liveness.PhaseCancelWait)
@@ -320,7 +331,6 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		tracker.Advance(liveness.PhaseOperation)
 		s.logPollRecovery(pollRetry.recovery())
 		journalCtx, cancelJournal = s.journalContext(ctx)
 		err = s.updateJournal.ConfirmUpdateOffset(journalCtx, updateConfig.Offset)
@@ -329,7 +339,9 @@ func (s *Service) Run(ctx context.Context) error {
 			return journalOperationError(ctx, "confirm polling offset", err)
 		}
 
-		for _, update := range updates {
+		for _, candidate := range actionableUpdates {
+			update := candidate.update
+			nextOffset := candidate.nextOffset
 			if err := ctx.Err(); err != nil {
 				tracker.Advance(liveness.PhaseCancelWait)
 				return err
@@ -358,7 +370,7 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 			switch disposition {
 			case updateBeginAlreadyTerminal, updateBeginDead:
-				updateConfig.Offset = update.UpdateID + 1
+				updateConfig.Offset = nextOffset
 				continue
 			case updateBeginBusy:
 				return fmt.Errorf("%w: update_id=%d", ErrUpdateAttemptBusy, update.UpdateID)
@@ -377,6 +389,7 @@ func (s *Service) Run(ctx context.Context) error {
 				case errors.Is(err, ErrUpdateHandlerStuck):
 					dead, journalErr := s.recordUpdateFailure(
 						update.UpdateID,
+						nextOffset,
 						ownerToken,
 						cause,
 						s.now().Add(s.effectiveStuckOwnerLease()),
@@ -399,6 +412,7 @@ func (s *Service) Run(ctx context.Context) error {
 				default:
 					dead, journalErr := s.recordUpdateFailure(
 						update.UpdateID,
+						nextOffset,
 						ownerToken,
 						cause,
 						time.Time{},
@@ -417,22 +431,53 @@ func (s *Service) Run(ctx context.Context) error {
 						// only the next generation may poll past it.
 						return err
 					}
-					updateConfig.Offset = update.UpdateID + 1
+					updateConfig.Offset = nextOffset
 					continue
 				}
 			}
 			if timedOut {
 				s.logger.Warn("telegram update processing timed out", "update_id", update.UpdateID)
 			}
-			if err := s.completeUpdateAttempt(update.UpdateID, ownerToken); err != nil {
+			if err := s.completeUpdateAttempt(update.UpdateID, nextOffset, ownerToken); err != nil {
 				return err
 			}
 			// The done journal row and durable next offset commit atomically.
 			// Telegram itself confirms that offset only on the next successful
 			// GetUpdates request, when confirmed_offset advances separately.
-			updateConfig.Offset = update.UpdateID + 1
+			updateConfig.Offset = nextOffset
 		}
 	}
+}
+
+func validateActionableUpdates(
+	updates []tgbotapi.Update,
+	currentOffset int,
+) ([]actionableUpdate, error) {
+	actionable := make([]actionableUpdate, 0, len(updates))
+	for _, update := range updates {
+		nextOffset, err := nextTelegramOffset(update.UpdateID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Telegram update response: %w", err)
+		}
+		if update.UpdateID < currentOffset {
+			continue
+		}
+		actionable = append(actionable, actionableUpdate{
+			update:     update,
+			nextOffset: nextOffset,
+		})
+	}
+	return actionable, nil
+}
+
+func nextTelegramOffset(updateID int) (int, error) {
+	if updateID < 0 {
+		return 0, fmt.Errorf("Telegram update ID must be non-negative: %d", updateID)
+	}
+	if updateID == math.MaxInt {
+		return 0, fmt.Errorf("Telegram update ID has no representable successor: %d", updateID)
+	}
+	return updateID + 1, nil
 }
 
 func (s *Service) updateLeaseUntil() time.Time {
@@ -479,12 +524,12 @@ func (s *Service) abortUpdateAttempt(updateID int, ownerToken string) error {
 	return nil
 }
 
-func (s *Service) completeUpdateAttempt(updateID int, ownerToken string) error {
+func (s *Service) completeUpdateAttempt(updateID int, nextOffset int, ownerToken string) error {
 	journalCtx, cancel := s.independentJournalContext()
 	err := s.updateJournal.CompleteUpdateAttempt(
 		journalCtx,
 		updateID,
-		updateID+1,
+		nextOffset,
 		ownerToken,
 	)
 	cancel()
@@ -507,6 +552,7 @@ func (s *Service) completeUpdateAttempt(updateID int, ownerToken string) error {
 
 func (s *Service) recordUpdateFailure(
 	updateID int,
+	nextOffset int,
 	ownerToken string,
 	cause string,
 	holdLeaseUntil time.Time,
@@ -516,7 +562,7 @@ func (s *Service) recordUpdateFailure(
 	dead, err := s.updateJournal.FailUpdateAttempt(
 		journalCtx,
 		updateID,
-		updateID+1,
+		nextOffset,
 		ownerToken,
 		maxUpdateHandlerFailures,
 		cause,

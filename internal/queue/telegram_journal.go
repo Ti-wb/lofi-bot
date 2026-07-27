@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -307,8 +308,9 @@ func (s *Store) BeginUpdateAttempt(
 	leaseUntil time.Time,
 	maxFailures int,
 ) (disposition string, attemptCount int, failureCount int, err error) {
-	if updateID < 0 {
-		return "", 0, 0, fmt.Errorf("Telegram update ID must be non-negative: %d", updateID)
+	nextOffset, err := telegramUpdateSuccessor(updateID)
+	if err != nil {
+		return "", 0, 0, err
 	}
 	if err := validateTelegramJournalLabel("kind", updateKind, telegramMaxKindBytes, false); err != nil {
 		return "", 0, 0, err
@@ -402,7 +404,7 @@ WHERE update_id = ?
 
 	switch status {
 	case telegramAttemptDone:
-		if err := advanceTelegramNextOffset(ctx, tx, updateID+1, nowText); err != nil {
+		if err := advanceTelegramNextOffset(ctx, tx, nextOffset, nowText); err != nil {
 			return "", 0, 0, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -410,7 +412,7 @@ WHERE update_id = ?
 		}
 		return telegramBeginAlreadyTerminal, attemptCount, failureCount, nil
 	case telegramAttemptDead:
-		if err := advanceTelegramNextOffset(ctx, tx, updateID+1, nowText); err != nil {
+		if err := advanceTelegramNextOffset(ctx, tx, nextOffset, nowText); err != nil {
 			return "", 0, 0, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -442,7 +444,7 @@ WHERE update_id = ?
 				); err != nil {
 					return "", 0, 0, err
 				}
-				if err := advanceTelegramNextOffset(ctx, tx, updateID+1, nowText); err != nil {
+				if err := advanceTelegramNextOffset(ctx, tx, nextOffset, nowText); err != nil {
 					return "", 0, 0, err
 				}
 				if err := tx.Commit(); err != nil {
@@ -731,7 +733,10 @@ func validateTelegramUpdateTransition(updateID int, nextOffset int) error {
 	if updateID < 0 {
 		return fmt.Errorf("Telegram update ID must be non-negative: %d", updateID)
 	}
-	if nextOffset != updateID+1 {
+	if updateID == math.MaxInt {
+		return fmt.Errorf("Telegram update ID has no representable successor: %d", updateID)
+	}
+	if nextOffset <= 0 || updateID != nextOffset-1 {
 		return fmt.Errorf(
 			"Telegram next offset %d does not follow update %d",
 			nextOffset,
@@ -739,6 +744,16 @@ func validateTelegramUpdateTransition(updateID int, nextOffset int) error {
 		)
 	}
 	return nil
+}
+
+func telegramUpdateSuccessor(updateID int) (int, error) {
+	if updateID < 0 {
+		return 0, fmt.Errorf("Telegram update ID must be non-negative: %d", updateID)
+	}
+	if updateID == math.MaxInt {
+		return 0, fmt.Errorf("Telegram update ID has no representable successor: %d", updateID)
+	}
+	return updateID + 1, nil
 }
 
 func requireSingleCheckpoint(result sql.Result) error {

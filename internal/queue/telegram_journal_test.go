@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -49,6 +50,176 @@ SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?
 		if count != 0 {
 			t.Fatalf("table %s survived failed migration transaction", table)
 		}
+	}
+}
+
+func TestTelegramUpdateSuccessorBoundaries(t *testing.T) {
+	tests := []struct {
+		name     string
+		updateID int
+		next     int
+		wantErr  bool
+	}{
+		{name: "negative", updateID: -1, wantErr: true},
+		{name: "zero", updateID: 0, next: 1},
+		{name: "largest representable successor", updateID: math.MaxInt - 1, next: math.MaxInt},
+		{name: "unrepresentable successor", updateID: math.MaxInt, wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := telegramUpdateSuccessor(test.updateID)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("telegramUpdateSuccessor(%d) succeeded with %d", test.updateID, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("telegramUpdateSuccessor(%d): %v", test.updateID, err)
+			}
+			if got != test.next {
+				t.Fatalf("telegramUpdateSuccessor(%d) = %d, want %d", test.updateID, got, test.next)
+			}
+			if err := validateTelegramUpdateTransition(test.updateID, test.next); err != nil {
+				t.Fatalf("validate transition (%d, %d): %v", test.updateID, test.next, err)
+			}
+		})
+	}
+
+	for _, transition := range []struct {
+		updateID int
+		next     int
+	}{
+		{updateID: -1, next: 0},
+		{updateID: 0, next: 0},
+		{updateID: math.MaxInt, next: math.MinInt},
+	} {
+		if err := validateTelegramUpdateTransition(transition.updateID, transition.next); err == nil {
+			t.Fatalf(
+				"validateTelegramUpdateTransition(%d, %d) succeeded",
+				transition.updateID,
+				transition.next,
+			)
+		}
+	}
+}
+
+func TestTelegramJournalRejectsMaxIntBeforeMutationAndKeepsMaxCheckpointValid(t *testing.T) {
+	ctx := context.Background()
+	store := openStoreAtPath(t, ctx, filepath.Join(t.TempDir(), "queue.db"))
+	defer store.Close()
+
+	_, _, _, err := store.BeginUpdateAttempt(
+		ctx,
+		math.MaxInt,
+		"message",
+		"queue",
+		-100123,
+		55,
+		42,
+		"owner-max",
+		store.nowUTC().Add(time.Minute),
+		3,
+	)
+	if err == nil {
+		t.Fatal("BeginUpdateAttempt(MaxInt) succeeded")
+	}
+	assertTelegramAttemptExists(t, ctx, store, math.MaxInt, false)
+	next, confirmed, err := store.LoadUpdateCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("load checkpoint after rejected MaxInt: %v", err)
+	}
+	if next != 0 || confirmed != 0 {
+		t.Fatalf("checkpoint after rejected MaxInt = (%d, %d), want (0, 0)", next, confirmed)
+	}
+
+	disposition, _, _, err := store.BeginUpdateAttempt(
+		ctx,
+		math.MaxInt-1,
+		"message",
+		"queue",
+		-100123,
+		56,
+		42,
+		"owner-max-minus-one",
+		store.nowUTC().Add(time.Minute),
+		3,
+	)
+	if err != nil {
+		t.Fatalf("BeginUpdateAttempt(MaxInt-1): %v", err)
+	}
+	if disposition != telegramBeginExecute {
+		t.Fatalf("disposition = %q, want %q", disposition, telegramBeginExecute)
+	}
+	if err := store.CompleteUpdateAttempt(
+		ctx,
+		math.MaxInt-1,
+		math.MaxInt,
+		"owner-max-minus-one",
+	); err != nil {
+		t.Fatalf("CompleteUpdateAttempt(MaxInt-1): %v", err)
+	}
+	if err := store.ConfirmUpdateOffset(ctx, math.MaxInt); err != nil {
+		t.Fatalf("ConfirmUpdateOffset(MaxInt): %v", err)
+	}
+	next, confirmed, err = store.LoadUpdateCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("load MaxInt checkpoint: %v", err)
+	}
+	if next != math.MaxInt || confirmed != math.MaxInt {
+		t.Fatalf(
+			"MaxInt checkpoint = (%d, %d), want (%d, %d)",
+			next,
+			confirmed,
+			math.MaxInt,
+			math.MaxInt,
+		)
+	}
+}
+
+func TestTelegramJournalAbortReleasesLegacyMaxIntClaim(t *testing.T) {
+	ctx := context.Background()
+	store := openStoreAtPath(t, ctx, filepath.Join(t.TempDir(), "queue.db"))
+	defer store.Close()
+
+	now := store.nowUTC()
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO telegram_update_attempts (
+	update_id, update_kind, action, chat_id, message_id, actor_id,
+	attempt_count, failure_count, status, owner_token, lease_until,
+	last_error, created_at, updated_at, finished_at
+) VALUES (?, 'message', 'queue', -100123, 55, 42, 1, 0, ?, ?, ?, '', ?, ?, NULL)
+`,
+		math.MaxInt,
+		telegramAttemptRunning,
+		"legacy-owner",
+		formatTime(now.Add(time.Minute)),
+		formatTime(now),
+		formatTime(now),
+	); err != nil {
+		t.Fatalf("insert legacy MaxInt claim: %v", err)
+	}
+
+	if err := store.AbortUpdateAttempt(ctx, math.MaxInt, "legacy-owner"); err != nil {
+		t.Fatalf("AbortUpdateAttempt(MaxInt): %v", err)
+	}
+	var status, owner string
+	var lease sql.NullString
+	if err := store.db.QueryRowContext(ctx, `
+SELECT status, owner_token, lease_until
+FROM telegram_update_attempts
+WHERE update_id = ?
+`, math.MaxInt).Scan(&status, &owner, &lease); err != nil {
+		t.Fatalf("read legacy MaxInt claim: %v", err)
+	}
+	if status != telegramAttemptPending || owner != "" || lease.Valid {
+		t.Fatalf(
+			"legacy MaxInt claim = status=%q owner=%q lease=%#v",
+			status,
+			owner,
+			lease,
+		)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -1290,6 +1291,107 @@ func TestRunRetriesGetUpdatesError(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Run did not stop after cancellation")
+	}
+}
+
+func TestNextTelegramOffsetBoundaries(t *testing.T) {
+	tests := []struct {
+		name     string
+		updateID int
+		want     int
+		wantErr  bool
+	}{
+		{name: "negative", updateID: -1, wantErr: true},
+		{name: "zero", updateID: 0, want: 1},
+		{name: "largest representable successor", updateID: math.MaxInt - 1, want: math.MaxInt},
+		{name: "unrepresentable successor", updateID: math.MaxInt, wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := nextTelegramOffset(test.updateID)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("nextTelegramOffset(%d) succeeded with %d", test.updateID, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("nextTelegramOffset(%d): %v", test.updateID, err)
+			}
+			if got != test.want {
+				t.Fatalf("nextTelegramOffset(%d) = %d, want %d", test.updateID, got, test.want)
+			}
+		})
+	}
+}
+
+func TestRunRetriesMalformedUpdateBatchBeforeJournalMutation(t *testing.T) {
+	journal := newFakeUpdateJournal()
+	bot := &fakeBotAPI{
+		updateResponses: []updateResponse{
+			{updates: []tgbotapi.Update{
+				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: math.MaxInt, Message: commandMessage(42, "/queue")},
+			}},
+			{updates: []tgbotapi.Update{
+				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			}},
+		},
+		updateCalls: make(chan struct{}, 3),
+	}
+	svc := newTestServiceWithJournal(t, bot, journal)
+	svc.pollRetryDelay = time.Millisecond
+	var handledMu sync.Mutex
+	var handled []int
+	svc.updateHandler = func(_ context.Context, update tgbotapi.Update) error {
+		handledMu.Lock()
+		defer handledMu.Unlock()
+		handled = append(handled, update.UpdateID)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.Run(ctx)
+	}()
+
+	waitForUpdateCalls(t, bot.updateCalls, 3)
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error = %v, want cancellation", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Run did not stop after cancellation")
+	}
+
+	if len(bot.updateConfigs) < 3 {
+		t.Fatalf("update configs = %d, want at least 3", len(bot.updateConfigs))
+	}
+	for poll, want := range []int{0, 0, 11} {
+		if got := bot.updateConfigs[poll].Offset; got != want {
+			t.Fatalf("poll %d offset = %d, want %d", poll+1, got, want)
+		}
+	}
+	handledMu.Lock()
+	defer handledMu.Unlock()
+	if len(handled) != 1 || handled[0] != 10 {
+		t.Fatalf("handled updates = %v, want [10]", handled)
+	}
+	next, confirmed, attempt, ok := journal.snapshot(10)
+	if !ok || next != 11 || confirmed != 0 || attempt.status != "done" {
+		t.Fatalf(
+			"update 10 state = next=%d confirmed=%d attempt=%#v ok=%v",
+			next,
+			confirmed,
+			attempt,
+			ok,
+		)
+	}
+	if _, _, _, ok := journal.snapshot(math.MaxInt); ok {
+		t.Fatal("malformed MaxInt update reached the journal")
 	}
 }
 
@@ -3123,6 +3225,10 @@ func (j *fakeUpdateJournal) BeginUpdateAttempt(
 	if j.beginErr != nil {
 		return "", 0, 0, j.beginErr
 	}
+	nextOffset, err := nextTelegramOffset(updateID)
+	if err != nil {
+		return "", 0, 0, err
+	}
 	attempt := j.attempts[updateID]
 	if attempt == nil {
 		attempt = &fakeJournalAttempt{
@@ -3137,10 +3243,10 @@ func (j *fakeUpdateJournal) BeginUpdateAttempt(
 	}
 	switch attempt.status {
 	case "done":
-		j.advance(updateID + 1)
+		j.advance(nextOffset)
 		return updateBeginAlreadyTerminal, attempt.attemptCount, attempt.failureCount, nil
 	case "dead":
-		j.advance(updateID + 1)
+		j.advance(nextOffset)
 		return updateBeginDead, attempt.attemptCount, attempt.failureCount, nil
 	case "running", "stuck":
 		if attempt.leaseUntil.After(j.now) {
@@ -3153,7 +3259,7 @@ func (j *fakeUpdateJournal) BeginUpdateAttempt(
 				attempt.status = "dead"
 				attempt.ownerToken = ""
 				attempt.leaseUntil = time.Time{}
-				j.advance(updateID + 1)
+				j.advance(nextOffset)
 				return updateBeginDead, attempt.attemptCount, attempt.failureCount, nil
 			}
 		}
