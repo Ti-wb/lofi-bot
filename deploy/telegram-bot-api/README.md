@@ -20,6 +20,8 @@ Use the repository root `.env` for both `tg-obs-bot` and Telegram Bot API Server
 
 `.env` is ignored by git. `.env.example` is the versioned schema and is safe to commit because it contains only placeholders and local defaults.
 
+Each helper sets the shared `.env` to owner-only mode `0600` before reading or sourcing it.
+
 Required Telegram Bot API Server fields:
 
 ```env

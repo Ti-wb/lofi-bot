@@ -9,7 +9,7 @@ Go backend for a 24h Lo-Fi Music channel workflow:
 
 ## Requirements
 
-- macOS with OBS Studio
+- macOS or Linux with OBS Studio
 - OBS WebSocket enabled, usually port `4455`
 - Go 1.22+
 - `ffmpeg` / `ffprobe`
@@ -29,7 +29,7 @@ brew install go ffmpeg
 4. Create a Media Source named `tg_music_player` for Lo-Fi music.
 5. Add both sources to the Program scene used for playback.
 6. Keep looping disabled in OBS; the app sets loop/music behavior through OBS WebSocket.
-7. Keep the backend running on the same Mac.
+7. Keep the backend running on the same host.
 
 The app mutes the loop source, plays music through the music source, and centers the loop source in the current Program scene without changing scale, bounds, or crop. The legacy queue source name is still configured by `OBS_MEDIA_SOURCE_NAME`.
 
@@ -84,7 +84,11 @@ For unattended use with the portable shell environment, build first and keep `./
 ./run.sh up
 ```
 
-`./run.sh up` supervises the Telegram Local Bot API Server and `tg-obs-bot` separately. If either child exits, only that child is restarted with exponential backoff. The supervisor uses `dist/tg-obs-bot` when it is current; if the binary is missing or older than Go source files, it falls back to `go run` and prints a warning. You can set `RESTART_MIN_DELAY_SECONDS`, `RESTART_MAX_DELAY_SECONDS`, or `APP_BIN` to customize restart delays or the app binary path. Restart delays must be positive integers no larger than 86400 seconds.
+`./run.sh up` supervises the Telegram Local Bot API Server and `tg-obs-bot` separately. It never supervises `go run`: when `dist/tg-obs-bot` is missing or older than the Go sources, startup first builds a temporary binary and atomically installs it; a build or process-group isolation failure aborts startup. Each service generation runs in its own process group, and the supervisor drains that complete group before starting a replacement, so descendants cannot accumulate across crashes. The root process also tracks each active generation in private runtime state; if either service supervisor dies unexpectedly, it drains both trees and exits non-zero. Singleton contention is a non-retryable startup failure: the stack stops and propagates exit code `73` instead of looping. `HUP`, `Ctrl-C`/`INT`, and `TERM` use a bounded `TERM`-then-`KILL` shutdown.
+
+For supervised app generations, `./run.sh up` also creates a private local FIFO on descriptor 3 and enables the built-in worker reporter with the exact marker `TG_OBS_LIVENESS_FD3=1`. A strict reader rejects malformed, replayed, reversed, or inconsistent frames; the supervisor restarts only the failed app process group when no initial frame arrives within 360 seconds or a worker makes no progress for 60 seconds in phases `00`-`07`, 150 seconds in phase `08`, or 310 seconds in phases `09`-`10`. A newer frame with an unchanged worker sequence does not renew that worker's lease. `./run.sh app` explicitly leaves this local watchdog disabled.
+
+Set `APP_BIN` to use a different executable. The optional supervisor controls are `RESTART_MIN_DELAY_SECONDS` (default `2`), `RESTART_MAX_DELAY_SECONDS` (default `60`), `RESTART_RESET_AFTER_SECONDS` (default `300`, resets exponential backoff after a stable run), and `SHUTDOWN_GRACE_SECONDS` (default `15`). These values must be positive integers no larger than 86400 seconds.
 
 After changing `.env`, restart the root `./run.sh up` process so both child services inherit the same configuration.
 
@@ -92,9 +96,13 @@ After changing `.env`, restart the root `./run.sh up` process so both child serv
 
 `.env` is local runtime config and is ignored by git. `.env.example` is the versioned schema shared by the Go backend and Telegram Local Bot API Server helpers; keep `ENV_SCHEMA_VERSION` at the top when creating or reviewing config.
 
+Runtime entrypoints set `.env` to owner-only mode `0600` before reading it, and env migration creates its backup and replacement temp files private from their first write. The backend likewise creates or repairs `DATA_DIR` as owner-only mode `0700` before opening persistent state, and keeps the SQLite database plus its WAL/SHM sidecars at mode `0600` even when `DATABASE_PATH` points elsewhere.
+
 Before deploying a new build, back up the production `.env`. You can run `./run.sh migrate-env` to apply the stack helper's lightweight `.env` repair without starting the Go app. It copies the original to `.env.backup.<unix_timestamp>`, updates older schema markers, and appends missing fields needed by the Local Bot API helper. If appended Local Bot API Server defaults are not correct for production, edit `.env` before starting the stack.
 
-Numeric config values must be valid integers; malformed values fail startup instead of silently falling back to defaults. `OBS_PORT` must be `1..65535`; `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` must be positive; `MAX_VIDEO_DURATION_SECONDS`, `RETENTION_DAYS`, and `RETENTION_MAX_FILES` may be `0` to disable that limit where supported. `RETENTION_DELETE_LOCAL_FILES` defaults to `false`, so retention removes old SQLite rows without deleting Telegram Local Bot API media files unless you explicitly opt in.
+Numeric config values must be valid integers; malformed values fail startup instead of silently falling back to defaults. `OBS_PORT` must be `1..65535`; `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` must be positive; `MAX_VIDEO_DURATION_SECONDS`, `MIN_FREE_DISK_MB`, and `RETENTION_MAX_FILES` may be `0` to disable that limit where supported; and `RETENTION_DAYS` must be `0..106751`. `MIN_FREE_DISK_MB` defaults to `512`; uploads require a positive declared size and enough configured cache/destination headroom before Local Bot API `getFile`, followed by authoritative checks against the actual local file. Setting it to `0` disables only the additional reserve—the actual-size filesystem admission and `MAX_VIDEO_SIZE_MB` limit remain enforced. `RETENTION_DELETE_LOCAL_FILES` defaults to `false`, so retention removes old SQLite rows without deleting Telegram Local Bot API media files unless you explicitly opt in.
+
+Persistent media state also has fixed, non-configurable ceilings: 10,000 entries in each loop/music directory and 10,000 total rows in the `videos` table. Uploads that would exceed either ceiling are rejected before Local Bot API `getFile` and rechecked at the authoritative write boundary; the app never auto-deletes library assets or Telegram-owned cache files to make room.
 
 The stack helpers run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing supported schema defaults. The Go app itself only reads config at startup; it does not rewrite `.env`.
 
@@ -141,6 +149,8 @@ Common runtime commands:
 
 - The MVP avoids transcoding to keep CPU use low on the MacBook.
 - Imported library media is copied into `LOOP_MEDIA_DIR` or `MUSIC_MEDIA_DIR`.
+- Library imports are validated in a dedicated staging directory on the destination filesystem before atomic publication; startup and periodic maintenance remove interrupted staging files older than six hours in bounded batches.
+- When `MAX_VIDEO_DURATION_SECONDS` is enabled, a missing or invalid `ffprobe` duration rejects the video instead of treating it as zero.
 - SQLite state is stored under `DATA_DIR` so today's overrides and period picks survive restarts.
 - `PLAYER_MODE=queue` enables the legacy queue player; `FALLBACK_MODE=random_played` only applies there.
 - `OBS_PASSWORD` can be left empty when OBS WebSocket authentication is disabled.

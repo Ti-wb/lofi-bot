@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -13,19 +14,35 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/secret"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 const (
-	defaultUpdateTimeout  = 30
-	defaultRequestTimeout = time.Duration(defaultUpdateTimeout)*time.Second + 5*time.Second
-	defaultPollRetryDelay = 3 * time.Second
-	adminCacheTTL         = 60 * time.Second
+	defaultUpdateTimeout           = 30
+	defaultRequestTimeout          = time.Duration(defaultUpdateTimeout)*time.Second + 5*time.Second
+	defaultPollRetryDelay          = 3 * time.Second
+	defaultUpdateProcessingTimeout = 5 * time.Minute
+	defaultUpdateHandlerStopGrace  = 5 * time.Second
+	defaultJournalWriteTimeout     = 4 * time.Second
+	defaultUpdateLeaseBuffer       = 30 * time.Second
+	defaultStuckOwnerLease         = 10 * time.Second
+	defaultAdminLookupTimeout      = 5 * time.Second
+	adminCacheTTL                  = 60 * time.Second
+
+	// RecommendedParentDrainGrace reserves enough time for a handler that
+	// ignores cancellation to consume its stop grace and for the update
+	// journal to persist Abort/Fail in an independent bounded context, plus a
+	// small scheduling cushion. The app coordinator uses this as its outer
+	// worker-drain budget.
+	RecommendedParentDrainGrace = defaultUpdateHandlerStopGrace + defaultJournalWriteTimeout + time.Second
 )
 
 var queueItemPattern = regexp.MustCompile(`#([0-9]+).*第 ([0-9]+) 位`)
+
+var ErrUpdateHandlerStuck = errors.New("telegram update handler did not stop after cancellation")
 
 type Config struct {
 	Token              string
@@ -39,14 +56,26 @@ type Config struct {
 }
 
 type Service struct {
-	bot             botAPI
-	cfg             Config
-	hooks           Hooks
-	logger          *slog.Logger
-	now             func() time.Time
-	pollRetryDelay  time.Duration
-	adminCacheMutex sync.Mutex
-	adminCache      map[int64]adminCacheEntry
+	bot                     botAPI
+	cfg                     Config
+	hooks                   Hooks
+	logger                  *slog.Logger
+	now                     func() time.Time
+	pollRetryDelay          time.Duration
+	pollRetryMaxDelay       time.Duration
+	pollProviderHintMax     time.Duration
+	retryRandom             func() uint64
+	pollSleep               func(context.Context, time.Duration) error
+	updateProcessingTimeout time.Duration
+	updateHandlerStopGrace  time.Duration
+	journalWriteTimeout     time.Duration
+	updateLeaseBuffer       time.Duration
+	stuckOwnerLease         time.Duration
+	adminLookupTimeout      time.Duration
+	adminCacheMutex         sync.Mutex
+	adminCache              map[int64]adminCacheEntry
+	updateJournal           UpdateJournal
+	updateHandler           func(context.Context, tgbotapi.Update) error
 }
 
 type adminCacheEntry struct {
@@ -55,21 +84,22 @@ type adminCacheEntry struct {
 }
 
 type Hooks struct {
-	EnqueueUpload EnqueueUploadFunc
-	Library       SimpleFunc
-	Scan          SimpleFunc
-	Preview       SimpleFunc
-	SetTheme      TextFunc
-	SelectLoop    TextFunc
-	SkipLoop      SimpleFunc
-	SkipMusic     SimpleFunc
-	ListQueue     SimpleFunc
-	Move          MoveFunc
-	Remove        IDFunc
-	Skip          SimpleFunc
-	Now           SimpleFunc
-	History       SimpleFunc
-	Status        SimpleFunc
+	PreflightUpload func(context.Context, Upload) error
+	EnqueueUpload   EnqueueUploadFunc
+	Library         SimpleFunc
+	Scan            SimpleFunc
+	Preview         SimpleFunc
+	SetTheme        TextFunc
+	SelectLoop      TextFunc
+	SkipLoop        SimpleFunc
+	SkipMusic       SimpleFunc
+	ListQueue       SimpleFunc
+	Move            MoveFunc
+	Remove          IDFunc
+	Skip            SimpleFunc
+	Now             SimpleFunc
+	History         SimpleFunc
+	Status          SimpleFunc
 }
 
 type EnqueueUploadFunc func(context.Context, Upload) (string, error)
@@ -81,6 +111,11 @@ type MoveFunc func(context.Context, int64, int) (string, error)
 type botResponse struct {
 	text   string
 	markup *tgbotapi.InlineKeyboardMarkup
+}
+
+type actionableUpdate struct {
+	update     tgbotapi.Update
+	nextOffset int
 }
 
 type Upload struct {
@@ -135,15 +170,26 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 	}
 
 	s := &Service{
-		cfg:            cfg,
-		hooks:          hooks,
-		logger:         logger,
-		now:            time.Now,
-		pollRetryDelay: defaultPollRetryDelay,
-		adminCache:     make(map[int64]adminCacheEntry),
+		cfg:                     cfg,
+		hooks:                   hooks,
+		logger:                  logger,
+		now:                     time.Now,
+		pollRetryDelay:          defaultPollRetryDelay,
+		pollRetryMaxDelay:       defaultPollRetryMaxDelay,
+		pollProviderHintMax:     defaultPollProviderHintMax,
+		updateProcessingTimeout: defaultUpdateProcessingTimeout,
+		updateHandlerStopGrace:  defaultUpdateHandlerStopGrace,
+		journalWriteTimeout:     defaultJournalWriteTimeout,
+		updateLeaseBuffer:       defaultUpdateLeaseBuffer,
+		stuckOwnerLease:         defaultStuckOwnerLease,
+		adminLookupTimeout:      defaultAdminLookupTimeout,
+		adminCache:              make(map[int64]adminCacheEntry),
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	if s.updateJournal == nil {
+		return nil, errors.New("telegram update journal is required")
 	}
 	if s.bot == nil {
 		bot, err := newProductionBotAPI(cfg)
@@ -158,6 +204,12 @@ func New(cfg Config, hooks Hooks, logger *slog.Logger, opts ...Option) (*Service
 func WithBotAPI(bot botAPI) Option {
 	return func(s *Service) {
 		s.bot = bot
+	}
+}
+
+func WithUpdateJournal(journal UpdateJournal) Option {
+	return func(s *Service) {
+		s.updateJournal = journal
 	}
 }
 
@@ -218,40 +270,384 @@ func (s *Service) registerQueueCommands(ctx context.Context) error {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	tracker := liveness.WorkerFromContext(ctx)
+	tracker.Advance(liveness.PhaseOperation)
+	if err := ctx.Err(); err != nil {
+		tracker.Advance(liveness.PhaseCancelWait)
+		return err
+	}
+	ownerToken, err := newUpdateOwnerToken()
+	if err != nil {
+		return journalFailure("create update owner token", err)
+	}
+	journalCtx, cancelJournal := s.journalContext(ctx)
+	nextOffset, confirmedOffset, err := s.updateJournal.LoadUpdateCheckpoint(journalCtx)
+	cancelJournal()
+	if err != nil {
+		return journalOperationError(ctx, "load polling checkpoint", err)
+	}
+	if nextOffset < 0 || confirmedOffset < 0 || confirmedOffset > nextOffset {
+		return journalFailure(
+			"load polling checkpoint",
+			fmt.Errorf(
+				"invalid offsets: next_offset=%d confirmed_offset=%d",
+				nextOffset,
+				confirmedOffset,
+			),
+		)
+	}
+
 	if err := s.registerCommands(ctx); err != nil {
 		s.logger.Warn("register telegram commands", "error", s.redactError(err))
 	}
 
-	updateConfig := tgbotapi.NewUpdate(0)
+	updateConfig := tgbotapi.NewUpdate(nextOffset)
 	updateConfig.Timeout = s.cfg.UpdateTimeout
+	updateConfig.Limit = 1
+	pollRetry := s.newPollRetryState()
 
 	for {
 		if err := ctx.Err(); err != nil {
+			tracker.Advance(liveness.PhaseCancelWait)
 			return ctx.Err()
 		}
 
+		tracker.Advance(liveness.PhaseOperation)
 		updates, err := s.bot.GetUpdates(ctx, updateConfig)
+		var actionableUpdates []actionableUpdate
+		if err == nil {
+			tracker.Advance(liveness.PhaseOperation)
+			actionableUpdates, err = validateActionableUpdates(updates, updateConfig.Offset)
+		}
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
+				tracker.Advance(liveness.PhaseCancelWait)
 				return ctxErr
 			}
-			s.logger.Warn("get telegram updates", "error", s.redactError(err))
-			if err := sleepContext(ctx, s.pollRetryDelay); err != nil {
+			hint := telegramRetryHint(err, s.pollProviderHintMax)
+			attempt, sample := pollRetry.failure(hint)
+			s.logPollFailure(err, attempt, sample)
+			if err := s.waitPollRetry(ctx, tracker, attempt.Delay); err != nil {
 				return err
 			}
 			continue
 		}
+		s.logPollRecovery(pollRetry.recovery())
+		journalCtx, cancelJournal = s.journalContext(ctx)
+		err = s.updateJournal.ConfirmUpdateOffset(journalCtx, updateConfig.Offset)
+		cancelJournal()
+		if err != nil {
+			return journalOperationError(ctx, "confirm polling offset", err)
+		}
 
-		for _, update := range updates {
+		for _, candidate := range actionableUpdates {
+			update := candidate.update
+			nextOffset := candidate.nextOffset
 			if err := ctx.Err(); err != nil {
+				tracker.Advance(liveness.PhaseCancelWait)
 				return err
 			}
+			tracker.Advance(liveness.PhaseOperation)
 			if update.UpdateID < updateConfig.Offset {
 				continue
 			}
-			updateConfig.Offset = update.UpdateID + 1
-			s.handleUpdate(ctx, update)
+			metadata := metadataForUpdate(update)
+			journalCtx, cancelJournal = s.journalContext(ctx)
+			disposition, attemptCount, failureCount, err := s.updateJournal.BeginUpdateAttempt(
+				journalCtx,
+				update.UpdateID,
+				metadata.kind,
+				metadata.action,
+				metadata.chatID,
+				metadata.messageID,
+				metadata.actorID,
+				ownerToken,
+				s.updateLeaseUntil(),
+				maxUpdateHandlerFailures,
+			)
+			cancelJournal()
+			if err != nil {
+				return journalOperationError(ctx, "begin update attempt", err)
+			}
+			switch disposition {
+			case updateBeginAlreadyTerminal, updateBeginDead:
+				updateConfig.Offset = nextOffset
+				continue
+			case updateBeginBusy:
+				return fmt.Errorf("%w: update_id=%d", ErrUpdateAttemptBusy, update.UpdateID)
+			case updateBeginExecute:
+			default:
+				return journalFailure(
+					"begin update attempt",
+					fmt.Errorf("unknown disposition %q", disposition),
+				)
+			}
+
+			timedOut, err := s.handleUpdateBounded(ctx, update)
+			if err != nil {
+				cause := boundedJournalError(s.redactError(err))
+				switch {
+				case errors.Is(err, ErrUpdateHandlerStuck):
+					dead, journalErr := s.recordUpdateFailure(
+						update.UpdateID,
+						nextOffset,
+						ownerToken,
+						cause,
+						s.now().Add(s.effectiveStuckOwnerLease()),
+					)
+					if journalErr != nil {
+						return errors.Join(err, journalErr)
+					}
+					if dead {
+						s.logPoisonUpdate(update.UpdateID, attemptCount, failureCount+1, metadata, cause)
+					}
+					// A stuck handler may still own application locks. Even
+					// after the third failure dead-letters the update, this
+					// process generation must stop and never poll again.
+					return err
+				case ctx.Err() != nil:
+					if journalErr := s.abortUpdateAttempt(update.UpdateID, ownerToken); journalErr != nil {
+						return errors.Join(err, journalErr)
+					}
+					return err
+				default:
+					dead, journalErr := s.recordUpdateFailure(
+						update.UpdateID,
+						nextOffset,
+						ownerToken,
+						cause,
+						time.Time{},
+					)
+					if journalErr != nil {
+						return errors.Join(err, journalErr)
+					}
+					if !dead {
+						return err
+					}
+					s.logPoisonUpdate(update.UpdateID, attemptCount, failureCount+1, metadata, cause)
+					if errors.Is(err, ErrUpdateHandlerPanic) {
+						// A recovered panic may have left unrelated in-process
+						// state inconsistent. Persist quarantine atomically,
+						// then let the supervisor replace this generation;
+						// only the next generation may poll past it.
+						return err
+					}
+					updateConfig.Offset = nextOffset
+					continue
+				}
+			}
+			if timedOut {
+				s.logger.Warn("telegram update processing timed out", "update_id", update.UpdateID)
+			}
+			if err := s.completeUpdateAttempt(update.UpdateID, nextOffset, ownerToken); err != nil {
+				return err
+			}
+			// The done journal row and durable next offset commit atomically.
+			// Telegram itself confirms that offset only on the next successful
+			// GetUpdates request, when confirmed_offset advances separately.
+			updateConfig.Offset = nextOffset
 		}
+	}
+}
+
+func validateActionableUpdates(
+	updates []tgbotapi.Update,
+	currentOffset int,
+) ([]actionableUpdate, error) {
+	actionable := make([]actionableUpdate, 0, len(updates))
+	for _, update := range updates {
+		nextOffset, err := nextTelegramOffset(update.UpdateID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Telegram update response: %w", err)
+		}
+		if update.UpdateID < currentOffset {
+			continue
+		}
+		actionable = append(actionable, actionableUpdate{
+			update:     update,
+			nextOffset: nextOffset,
+		})
+	}
+	return actionable, nil
+}
+
+func nextTelegramOffset(updateID int) (int, error) {
+	if updateID < 0 {
+		return 0, fmt.Errorf("Telegram update ID must be non-negative: %d", updateID)
+	}
+	if updateID == math.MaxInt {
+		return 0, fmt.Errorf("Telegram update ID has no representable successor: %d", updateID)
+	}
+	return updateID + 1, nil
+}
+
+func (s *Service) updateLeaseUntil() time.Time {
+	processingTimeout := s.updateProcessingTimeout
+	if processingTimeout <= 0 {
+		processingTimeout = defaultUpdateProcessingTimeout
+	}
+	stopGrace := s.updateHandlerStopGrace
+	if stopGrace <= 0 {
+		stopGrace = defaultUpdateHandlerStopGrace
+	}
+	buffer := s.updateLeaseBuffer
+	if buffer <= 0 {
+		buffer = defaultUpdateLeaseBuffer
+	}
+	return s.now().Add(processingTimeout + stopGrace + buffer)
+}
+
+func (s *Service) effectiveStuckOwnerLease() time.Duration {
+	if s.stuckOwnerLease <= 0 {
+		return defaultStuckOwnerLease
+	}
+	return s.stuckOwnerLease
+}
+
+func (s *Service) journalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := s.journalWriteTimeout
+	if timeout <= 0 {
+		timeout = defaultJournalWriteTimeout
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func (s *Service) independentJournalContext() (context.Context, context.CancelFunc) {
+	return s.journalContext(context.Background())
+}
+
+func (s *Service) abortUpdateAttempt(updateID int, ownerToken string) error {
+	journalCtx, cancel := s.independentJournalContext()
+	defer cancel()
+	if err := s.updateJournal.AbortUpdateAttempt(journalCtx, updateID, ownerToken); err != nil {
+		return journalFailure("abort canceled update attempt", err)
+	}
+	return nil
+}
+
+func (s *Service) completeUpdateAttempt(updateID int, nextOffset int, ownerToken string) error {
+	journalCtx, cancel := s.independentJournalContext()
+	err := s.updateJournal.CompleteUpdateAttempt(
+		journalCtx,
+		updateID,
+		nextOffset,
+		ownerToken,
+	)
+	cancel()
+	if err == nil {
+		return nil
+	}
+
+	// A failed terminal transaction must remain at-least-once replayable, but
+	// it must not retain the normal multi-minute processing lease. Release the
+	// still-owned claim in a fresh bounded context so a supervisor restart can
+	// replay immediately. If the commit actually succeeded despite an
+	// ambiguous driver error, Abort will safely fail its owner/status guard and
+	// the terminal row will repair the checkpoint on the next Begin.
+	completeErr := journalFailure("complete update attempt", err)
+	if abortErr := s.abortUpdateAttempt(updateID, ownerToken); abortErr != nil {
+		return errors.Join(completeErr, abortErr)
+	}
+	return completeErr
+}
+
+func (s *Service) recordUpdateFailure(
+	updateID int,
+	nextOffset int,
+	ownerToken string,
+	cause string,
+	holdLeaseUntil time.Time,
+) (bool, error) {
+	journalCtx, cancel := s.independentJournalContext()
+	defer cancel()
+	dead, err := s.updateJournal.FailUpdateAttempt(
+		journalCtx,
+		updateID,
+		nextOffset,
+		ownerToken,
+		maxUpdateHandlerFailures,
+		cause,
+		holdLeaseUntil,
+	)
+	if err != nil {
+		return false, journalFailure("record failed update attempt", err)
+	}
+	return dead, nil
+}
+
+func (s *Service) logPoisonUpdate(
+	updateID int,
+	attemptCount int,
+	failureCount int,
+	metadata updateMetadata,
+	cause string,
+) {
+	s.logger.Error(
+		"Telegram update quarantined after repeated handler failures",
+		"update_id", updateID,
+		"attempt_count", attemptCount,
+		"failure_count", failureCount,
+		"action", metadata.action,
+		"error", cause,
+	)
+}
+
+func (s *Service) handleUpdateBounded(ctx context.Context, update tgbotapi.Update) (bool, error) {
+	updateTimeout := s.updateProcessingTimeout
+	if updateTimeout <= 0 {
+		updateTimeout = defaultUpdateProcessingTimeout
+	}
+	stopGrace := s.updateHandlerStopGrace
+	if stopGrace <= 0 {
+		stopGrace = defaultUpdateHandlerStopGrace
+	}
+
+	updateCtx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		var handlerErr error
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				handlerErr = fmt.Errorf("%w: %v", ErrUpdateHandlerPanic, recovered)
+			}
+			done <- handlerErr
+		}()
+		if s.updateHandler != nil {
+			handlerErr = s.updateHandler(updateCtx, update)
+			return
+		}
+		s.handleUpdate(updateCtx, update)
+	}()
+
+	select {
+	case handlerErr := <-done:
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		return errors.Is(updateCtx.Err(), context.DeadlineExceeded), handlerErr
+	case <-updateCtx.Done():
+	}
+
+	liveness.WorkerFromContext(ctx).Advance(liveness.PhaseCancelWait)
+	stopTimer := time.NewTimer(stopGrace)
+	defer stopTimer.Stop()
+	select {
+	case handlerErr := <-done:
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		return errors.Is(updateCtx.Err(), context.DeadlineExceeded), handlerErr
+	case <-stopTimer.C:
+		cause := updateCtx.Err()
+		if cause == nil {
+			cause = context.Canceled
+		}
+		return false, errors.Join(
+			cause,
+			fmt.Errorf("%w: update_id=%d grace=%s", ErrUpdateHandlerStuck, update.UpdateID, stopGrace),
+		)
 	}
 }
 
@@ -322,7 +718,12 @@ func (s *Service) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery
 func (s *Service) handleCommand(ctx context.Context, msg *tgbotapi.Message) (botResponse, error) {
 	command := strings.ToLower(msg.Command())
 	args := strings.Fields(msg.CommandArguments())
-	admin := s.isAdmin(ctx, msg.Chat.ID, msg.From)
+	admin := false
+	if requiresFreshAdmin(command, s.libraryMode()) {
+		admin = s.isAdminFresh(ctx, msg.Chat.ID, msg.From)
+	} else {
+		admin = s.isAdmin(ctx, msg.Chat.ID, msg.From)
+	}
 	switch command {
 	case "start", "help":
 		return botResponse{text: helpTextForMode(admin, s.libraryMode()), markup: homeKeyboardForMode(admin, s.libraryMode())}, nil
@@ -414,7 +815,12 @@ func (s *Service) routeAction(ctx context.Context, chatID int64, user *tgbotapi.
 	}
 
 	action := strings.ToLower(parts[0])
-	admin := s.isAdmin(ctx, chatID, user)
+	admin := false
+	if requiresFreshAdmin(action, s.libraryMode()) {
+		admin = s.isAdminFresh(ctx, chatID, user)
+	} else {
+		admin = s.isAdmin(ctx, chatID, user)
+	}
 	switch action {
 	case "library":
 		if !s.libraryMode() {
@@ -495,7 +901,10 @@ func (s *Service) routeAction(ctx context.Context, chatID int64, user *tgbotapi.
 }
 
 func (s *Service) handleUpload(ctx context.Context, msg *tgbotapi.Message) (botResponse, error) {
-	if s.libraryMode() && !s.isAdmin(ctx, msg.Chat.ID, msg.From) {
+	if s.libraryMode() && !s.isAdminFresh(ctx, msg.Chat.ID, msg.From) {
+		if err := ctx.Err(); err != nil {
+			return botResponse{}, err
+		}
 		return botResponse{}, errAdminOnly
 	}
 	if s.hooks.EnqueueUpload == nil {
@@ -511,6 +920,12 @@ func (s *Service) handleUpload(ctx context.Context, msg *tgbotapi.Message) (botR
 	}
 	if s.cfg.MaxUploadSizeBytes > 0 && upload.SizeBytes > s.cfg.MaxUploadSizeBytes {
 		return botResponse{}, fmt.Errorf("%w: %s is larger than the limit of %s", errUploadTooLarge, formatBytes(upload.SizeBytes), formatBytes(s.cfg.MaxUploadSizeBytes))
+	}
+	if s.hooks.PreflightUpload == nil {
+		return botResponse{}, errHookNotConfigured("preflight upload")
+	}
+	if err := s.hooks.PreflightUpload(ctx, upload); err != nil {
+		return botResponse{}, err
 	}
 
 	file, err := s.getFile(ctx, tgbotapi.FileConfig{FileID: upload.FileID})
@@ -770,17 +1185,39 @@ func (s *Service) isAdmin(ctx context.Context, chatID int64, user *tgbotapi.User
 		s.logger.Warn("get telegram chat administrators", "chat_id", chatID, "error", s.redactError(err))
 		return false
 	}
-	if _, ok := adminIDs[userID]; ok {
-		return true
-	}
+	_, ok := adminIDs[userID]
+	return ok
+}
 
-	adminIDs, _, err = s.getAdminIDs(ctx, chatID, true)
+func (s *Service) isAdminFresh(ctx context.Context, chatID int64, user *tgbotapi.User) bool {
+	if user == nil {
+		return false
+	}
+	timeout := s.adminLookupTimeout
+	if timeout <= 0 {
+		timeout = defaultAdminLookupTimeout
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	adminIDs, _, err := s.getAdminIDs(lookupCtx, chatID, true)
 	if err != nil {
 		s.logger.Warn("refresh telegram chat administrators", "chat_id", chatID, "error", s.redactError(err))
 		return false
 	}
-	_, ok := adminIDs[userID]
+	_, ok := adminIDs[int64(user.ID)]
 	return ok
+}
+
+func requiresFreshAdmin(action string, libraryMode bool) bool {
+	switch action {
+	case "remove", "move", "skip":
+		return true
+	case "scan", "theme", "select":
+		return libraryMode
+	default:
+		return false
+	}
 }
 
 func (s *Service) getAdminIDs(ctx context.Context, chatID int64, force bool) (map[int64]struct{}, bool, error) {
@@ -1331,16 +1768,18 @@ type botAPI interface {
 }
 
 type productionBotAPI struct {
-	updates       *tgbotapi.BotAPI
-	requests      *tgbotapi.BotAPI
-	updateClient  *contextHTTPClient
-	updateMu      sync.Mutex
-	requestClient *contextHTTPClient
-	requestMu     sync.Mutex
+	updates        *tgbotapi.BotAPI
+	requests       *tgbotapi.BotAPI
+	updateClient   *contextHTTPClient
+	updateGate     chan struct{}
+	requestClient  *contextHTTPClient
+	requestGate    chan struct{}
+	requestTimeout time.Duration
 }
 
 type contextHTTPClient struct {
 	base    tgbotapi.HTTPClient
+	mu      sync.RWMutex
 	ctx     context.Context
 	secrets []string
 }
@@ -1366,10 +1805,13 @@ func newProductionBotAPI(cfg Config) (*productionBotAPI, error) {
 	updates.Debug = cfg.Debug
 	requests.Debug = cfg.Debug
 	return &productionBotAPI{
-		updates:       updates,
-		requests:      &requests,
-		updateClient:  updateClient,
-		requestClient: requestClient,
+		updates:        updates,
+		requests:       &requests,
+		updateClient:   updateClient,
+		updateGate:     newContextGate(),
+		requestClient:  requestClient,
+		requestGate:    newContextGate(),
+		requestTimeout: cfg.RequestTimeout,
 	}, nil
 }
 
@@ -1424,53 +1866,64 @@ func (b *productionBotAPI) GetChatAdministrators(ctx context.Context, config tgb
 }
 
 func (b *productionBotAPI) withUpdateContext(ctx context.Context, call func() error) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	b.updateMu.Lock()
-	defer b.updateMu.Unlock()
-	b.updateClient.ctx = ctx
-	defer func() {
-		b.updateClient.ctx = nil
-	}()
-	return call()
+	return withContextGate(ctx, b.requestTimeout, b.updateGate, b.updateClient, call)
 }
 
 func (b *productionBotAPI) withRequestContext(ctx context.Context, call func() error) error {
+	return withContextGate(ctx, b.requestTimeout, b.requestGate, b.requestClient, call)
+}
+
+func newContextGate() chan struct{} {
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
+	return gate
+}
+
+func withContextGate(ctx context.Context, timeout time.Duration, gate chan struct{}, client *contextHTTPClient, call func() error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if gate == nil {
+		return errors.New("telegram context gate is not initialized")
+	}
+	if timeout <= 0 {
+		timeout = defaultRequestTimeout
+	}
+	boundedCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-	b.requestMu.Lock()
-	defer b.requestMu.Unlock()
-	b.requestClient.ctx = ctx
+	select {
+	case <-boundedCtx.Done():
+		return boundedCtx.Err()
+	case <-gate:
+	}
 	defer func() {
-		b.requestClient.ctx = nil
+		gate <- struct{}{}
 	}()
+	if err := boundedCtx.Err(); err != nil {
+		return err
+	}
+
+	client.setContext(boundedCtx)
+	defer client.setContext(nil)
 	return call()
 }
 
 func (c *contextHTTPClient) Do(req *http.Request) (*http.Response, error) {
-	if c.ctx != nil {
-		req = req.WithContext(c.ctx)
+	c.mu.RLock()
+	ctx := c.ctx
+	c.mu.RUnlock()
+	if ctx != nil {
+		req = req.WithContext(ctx)
 	}
 	resp, err := c.base.Do(req)
 	return resp, secret.RedactError(err, c.secrets...)
 }
 
-func sleepContext(ctx context.Context, delay time.Duration) error {
-	if delay <= 0 {
-		delay = defaultPollRetryDelay
-	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
+func (c *contextHTTPClient) setContext(ctx context.Context) {
+	c.mu.Lock()
+	c.ctx = ctx
+	c.mu.Unlock()
 }
 
 func (s *Service) redactError(err error) error {

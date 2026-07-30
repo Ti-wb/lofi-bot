@@ -14,9 +14,14 @@ const (
 	ErrorInvalidFilename      ErrorCode = "invalid_filename"
 	ErrorInvalidPeriod        ErrorCode = "invalid_period"
 	ErrorReadDirectory        ErrorCode = "read_directory"
+	ErrorDirectoryCapacity    ErrorCode = "directory_capacity"
 	ErrorNoCandidates         ErrorCode = "no_candidates"
 	ErrorInvalidRandom        ErrorCode = "invalid_random"
 )
+
+// ErrDirectoryCapacity identifies a scan that stopped before parsing because
+// one top-level media directory exceeded MaxDirectoryEntries.
+var ErrDirectoryCapacity = errors.New("media library directory capacity reached")
 
 // Error is a structured error that callers can surface without parsing text.
 type Error struct {

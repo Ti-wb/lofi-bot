@@ -12,7 +12,13 @@ import (
 	"time"
 )
 
-const currentEnvSchemaVersion = 4
+const (
+	currentEnvSchemaVersion = 5
+	bytesPerMiB             = int64(1024 * 1024)
+	maxStorageMiB           = int64(^uint64(0)>>1) / bytesPerMiB
+	// maxRetentionDays is the largest whole-day window representable by time.Duration.
+	maxRetentionDays = int((1<<63 - 1) / (24 * time.Hour))
+)
 
 type Config struct {
 	TelegramBotToken   string
@@ -37,6 +43,7 @@ type Config struct {
 	PlayerMode                string
 	MaxVideoSizeBytes         int64
 	MaxVideoDurationSeconds   int
+	MinFreeDiskBytes          int64
 	MaxQueueLength            int
 	RetentionDays             int
 	RetentionMaxFiles         int
@@ -57,11 +64,15 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	maxVideoSizeMB, err := getenvInt("MAX_VIDEO_SIZE_MB", 2000)
+	maxVideoSizeMB, err := getenvInt64("MAX_VIDEO_SIZE_MB", 2000)
 	if err != nil {
 		return Config{}, err
 	}
 	maxVideoDurationSeconds, err := getenvInt("MAX_VIDEO_DURATION_SECONDS", 7200)
+	if err != nil {
+		return Config{}, err
+	}
+	minFreeDiskMB, err := getenvInt64("MIN_FREE_DISK_MB", 512)
 	if err != nil {
 		return Config{}, err
 	}
@@ -81,6 +92,18 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	if maxVideoSizeMB <= 0 {
+		return Config{}, errors.New("MAX_VIDEO_SIZE_MB must be positive")
+	}
+	if maxVideoSizeMB > maxStorageMiB {
+		return Config{}, errors.New("MAX_VIDEO_SIZE_MB is too large")
+	}
+	if minFreeDiskMB < 0 {
+		return Config{}, errors.New("MIN_FREE_DISK_MB must be non-negative")
+	}
+	if minFreeDiskMB > maxStorageMiB {
+		return Config{}, errors.New("MIN_FREE_DISK_MB is too large")
+	}
 
 	cfg := Config{
 		TelegramBotToken:          strings.TrimSpace(getenv("TELEGRAM_BOT_TOKEN", "")),
@@ -97,8 +120,9 @@ func Load() (Config, error) {
 		FallbackMode:              strings.TrimSpace(getenv("FALLBACK_MODE", "random_played")),
 		PlayerMode:                strings.TrimSpace(getenv("PLAYER_MODE", "library")),
 		DataDir:                   strings.TrimSpace(getenv("DATA_DIR", "./data")),
-		MaxVideoSizeBytes:         int64(maxVideoSizeMB) * 1024 * 1024,
+		MaxVideoSizeBytes:         maxVideoSizeMB * bytesPerMiB,
 		MaxVideoDurationSeconds:   maxVideoDurationSeconds,
+		MinFreeDiskBytes:          minFreeDiskMB * bytesPerMiB,
 		MaxQueueLength:            maxQueueLength,
 		RetentionDays:             retentionDays,
 		RetentionMaxFiles:         retentionMaxFiles,
@@ -144,9 +168,6 @@ func Load() (Config, error) {
 	if !validPlayerMode(cfg.PlayerMode) {
 		return cfg, fmt.Errorf("PLAYER_MODE must be one of library, queue")
 	}
-	if cfg.MaxVideoSizeBytes <= 0 {
-		return cfg, errors.New("MAX_VIDEO_SIZE_MB must be positive")
-	}
 	if cfg.MaxVideoDurationSeconds < 0 {
 		return cfg, errors.New("MAX_VIDEO_DURATION_SECONDS must be non-negative")
 	}
@@ -155,6 +176,9 @@ func Load() (Config, error) {
 	}
 	if cfg.RetentionDays < 0 {
 		return cfg, errors.New("RETENTION_DAYS must be non-negative")
+	}
+	if cfg.RetentionDays > maxRetentionDays {
+		return cfg, fmt.Errorf("RETENTION_DAYS must be at most %d", maxRetentionDays)
 	}
 	if cfg.RetentionMaxFiles < 0 {
 		return cfg, errors.New("RETENTION_MAX_FILES must be non-negative")
@@ -178,7 +202,7 @@ func validateHTTPURL(key, raw string) error {
 }
 
 func migrateDotEnv(path string) error {
-	body, err := os.ReadFile(path)
+	body, err := readPrivateDotEnv(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -307,6 +331,11 @@ func envMigrationAdditions(version int, values map[string]string) []string {
 			additions = append(additions, "MUSIC_MEDIA_DIR="+joinEnvPath(mediaDir, "music"))
 		}
 	}
+	if version < 5 {
+		if _, ok := values["MIN_FREE_DISK_MB"]; !ok {
+			additions = append(additions, "MIN_FREE_DISK_MB=512")
+		}
+	}
 	return additions
 }
 
@@ -367,7 +396,7 @@ func validPlayerMode(mode string) bool {
 }
 
 func loadDotEnv(path string) error {
-	body, err := os.ReadFile(path)
+	body, err := readPrivateDotEnv(path)
 	if err != nil {
 		return err
 	}
@@ -387,6 +416,13 @@ func loadDotEnv(path string) error {
 		}
 	}
 	return nil
+}
+
+func readPrivateDotEnv(path string) ([]byte, error) {
+	if err := os.Chmod(path, 0o600); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(path)
 }
 
 func getenv(key, fallback string) string {

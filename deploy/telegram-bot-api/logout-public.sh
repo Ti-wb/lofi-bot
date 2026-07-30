@@ -42,6 +42,7 @@ is_placeholder() {
 }
 
 [ -f "$ENV_FILE" ] || die ".env is required at repo root"
+chmod 600 "$ENV_FILE" || die "could not secure .env"
 
 reject_env_xtrace
 disable_xtrace

@@ -78,6 +78,40 @@ type Event struct {
 	At        time.Time
 }
 
+type MediaState string
+
+const (
+	MediaStateNone      MediaState = "OBS_MEDIA_STATE_NONE"
+	MediaStatePlaying   MediaState = "OBS_MEDIA_STATE_PLAYING"
+	MediaStateOpening   MediaState = "OBS_MEDIA_STATE_OPENING"
+	MediaStateBuffering MediaState = "OBS_MEDIA_STATE_BUFFERING"
+	MediaStatePaused    MediaState = "OBS_MEDIA_STATE_PAUSED"
+	MediaStateStopped   MediaState = "OBS_MEDIA_STATE_STOPPED"
+	MediaStateEnded     MediaState = "OBS_MEDIA_STATE_ENDED"
+	MediaStateError     MediaState = "OBS_MEDIA_STATE_ERROR"
+)
+
+type MediaInputStatus struct {
+	State                MediaState
+	DurationMilliseconds *float64
+	CursorMilliseconds   *float64
+}
+
+type InputSettings struct {
+	LocalFile string
+	InputKind string
+}
+
+type RequestError struct {
+	RequestType string
+	Code        int
+	Comment     string
+}
+
+func (e *RequestError) Error() string {
+	return fmt.Sprintf("OBS %s failed: %s (%d)", e.RequestType, e.Comment, e.Code)
+}
+
 // PlaySourceOptions controls optional OBS requests around source playback.
 // Nil Looping or Mute leaves the corresponding OBS input setting unchanged.
 type PlaySourceOptions struct {
@@ -103,12 +137,13 @@ type Client struct {
 	currentFiles    map[string]string
 	supersededFiles map[string][]supersededSourceFile
 	lastErr         error
-	pending         map[string]chan requestResponseData
+	pending         map[string]chan requestResult
 	closed          bool
 
-	writeMu sync.Mutex
-	nextID  atomic.Uint64
-	events  chan Event
+	writeGate  chan struct{}
+	nextID     atomic.Uint64
+	events     chan Event
+	logSamples eventLogSamplers
 }
 
 func NewClient(opts Options) (*Client, error) {
@@ -135,7 +170,8 @@ func NewClient(opts Options) (*Client, error) {
 		state:           StateDisconnected,
 		currentFiles:    make(map[string]string),
 		supersededFiles: make(map[string][]supersededSourceFile),
-		pending:         make(map[string]chan requestResponseData),
+		pending:         make(map[string]chan requestResult),
+		writeGate:       make(chan struct{}, 1),
 		events:          make(chan Event, opts.EventBuffer),
 	}, nil
 }
@@ -222,6 +258,45 @@ func (c *Client) Status() Status {
 	return status
 }
 
+func (c *Client) Probe(ctx context.Context) error {
+	return c.request(ctx, "GetVersion", nil)
+}
+
+func (c *Client) GetMediaInputStatus(ctx context.Context, inputName string) (MediaInputStatus, error) {
+	if inputName == "" {
+		return MediaInputStatus{}, errors.New("OBS input name is required")
+	}
+
+	var response mediaInputStatusResponse
+	if err := c.requestInto(ctx, "GetMediaInputStatus", map[string]any{
+		"inputName": inputName,
+	}, &response); err != nil {
+		return MediaInputStatus{}, err
+	}
+	return MediaInputStatus{
+		State:                response.MediaState,
+		DurationMilliseconds: response.MediaDuration,
+		CursorMilliseconds:   response.MediaCursor,
+	}, nil
+}
+
+func (c *Client) GetInputSettings(ctx context.Context, inputName string) (InputSettings, error) {
+	if inputName == "" {
+		return InputSettings{}, errors.New("OBS input name is required")
+	}
+
+	var response inputSettingsResponse
+	if err := c.requestInto(ctx, "GetInputSettings", map[string]any{
+		"inputName": inputName,
+	}, &response); err != nil {
+		return InputSettings{}, err
+	}
+	return InputSettings{
+		LocalFile: response.InputSettings.LocalFile,
+		InputKind: response.InputKind,
+	}, nil
+}
+
 func (c *Client) PlayFile(ctx context.Context, path string) error {
 	return c.PlaySourceFile(ctx, c.opts.MediaSourceName, path, PlaySourceOptions{
 		Restart:         true,
@@ -261,7 +336,15 @@ func (c *Client) PlaySourceFile(ctx context.Context, sourceName string, path str
 	}
 	if options.CenterSceneItem {
 		if err := c.centerCurrentProgramSceneItem(ctx, sourceName); err != nil {
-			c.opts.Logger.Warn("center OBS media source failed", "source", sourceName, "error", err)
+			logSampledEventWarning(
+				c.opts.Logger,
+				"center OBS media source failed",
+				c.logSamples.failure(&c.logSamples.centerSource),
+				"source", sourceName,
+				"error", c.boundedLogError(err),
+			)
+		} else {
+			c.logSamples.success(&c.logSamples.centerSource)
 		}
 	}
 	if options.Restart {
@@ -443,7 +526,7 @@ func (c *Client) requestResponse(ctx context.Context, requestType string, reques
 	defer cancelTimeout()
 
 	id := fmt.Sprintf("%d", c.nextID.Add(1))
-	responseCh := make(chan requestResponseData, 1)
+	responseCh := make(chan requestResult, 1)
 
 	c.mu.Lock()
 	if c.conn != conn || c.state != StateConnected {
@@ -468,7 +551,7 @@ func (c *Client) requestResponse(ctx context.Context, requestType string, reques
 	default:
 	}
 
-	err = c.write(ctx, timeoutCtx, conn, envelope{Op: opRequest, D: mustMarshal(requestDataPayload{
+	err = c.write(ctx, timeoutCtx, responseCh, conn, envelope{Op: opRequest, D: mustMarshal(requestDataPayload{
 		RequestType: requestType,
 		RequestID:   id,
 		RequestData: requestData,
@@ -494,10 +577,18 @@ func (c *Client) requestResponse(ctx context.Context, requestType string, reques
 		cleanup = false
 		c.disconnectIfCurrent(conn, err)
 		return requestResponseData{}, err
-	case response := <-responseCh:
+	case result := <-responseCh:
 		cleanup = false
+		if result.err != nil {
+			return requestResponseData{}, result.err
+		}
+		response := result.response
 		if !response.RequestStatus.Result {
-			return requestResponseData{}, fmt.Errorf("OBS %s failed: %s (%d)", requestType, response.RequestStatus.Comment, response.RequestStatus.Code)
+			return requestResponseData{}, &RequestError{
+				RequestType: requestType,
+				Code:        response.RequestStatus.Code,
+				Comment:     response.RequestStatus.Comment,
+			}
 		}
 		return response, nil
 	}
@@ -515,9 +606,22 @@ func (c *Client) connectedConn() (*websocket.Conn, error) {
 	return c.conn, nil
 }
 
-func (c *Client) write(ctx context.Context, timeoutCtx context.Context, conn *websocket.Conn, value any) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+func (c *Client) write(ctx context.Context, timeoutCtx context.Context, failed <-chan requestResult, conn *websocket.Conn, value any) error {
+	select {
+	case c.writeGate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timeoutCtx.Done():
+		return timeoutCtx.Err()
+	case result := <-failed:
+		if result.err != nil {
+			return result.err
+		}
+		return errors.New("OBS request completed before its write started")
+	}
+	defer func() {
+		<-c.writeGate
+	}()
 	return writeJSONWithTimeout(ctx, timeoutCtx, conn, value)
 }
 
@@ -541,9 +645,15 @@ func (c *Client) readLoop(conn *websocket.Conn) {
 func (c *Client) handleEvent(raw json.RawMessage) {
 	var data eventData
 	if err := json.Unmarshal(raw, &data); err != nil {
-		c.opts.Logger.Warn("decode OBS event", "error", err)
+		logSampledEventWarning(
+			c.opts.Logger,
+			"decode OBS event",
+			c.logSamples.failure(&c.logSamples.eventDecode),
+			"error", c.boundedLogError(err),
+		)
 		return
 	}
+	c.logSamples.success(&c.logSamples.eventDecode)
 	if data.EventType != "MediaInputPlaybackEnded" {
 		return
 	}
@@ -561,34 +671,39 @@ func (c *Client) handleEvent(raw json.RawMessage) {
 	}
 	if supersededPath, ok := c.popSupersededSourceFileLocked(inputName, event.At); ok {
 		event.Path = supersededPath
-		select {
-		case c.events <- event:
-		default:
-			c.opts.Logger.Warn("drop OBS event because event channel is full", "event", event.Type)
-		}
-		c.mu.Unlock()
-		return
-	}
-	path, tracked := c.currentFiles[inputName]
-	if inputName != c.opts.MediaSourceName && !tracked {
-		c.mu.Unlock()
-		return
-	}
-	if tracked {
-		event.Path = path
-		delete(c.currentFiles, inputName)
 	} else {
-		event.Path = c.currentFile
+		path, tracked := c.currentFiles[inputName]
+		if inputName != c.opts.MediaSourceName && !tracked {
+			c.mu.Unlock()
+			return
+		}
+		if tracked {
+			event.Path = path
+			delete(c.currentFiles, inputName)
+		} else {
+			event.Path = c.currentFile
+		}
+		if inputName == c.opts.MediaSourceName {
+			c.currentFile = ""
+		}
 	}
-	if inputName == c.opts.MediaSourceName {
-		c.currentFile = ""
-	}
+	dropped := false
 	select {
 	case c.events <- event:
 	default:
-		c.opts.Logger.Warn("drop OBS event because event channel is full", "event", event.Type)
+		dropped = true
 	}
 	c.mu.Unlock()
+	if dropped {
+		logSampledEventWarning(
+			c.opts.Logger,
+			"drop OBS event because event channel is full",
+			c.logSamples.failure(&c.logSamples.eventOverflow),
+			"event", event.Type,
+		)
+	} else {
+		c.logSamples.success(&c.logSamples.eventOverflow)
+	}
 }
 
 func (c *Client) popSupersededSourceFileLocked(inputName string, now time.Time) (string, bool) {
@@ -612,9 +727,15 @@ func (c *Client) popSupersededSourceFileLocked(inputName string, now time.Time) 
 func (c *Client) handleRequestResponse(raw json.RawMessage) {
 	var data requestResponseData
 	if err := json.Unmarshal(raw, &data); err != nil {
-		c.opts.Logger.Warn("decode OBS request response", "error", err)
+		logSampledEventWarning(
+			c.opts.Logger,
+			"decode OBS request response",
+			c.logSamples.failure(&c.logSamples.responseDecode),
+			"error", c.boundedLogError(err),
+		)
 		return
 	}
+	c.logSamples.success(&c.logSamples.responseDecode)
 
 	c.mu.Lock()
 	responseCh := c.pending[data.RequestID]
@@ -622,7 +743,7 @@ func (c *Client) handleRequestResponse(raw json.RawMessage) {
 	c.mu.Unlock()
 
 	if responseCh != nil {
-		responseCh <- data
+		responseCh <- requestResult{response: data}
 	}
 }
 
@@ -654,43 +775,28 @@ func (c *Client) setDisconnected(err error) {
 func (c *Client) failPendingLocked(err error) {
 	for id, ch := range c.pending {
 		delete(c.pending, id)
-		ch <- requestResponseData{
-			RequestID: id,
-			RequestStatus: requestStatus{
-				Result:  false,
-				Code:    0,
-				Comment: err.Error(),
-			},
-		}
+		ch <- requestResult{err: err}
 	}
 }
 
 func readJSON(ctx context.Context, conn *websocket.Conn, value any) error {
-	done := make(chan error, 1)
-	go func() {
-		done <- conn.ReadJSON(value)
-	}()
-	select {
-	case <-ctx.Done():
-		_ = conn.Close()
-		return ctx.Err()
-	case err := <-done:
-		return err
+	stopInterrupt := interruptConnectionOnDone(ctx, conn.Close)
+	err := conn.ReadJSON(value)
+	stopInterrupt()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
+	return err
 }
 
 func writeJSON(ctx context.Context, conn *websocket.Conn, value any) error {
-	done := make(chan error, 1)
-	go func() {
-		done <- conn.WriteJSON(value)
-	}()
-	select {
-	case <-ctx.Done():
-		_ = conn.Close()
-		return ctx.Err()
-	case err := <-done:
-		return err
+	stopInterrupt := interruptConnectionOnDone(ctx, conn.Close)
+	err := conn.WriteJSON(value)
+	stopInterrupt()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
+	return err
 }
 
 func writeJSONWithTimeout(ctx context.Context, timeoutCtx context.Context, conn *websocket.Conn, value any) error {
@@ -700,25 +806,48 @@ func writeJSONWithTimeout(ctx context.Context, timeoutCtx context.Context, conn 
 }
 
 func waitWriteJSON(ctx context.Context, timeoutCtx context.Context, write func() error, closeConn func() error) error {
-	done := make(chan error, 1)
-	go func() {
-		done <- write()
-	}()
-	select {
-	case <-ctx.Done():
-		_ = closeConn()
-		return ctx.Err()
-	case <-timeoutCtx.Done():
-		_ = closeConn()
-		return timeoutCtx.Err()
-	case err := <-done:
+	var closeOnce sync.Once
+	interrupt := func() error {
+		var err error
+		closeOnce.Do(func() {
+			err = closeConn()
+		})
 		return err
+	}
+	stopCallerInterrupt := interruptConnectionOnDone(ctx, interrupt)
+	stopTimeoutInterrupt := interruptConnectionOnDone(timeoutCtx, interrupt)
+
+	err := write()
+	stopCallerInterrupt()
+	stopTimeoutInterrupt()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if timeoutErr := timeoutCtx.Err(); timeoutErr != nil {
+		return timeoutErr
+	}
+	return err
+}
+
+func interruptConnectionOnDone(ctx context.Context, closeConn func() error) func() {
+	callbackDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(callbackDone)
+		_ = closeConn()
+	})
+	return func() {
+		if !stop() {
+			<-callbackDone
+		}
 	}
 }
 
 func buildIdentify(data helloData, password string) (identifyData, error) {
 	identify := identifyData{RPCVersion: data.RPCVersion}
 	if data.Authentication == nil {
+		if password != "" {
+			return identifyData{}, errors.New("OBS authentication required but server did not offer it")
+		}
 		return identify, nil
 	}
 	auth, err := buildAuthentication(password, data.Authentication.Salt, data.Authentication.Challenge)
@@ -781,6 +910,11 @@ type eventData struct {
 	} `json:"eventData"`
 }
 
+type requestResult struct {
+	response requestResponseData
+	err      error
+}
+
 type requestResponseData struct {
 	RequestType   string          `json:"requestType"`
 	RequestID     string          `json:"requestId"`
@@ -792,6 +926,19 @@ type requestStatus struct {
 	Result  bool   `json:"result"`
 	Code    int    `json:"code"`
 	Comment string `json:"comment"`
+}
+
+type mediaInputStatusResponse struct {
+	MediaState    MediaState `json:"mediaState"`
+	MediaDuration *float64   `json:"mediaDuration"`
+	MediaCursor   *float64   `json:"mediaCursor"`
+}
+
+type inputSettingsResponse struct {
+	InputSettings struct {
+		LocalFile string `json:"local_file"`
+	} `json:"inputSettings"`
+	InputKind string `json:"inputKind"`
 }
 
 type currentProgramSceneResponse struct {

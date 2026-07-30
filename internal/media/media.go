@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/tiwb/tg-obs-bot/internal/liveness"
 )
 
 type Manager struct {
@@ -111,6 +114,10 @@ func (m *Manager) Download(ctx context.Context, url, originalName string, maxByt
 }
 
 func (m *Manager) Probe(ctx context.Context, path string) (Metadata, error) {
+	tracker := liveness.WorkerFromContext(ctx)
+	probeScope := tracker.Scope(liveness.PhaseMediaProbe)
+	defer probeScope.Close()
+
 	stat, err := os.Stat(path)
 	if err != nil {
 		return Metadata{}, err
@@ -140,8 +147,11 @@ func (m *Manager) Probe(ctx context.Context, path string) (Metadata, error) {
 	}
 	if result.Format.Duration != "" {
 		duration, err := strconv.ParseFloat(result.Format.Duration, 64)
-		if err == nil {
-			meta.DurationSeconds = int(duration + 0.5)
+		if err == nil && duration > 0 && !math.IsNaN(duration) && !math.IsInf(duration, 0) {
+			rounded := math.Ceil(duration)
+			if rounded <= float64(1<<31-1) {
+				meta.DurationSeconds = int(rounded)
+			}
 		}
 	}
 	return meta, nil
@@ -153,6 +163,9 @@ func (m *Manager) Validate(meta Metadata, maxBytes int64, maxDurationSeconds int
 	}
 	if meta.SizeBytes > maxBytes {
 		return fmt.Errorf("file exceeds max size of %d bytes", maxBytes)
+	}
+	if maxDurationSeconds > 0 && meta.DurationSeconds <= 0 {
+		return errors.New("video duration is unavailable or invalid")
 	}
 	if maxDurationSeconds > 0 && meta.DurationSeconds > maxDurationSeconds {
 		return fmt.Errorf("video exceeds max duration of %d seconds", maxDurationSeconds)

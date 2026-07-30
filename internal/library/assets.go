@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +18,10 @@ type Kind string
 const (
 	KindLoop  Kind = "loop"
 	KindMusic Kind = "music"
+
+	// MaxDirectoryEntries bounds both persistent library growth and one scan's
+	// top-level directory read.
+	MaxDirectoryEntries = 10_000
 )
 
 var supportedLoopExtensions = map[string]struct{}{
@@ -182,13 +188,17 @@ func Scan(mediaDir string) (Library, error) {
 
 // ScanDirs reads explicit loop and music directories non-recursively.
 func ScanDirs(loopDir string, musicDir string) (Library, error) {
+	return scanDirsWithLimit(loopDir, musicDir, MaxDirectoryEntries)
+}
+
+func scanDirsWithLimit(loopDir string, musicDir string, limit int) (Library, error) {
 	var (
 		lib    Library
 		issues []*Error
 	)
 
-	loops, loopIssues := scanLoops(loopDir)
-	music, musicIssues := scanMusic(musicDir)
+	loops, loopIssues := scanLoops(loopDir, limit)
+	music, musicIssues := scanMusic(musicDir, limit)
 	lib.Loops = loops
 	lib.Music = music
 	issues = append(issues, loopIssues...)
@@ -242,17 +252,14 @@ func (l Library) Summary() Summary {
 	return summary
 }
 
-func scanLoops(mediaDir string) ([]Loop, []*Error) {
+func scanLoops(mediaDir string, limit int) ([]Loop, []*Error) {
 	dir, err := filepath.Abs(mediaDir)
 	if err != nil {
 		return nil, []*Error{fileError(ErrorReadDirectory, KindLoop, "", "directory", mediaDir, err)}
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, []*Error{fileError(ErrorReadDirectory, KindLoop, "", "directory", dir, err)}
+	entries, issue := readDirectoryEntries(dir, KindLoop, limit)
+	if issue != nil {
+		return nil, []*Error{issue}
 	}
 
 	var (
@@ -286,17 +293,14 @@ func scanLoops(mediaDir string) ([]Loop, []*Error) {
 	return loops, issues
 }
 
-func scanMusic(mediaDir string) ([]Music, []*Error) {
+func scanMusic(mediaDir string, limit int) ([]Music, []*Error) {
 	dir, err := filepath.Abs(mediaDir)
 	if err != nil {
 		return nil, []*Error{fileError(ErrorReadDirectory, KindMusic, "", "directory", mediaDir, err)}
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, []*Error{fileError(ErrorReadDirectory, KindMusic, "", "directory", dir, err)}
+	entries, issue := readDirectoryEntries(dir, KindMusic, limit)
+	if issue != nil {
+		return nil, []*Error{issue}
 	}
 
 	var (
@@ -326,6 +330,46 @@ func scanMusic(mediaDir string) ([]Music, []*Error) {
 		return music[i].RelPath < music[j].RelPath
 	})
 	return music, issues
+}
+
+func readDirectoryEntries(dir string, kind Kind, limit int) ([]os.DirEntry, *Error) {
+	if limit <= 0 {
+		return nil, fileError(
+			ErrorDirectoryCapacity,
+			kind,
+			"",
+			"directory",
+			dir,
+			fmt.Errorf("%w: limit must be positive", ErrDirectoryCapacity),
+		)
+	}
+	handle, err := os.Open(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fileError(ErrorReadDirectory, kind, "", "directory", dir, err)
+	}
+	defer handle.Close()
+
+	entries, err := handle.ReadDir(limit + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, fileError(ErrorReadDirectory, kind, "", "directory", dir, err)
+	}
+	if len(entries) > limit {
+		return nil, fileError(
+			ErrorDirectoryCapacity,
+			kind,
+			"",
+			"directory",
+			dir,
+			fmt.Errorf("%w: %s exceeds %d entries", ErrDirectoryCapacity, dir, limit),
+		)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+	return entries, nil
 }
 
 func withFile(err error, kind Kind, path string) *Error {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,6 +29,21 @@ func TestBuildIdentifyAllowsEmptyPasswordWhenAuthenticationDisabled(t *testing.T
 	}
 }
 
+func TestBuildIdentifyRejectsConfiguredPasswordWithoutAuthentication(t *testing.T) {
+	const password = "configured-password"
+
+	_, err := buildIdentify(helloData{RPCVersion: 1}, password)
+	if err == nil {
+		t.Fatal("expected configured OBS authentication to be required")
+	}
+	if !strings.Contains(err.Error(), "OBS authentication required but server did not offer it") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Fatalf("authentication error leaked OBS password: %v", err)
+	}
+}
+
 func TestBuildIdentifyFailsWhenAuthenticationRequiresEmptyPassword(t *testing.T) {
 	_, err := buildIdentify(helloData{
 		RPCVersion: 1,
@@ -41,6 +57,151 @@ func TestBuildIdentifyFailsWhenAuthenticationRequiresEmptyPassword(t *testing.T)
 	}
 	if !strings.Contains(err.Error(), "OBS authentication required but password is empty") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBuildIdentifyAuthenticatesWhenServerRequiresIt(t *testing.T) {
+	identify, err := buildIdentify(helloData{
+		RPCVersion: 1,
+		Authentication: &authenticationData{
+			Challenge: "challenge",
+			Salt:      "salt",
+		},
+	}, "configured-password")
+	if err != nil {
+		t.Fatalf("build authenticated identify: %v", err)
+	}
+	if identify.RPCVersion != 1 {
+		t.Fatalf("rpc version = %d, want 1", identify.RPCVersion)
+	}
+	const want = "IC+CckPMyp9jOz74iVmxn7TWxInldEvbuJvqFtkHaYU="
+	if identify.Authentication != want {
+		t.Fatalf("authentication = %q, want %q", identify.Authentication, want)
+	}
+}
+
+func TestDroppedEventLoggingDoesNotBlockStatusOrCloseUnderClientMutex(t *testing.T) {
+	blocker := &blockingLogHandler{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	client, err := NewClient(Options{
+		URL:             "ws://unused.invalid",
+		MediaSourceName: "queue",
+		EventBuffer:     1,
+		Logger:          slog.New(blocker),
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	client.currentFiles["queue"] = "/tmp/current.mp4"
+	client.events <- Event{Type: EventMediaEnded}
+
+	handled := make(chan struct{})
+	go func() {
+		client.handleEvent(mediaEndedEvent("queue").D)
+		close(handled)
+	}()
+	select {
+	case <-blocker.started:
+	case <-time.After(time.Second):
+		t.Fatal("event-drop warning did not reach blocking logger")
+	}
+
+	statusDone := make(chan Status, 1)
+	go func() {
+		statusDone <- client.Status()
+	}()
+	select {
+	case <-statusDone:
+	case <-time.After(time.Second):
+		t.Fatal("Status blocked behind event-drop logging")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- client.Close()
+	}()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked behind event-drop logging")
+	}
+
+	close(blocker.release)
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("event handler did not return after logger unblocked")
+	}
+}
+
+func TestDroppedSupersededEventLoggingDoesNotBlockStatusOrCloseUnderClientMutex(t *testing.T) {
+	blocker := &blockingLogHandler{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	client, err := NewClient(Options{
+		URL:             "ws://unused.invalid",
+		MediaSourceName: "queue",
+		EventBuffer:     1,
+		Logger:          slog.New(blocker),
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	client.setCurrentFile("queue", "/tmp/current.mp4")
+	client.supersededFiles["queue"] = []supersededSourceFile{{
+		path:  "/tmp/superseded.mp4",
+		until: time.Now().Add(time.Minute),
+	}}
+	client.events <- Event{Type: EventMediaEnded}
+
+	handled := make(chan struct{})
+	go func() {
+		client.handleEvent(mediaEndedEvent("queue").D)
+		close(handled)
+	}()
+	select {
+	case <-blocker.started:
+	case <-time.After(time.Second):
+		t.Fatal("superseded event-drop warning did not reach blocking logger")
+	}
+
+	statusDone := make(chan Status, 1)
+	go func() {
+		statusDone <- client.Status()
+	}()
+	select {
+	case status := <-statusDone:
+		if status.CurrentFile != "/tmp/current.mp4" {
+			t.Fatalf("current file = %q, want replacement file to remain current", status.CurrentFile)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Status blocked behind superseded event-drop logging")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- client.Close()
+	}()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked behind superseded event-drop logging")
+	}
+
+	close(blocker.release)
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("superseded event handler did not return after logger unblocked")
 	}
 }
 
@@ -80,6 +241,58 @@ func TestClientConnectHandshakeSuccess(t *testing.T) {
 	}
 }
 
+func TestClientConnectRejectsConfiguredPasswordWithoutAuthentication(t *testing.T) {
+	identifyReceived := make(chan bool, 1)
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			return fmt.Errorf("set identify deadline: %w", err)
+		}
+		var identify envelope
+		if err := conn.ReadJSON(&identify); err != nil {
+			identifyReceived <- false
+			return nil
+		}
+		identifyReceived <- true
+		return writeEnvelope(conn, envelope{Op: opIdentified})
+	})
+	defer server.Close()
+
+	const password = "configured-password"
+	client, err := NewClient(Options{
+		URL:             server.URL,
+		Password:        password,
+		MediaSourceName: "media",
+		RequestTimeout:  time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = client.Connect(ctx)
+	if err == nil {
+		t.Fatal("expected authentication-free OBS handshake to fail")
+	}
+	if !strings.Contains(err.Error(), "OBS authentication required but server did not offer it") {
+		t.Fatalf("Connect error = %v", err)
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Fatalf("Connect error leaked OBS password: %v", err)
+	}
+	if received := <-identifyReceived; received {
+		t.Fatal("client sent Identify before rejecting authentication-free OBS hello")
+	}
+	status := client.Status()
+	if status.State != StateDisconnected {
+		t.Fatalf("state = %s, want %s", status.State, StateDisconnected)
+	}
+	if strings.Contains(status.LastError, password) {
+		t.Fatalf("status error leaked OBS password: %q", status.LastError)
+	}
+}
+
 func TestClientConnectHandshakeTimeoutDisconnects(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	release := make(chan struct{})
@@ -111,17 +324,22 @@ func TestClientConnectHandshakeTimeoutDisconnects(t *testing.T) {
 func TestWaitWriteJSONTimeoutClosesConnection(t *testing.T) {
 	releaseWrite := make(chan struct{})
 	closed := make(chan struct{}, 1)
+	writeReturned := make(chan struct{})
+	var releaseOnce sync.Once
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
 	err := waitWriteJSON(context.Background(), timeoutCtx, func() error {
 		<-releaseWrite
+		close(writeReturned)
 		return nil
 	}, func() error {
+		releaseOnce.Do(func() {
+			close(releaseWrite)
+		})
 		closed <- struct{}{}
 		return nil
 	})
-	close(releaseWrite)
 
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("wait write error = %v, want context deadline exceeded", err)
@@ -130,6 +348,252 @@ func TestWaitWriteJSONTimeoutClosesConnection(t *testing.T) {
 	case <-closed:
 	default:
 		t.Fatal("close function was not called on timeout")
+	}
+	select {
+	case <-writeReturned:
+	default:
+		t.Fatal("waitWriteJSON returned before the blocked write exited")
+	}
+}
+
+func TestClientProbeSendsGetVersion(t *testing.T) {
+	requests := make(chan requestDataPayload, 1)
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		req, err := readRequest(conn)
+		if err != nil {
+			return err
+		}
+		requests <- req
+		return writeEnvelope(conn, successfulRequestResponse(req))
+	})
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
+
+	if err := client.Probe(context.Background()); err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	req := receiveRequest(t, requests)
+	if req.RequestType != "GetVersion" {
+		t.Fatalf("request type = %q, want GetVersion", req.RequestType)
+	}
+}
+
+func TestClientProbeRequestFailureIsTypedAndKeepsConnection(t *testing.T) {
+	releaseServer := make(chan struct{})
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		req, err := readRequest(conn)
+		if err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, failedRequestResponse(req, "not available", 500)); err != nil {
+			return err
+		}
+		<-releaseServer
+		return nil
+	})
+	defer server.Close()
+	defer close(releaseServer)
+
+	client := newTestClient(t, server.URL, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
+
+	err := client.Probe(context.Background())
+	var requestErr *RequestError
+	if !errors.As(err, &requestErr) {
+		t.Fatalf("Probe error = %T %v, want *RequestError", err, err)
+	}
+	if requestErr.RequestType != "GetVersion" || requestErr.Code != 500 || requestErr.Comment != "not available" {
+		t.Fatalf("request error = %#v", requestErr)
+	}
+	if got := client.Status().State; got != StateConnected {
+		t.Fatalf("state = %s, want %s after OBS response", got, StateConnected)
+	}
+}
+
+func TestClientGetMediaInputStatusDecodesOfficialStatesAndTiming(t *testing.T) {
+	requests := make(chan requestDataPayload, 1)
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		req, err := readRequest(conn)
+		if err != nil {
+			return err
+		}
+		requests <- req
+		response := requestResponseData{
+			RequestType: req.RequestType,
+			RequestID:   req.RequestID,
+			RequestStatus: requestStatus{
+				Result: true,
+			},
+			ResponseData: mustMarshal(map[string]any{
+				"mediaState":    MediaStateBuffering,
+				"mediaDuration": 1234.5,
+				"mediaCursor":   678.25,
+			}),
+		}
+		return writeEnvelope(conn, envelope{Op: opRequestResponse, D: mustMarshal(response)})
+	})
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
+
+	status, err := client.GetMediaInputStatus(context.Background(), "music")
+	if err != nil {
+		t.Fatalf("GetMediaInputStatus: %v", err)
+	}
+	req := receiveRequest(t, requests)
+	if req.RequestType != "GetMediaInputStatus" {
+		t.Fatalf("request type = %q, want GetMediaInputStatus", req.RequestType)
+	}
+	if got := req.RequestData["inputName"]; got != "music" {
+		t.Fatalf("inputName = %v, want music", got)
+	}
+	if status.State != MediaStateBuffering {
+		t.Fatalf("state = %q, want %q", status.State, MediaStateBuffering)
+	}
+	if status.DurationMilliseconds == nil || *status.DurationMilliseconds != 1234.5 {
+		t.Fatalf("duration = %v, want 1234.5", status.DurationMilliseconds)
+	}
+	if status.CursorMilliseconds == nil || *status.CursorMilliseconds != 678.25 {
+		t.Fatalf("cursor = %v, want 678.25", status.CursorMilliseconds)
+	}
+}
+
+func TestClientGetInputSettingsDecodesMediaLocalFile(t *testing.T) {
+	requests := make(chan requestDataPayload, 1)
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		req, err := readRequest(conn)
+		if err != nil {
+			return err
+		}
+		requests <- req
+		response := requestResponseData{
+			RequestType: req.RequestType,
+			RequestID:   req.RequestID,
+			RequestStatus: requestStatus{
+				Result: true,
+			},
+			ResponseData: mustMarshal(map[string]any{
+				"inputSettings": map[string]any{
+					"local_file": "/media/current.mp4",
+					"looping":    false,
+				},
+				"inputKind": "ffmpeg_source",
+			}),
+		}
+		return writeEnvelope(conn, envelope{Op: opRequestResponse, D: mustMarshal(response)})
+	})
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
+
+	settings, err := client.GetInputSettings(context.Background(), "media")
+	if err != nil {
+		t.Fatalf("GetInputSettings: %v", err)
+	}
+	req := receiveRequest(t, requests)
+	if req.RequestType != "GetInputSettings" {
+		t.Fatalf("request type = %q, want GetInputSettings", req.RequestType)
+	}
+	if got := req.RequestData["inputName"]; got != "media" {
+		t.Fatalf("inputName = %v, want media", got)
+	}
+	if settings.LocalFile != "/media/current.mp4" {
+		t.Fatalf("local file = %q, want /media/current.mp4", settings.LocalFile)
+	}
+	if settings.InputKind != "ffmpeg_source" {
+		t.Fatalf("input kind = %q, want ffmpeg_source", settings.InputKind)
+	}
+}
+
+func TestMediaStateConstantsMatchOBSWebSocketProtocol(t *testing.T) {
+	got := []MediaState{
+		MediaStateNone,
+		MediaStatePlaying,
+		MediaStateOpening,
+		MediaStateBuffering,
+		MediaStatePaused,
+		MediaStateStopped,
+		MediaStateEnded,
+		MediaStateError,
+	}
+	want := []MediaState{
+		"OBS_MEDIA_STATE_NONE",
+		"OBS_MEDIA_STATE_PLAYING",
+		"OBS_MEDIA_STATE_OPENING",
+		"OBS_MEDIA_STATE_BUFFERING",
+		"OBS_MEDIA_STATE_PAUSED",
+		"OBS_MEDIA_STATE_STOPPED",
+		"OBS_MEDIA_STATE_ENDED",
+		"OBS_MEDIA_STATE_ERROR",
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("state constant %d = %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 
@@ -806,7 +1270,7 @@ func TestClientQueuesMultipleSupersededEndedEvents(t *testing.T) {
 	assertNoCurrentFile(t, client, "music")
 }
 
-func TestClientRequestTimeoutClearsPendingAndDisconnects(t *testing.T) {
+func TestClientProbeTimeoutClearsPendingAndDisconnects(t *testing.T) {
 	requestReceived := make(chan struct{}, 1)
 	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
 		if err := readIdentify(conn); err != nil {
@@ -825,7 +1289,7 @@ func TestClientRequestTimeoutClearsPendingAndDisconnects(t *testing.T) {
 	})
 	defer server.Close()
 
-	client := newTestClient(t, server.URL, 20*time.Millisecond)
+	client := newTestClient(t, server.URL, 100*time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := client.Connect(ctx); err != nil {
@@ -837,7 +1301,7 @@ func TestClientRequestTimeoutClearsPendingAndDisconnects(t *testing.T) {
 		}
 	}()
 
-	err := client.request(context.Background(), "GetVersion", nil)
+	err := client.Probe(context.Background())
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("request error = %v, want context deadline exceeded", err)
 	}
@@ -856,6 +1320,151 @@ func TestClientRequestTimeoutClearsPendingAndDisconnects(t *testing.T) {
 	if got := client.Status().State; got != StateDisconnected {
 		t.Fatalf("state = %s, want %s", got, StateDisconnected)
 	}
+}
+
+func TestClientProbeTimeoutDisconnectsAndAllowsReconnect(t *testing.T) {
+	var connectionMu sync.Mutex
+	connectionCount := 0
+	secondProbe := make(chan struct{}, 1)
+	releaseSecond := make(chan struct{})
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		connectionMu.Lock()
+		connectionCount++
+		connectionNumber := connectionCount
+		connectionMu.Unlock()
+
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		req, err := readRequest(conn)
+		if err != nil {
+			return err
+		}
+		if connectionNumber == 1 {
+			var msg envelope
+			_ = conn.ReadJSON(&msg)
+			return nil
+		}
+		if err := writeEnvelope(conn, successfulRequestResponse(req)); err != nil {
+			return err
+		}
+		secondProbe <- struct{}{}
+		<-releaseSecond
+		return nil
+	})
+	defer server.Close()
+	defer close(releaseSecond)
+
+	client := newTestClient(t, server.URL, 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	if err := client.Probe(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Probe error = %v, want deadline exceeded", err)
+	}
+	if got := client.Status().State; got != StateDisconnected {
+		t.Fatalf("state after timeout = %s, want %s", got, StateDisconnected)
+	}
+
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+	if err := client.Probe(context.Background()); err != nil {
+		t.Fatalf("second Probe: %v", err)
+	}
+	waitForSignal(t, secondProbe, "server did not receive second-connection probe")
+	if got := client.Status().State; got != StateConnected {
+		t.Fatalf("state after reconnect = %s, want %s", got, StateConnected)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestClientCloseUnblocksInFlightProbe(t *testing.T) {
+	requestReceived := make(chan struct{}, 1)
+	releaseServer := make(chan struct{})
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		if _, err := readRequest(conn); err != nil {
+			return err
+		}
+		requestReceived <- struct{}{}
+		<-releaseServer
+		return nil
+	})
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- client.Probe(context.Background())
+	}()
+	waitForSignal(t, requestReceived, "server did not receive probe")
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := receiveError(t, errCh); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Probe error = %v, want ErrClosed", err)
+	}
+	assertNoPending(t, client)
+	close(releaseServer)
+}
+
+func TestClientCloseUnblocksProbeWaitingForWriteGate(t *testing.T) {
+	releaseServer := make(chan struct{})
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		<-releaseServer
+		return nil
+	})
+	defer server.Close()
+	defer close(releaseServer)
+
+	client := newTestClient(t, server.URL, time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	client.writeGate <- struct{}{}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- client.Probe(context.Background())
+	}()
+	waitForPendingCount(t, client, 1)
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := receiveError(t, errCh); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Probe error = %v, want ErrClosed", err)
+	}
+	<-client.writeGate
+	assertNoPending(t, client)
 }
 
 func TestClientRequestCallerCancelClearsPendingWithoutDisconnect(t *testing.T) {
@@ -1204,6 +1813,27 @@ func assertNoPending(t *testing.T, client *Client) {
 	}
 }
 
+func waitForPendingCount(t *testing.T, client *Client, want int) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		client.mu.Lock()
+		pending := len(client.pending)
+		client.mu.Unlock()
+		if pending == want {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("pending request count = %d, want %d", pending, want)
+		case <-ticker.C:
+		}
+	}
+}
+
 type controlledDeadlineContext struct {
 	done     chan struct{}
 	deadline time.Time
@@ -1258,4 +1888,30 @@ func mediaEndedEvent(inputName string) envelope {
 			"inputName": inputName,
 		},
 	})}
+}
+
+type blockingLogHandler struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (h *blockingLogHandler) Enabled(context.Context, slog.Level) bool {
+	return true
+}
+
+func (h *blockingLogHandler) Handle(context.Context, slog.Record) error {
+	h.once.Do(func() {
+		close(h.started)
+	})
+	<-h.release
+	return nil
+}
+
+func (h *blockingLogHandler) WithAttrs([]slog.Attr) slog.Handler {
+	return h
+}
+
+func (h *blockingLogHandler) WithGroup(string) slog.Handler {
+	return h
 }

@@ -7,14 +7,29 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 type Store struct {
-	db *sql.DB
+	db  *sql.DB
+	now func() time.Time
 }
+
+const (
+	// MaxFallbackCandidates bounds both the SQLite result set and the in-memory
+	// work performed for one fallback attempt.
+	MaxFallbackCandidates = 256
+	// MaxVideoRows bounds all persisted video states, including terminal rows.
+	MaxVideoRows          = 10_000
+	maxHistoryRows        = 256
+	maxRetentionBatchRows = 256
+)
+
+// ErrVideoCapacity is returned when a video insert would exceed MaxVideoRows.
+var ErrVideoCapacity = errors.New("video row capacity reached")
 
 const videoColumns = `
 	id, telegram_file_id, telegram_unique_id, submitter_id, submitter_name,
@@ -27,14 +42,24 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if err := ensureParent(path); err != nil {
 		return nil, err
 	}
+	if err := prepareDatabaseFile(path); err != nil {
+		return nil, err
+	}
+	if err := secureDatabaseFiles(path); err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 
-	store := &Store{db: db}
+	store := &Store{db: db, now: time.Now}
 	if err := store.migrate(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := secureDatabaseFiles(path); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -47,6 +72,44 @@ func ensureParent(path string) error {
 		return nil
 	}
 	return os.MkdirAll(parent, 0o755)
+}
+
+func prepareDatabaseFile(path string) error {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("prepare SQLite database %q: %w", path, err)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("secure SQLite database %q: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close prepared SQLite database %q: %w", path, err)
+	}
+	return nil
+}
+
+func secureDatabaseFiles(path string) error {
+	for index, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		optional := index > 0
+		if err := os.Chmod(candidate, 0o600); err != nil {
+			if optional && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("secure SQLite file %q: %w", candidate, err)
+		}
+		info, err := os.Stat(candidate)
+		if err != nil {
+			if optional && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("verify SQLite file %q: %w", candidate, err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			return fmt.Errorf("verify SQLite file %q: mode is %04o, want 0600", candidate, got)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error {
@@ -62,7 +125,13 @@ PRAGMA busy_timeout=5000;
 		return err
 	}
 
-	if _, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+
+	if _, err := tx.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS videos (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	telegram_file_id TEXT NOT NULL,
@@ -88,31 +157,53 @@ CREATE TABLE IF NOT EXISTS videos (
 		return err
 	}
 
-	if err := s.ensureVideoColumn(ctx, "local_path", `ALTER TABLE videos ADD COLUMN local_path TEXT NOT NULL DEFAULT ''`); err != nil {
+	if err := ensureVideoColumn(ctx, tx, "local_path", `ALTER TABLE videos ADD COLUMN local_path TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE videos
+SET finished_at = updated_at
+WHERE status IN (?, ?, ?) AND (finished_at IS NULL OR finished_at = '')
+`, string(StatusPlayed), string(StatusCanceled), string(StatusFailed)); err != nil {
 		return err
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 CREATE INDEX IF NOT EXISTS idx_videos_status_position ON videos(status, queue_position);
 CREATE INDEX IF NOT EXISTS idx_videos_created ON videos(created_at);
-`)
-	return err
+CREATE INDEX IF NOT EXISTS idx_videos_status_finished ON videos(status, finished_at, updated_at);
+CREATE INDEX IF NOT EXISTS idx_videos_status_updated ON videos(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_videos_local_path ON videos(local_path);
+CREATE INDEX IF NOT EXISTS idx_videos_finished_status ON videos(finished_at, updated_at, id, status);
+CREATE INDEX IF NOT EXISTS idx_videos_updated_status ON videos(updated_at DESC, id DESC, status);
+`); err != nil {
+		return err
+	}
+	if err := migrateTelegramUpdateJournal(ctx, tx, s.nowUTC()); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (s *Store) ensureVideoColumn(ctx context.Context, name, alter string) error {
-	hasColumn, err := s.videoColumnExists(ctx, name)
+type schemaDB interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func ensureVideoColumn(ctx context.Context, db schemaDB, name, alter string) error {
+	hasColumn, err := videoColumnExists(ctx, db, name)
 	if err != nil {
 		return err
 	}
 	if hasColumn {
 		return nil
 	}
-	_, err = s.db.ExecContext(ctx, alter)
+	_, err = db.ExecContext(ctx, alter)
 	return err
 }
 
-func (s *Store) videoColumnExists(ctx context.Context, name string) (bool, error) {
-	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(videos)`)
+func videoColumnExists(ctx context.Context, db schemaDB, name string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(videos)`)
 	if err != nil {
 		return false, err
 	}
@@ -134,7 +225,21 @@ func (s *Store) videoColumnExists(ctx context.Context, name string) (bool, error
 	return false, rows.Err()
 }
 
+func (s *Store) nowUTC() time.Time {
+	if s.now == nil {
+		return time.Now().UTC()
+	}
+	return s.now().UTC()
+}
+
 func (s *Store) AddDownloading(ctx context.Context, v Video) (Video, error) {
+	return s.addDownloadingWithLimit(ctx, v, MaxVideoRows)
+}
+
+func (s *Store) addDownloadingWithLimit(ctx context.Context, v Video, limit int) (Video, error) {
+	if limit <= 0 {
+		return v, errors.New("video row limit must be positive")
+	}
 	now := time.Now().UTC()
 	v.CreatedAt = now
 	v.UpdatedAt = now
@@ -145,15 +250,44 @@ INSERT INTO videos (
 	telegram_file_id, telegram_unique_id, submitter_id, submitter_name, chat_id, message_id,
 	file_name, local_path, mime_type, size_bytes, duration_seconds, queue_position, status,
 	error, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', ?, ?)
+) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', ?, ?
+WHERE NOT EXISTS (
+	SELECT 1 FROM videos LIMIT 1 OFFSET ?
+)
 RETURNING id
 `, v.TelegramFileID, v.TelegramUniqueID, v.SubmitterID, v.SubmitterName, v.ChatID, v.MessageID,
 		v.FileName, v.LocalPath, v.MimeType, v.SizeBytes, v.DurationSeconds, string(v.Status),
-		formatTime(v.CreatedAt), formatTime(v.UpdatedAt)).Scan(&v.ID)
+		formatTime(v.CreatedAt), formatTime(v.UpdatedAt), limit-1).Scan(&v.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return v, ErrVideoCapacity
+	}
 	if err != nil {
 		return v, err
 	}
 	return v, nil
+}
+
+func (s *Store) CheckVideoCapacity(ctx context.Context) error {
+	return s.checkVideoCapacityWithLimit(ctx, MaxVideoRows)
+}
+
+func (s *Store) checkVideoCapacityWithLimit(ctx context.Context, limit int) error {
+	if limit <= 0 {
+		return errors.New("video row limit must be positive")
+	}
+	var atCapacity int
+	err := s.db.QueryRowContext(ctx, `
+SELECT EXISTS (
+	SELECT 1 FROM videos LIMIT 1 OFFSET ?
+)
+`, limit-1).Scan(&atCapacity)
+	if err != nil {
+		return err
+	}
+	if atCapacity != 0 {
+		return ErrVideoCapacity
+	}
+	return nil
 }
 
 func (s *Store) MarkReady(ctx context.Context, id int64, localPath string, sizeBytes int64, durationSeconds int) (Video, error) {
@@ -186,17 +320,77 @@ WHERE id = ? AND status = ?
 	if err := compactReadyPositions(ctx, tx); err != nil {
 		return Video{}, err
 	}
+	video, err := getVideo(ctx, tx, id)
+	if err != nil {
+		return Video{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Video{}, err
 	}
-	return s.Get(ctx, id)
+	return video, nil
 }
 
-func (s *Store) MarkFailed(ctx context.Context, id int64, cause string) error {
-	_, err := s.db.ExecContext(ctx, `
-UPDATE videos SET status = ?, error = ?, updated_at = ? WHERE id = ?
-`, string(StatusFailed), cause, formatTime(time.Now().UTC()), id)
-	return err
+func (s *Store) MarkFailed(ctx context.Context, id int64, cause string) (bool, error) {
+	return s.transitionToFailed(ctx, id, StatusDownloading, cause)
+}
+
+func (s *Store) FailReady(ctx context.Context, id int64, cause string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer rollback(tx)
+
+	changed, err := transitionToFailed(ctx, tx, id, StatusReady, cause)
+	if err != nil {
+		return false, err
+	}
+	if !changed {
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if err := compactReadyPositions(ctx, tx); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) FailPlaying(ctx context.Context, id int64, cause string) (bool, error) {
+	return s.transitionToFailed(ctx, id, StatusPlaying, cause)
+}
+
+func (s *Store) QuarantinePlayed(ctx context.Context, id int64, cause string) (bool, error) {
+	return s.transitionToFailed(ctx, id, StatusPlayed, cause)
+}
+
+func (s *Store) transitionToFailed(ctx context.Context, id int64, from Status, cause string) (bool, error) {
+	return transitionToFailed(ctx, s.db, id, from, cause)
+}
+
+type execer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func transitionToFailed(ctx context.Context, db execer, id int64, from Status, cause string) (bool, error) {
+	now := time.Now().UTC()
+	res, err := db.ExecContext(ctx, `
+UPDATE videos
+SET status = ?, error = ?, queue_position = 0, updated_at = ?, finished_at = ?
+WHERE id = ? AND status = ?
+`, string(StatusFailed), cause, formatTime(now), formatTime(now), id, string(from))
+	if err != nil {
+		return false, err
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
 }
 
 func (s *Store) FailStaleDownloading(ctx context.Context, olderThan time.Duration, cause string) (int64, error) {
@@ -257,15 +451,25 @@ WHERE id = ? AND status = ?
 	if err := compactReadyPositions(ctx, tx); err != nil {
 		return Video{}, err
 	}
+	video, err := getVideo(ctx, tx, id)
+	if err != nil {
+		return Video{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Video{}, err
 	}
-	return s.Get(ctx, id)
+	return video, nil
 }
 
 func (s *Store) RestartPlaying(ctx context.Context, id int64) (Video, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Video{}, err
+	}
+	defer rollback(tx)
+
 	now := time.Now().UTC()
-	res, err := s.db.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 UPDATE videos SET started_at = ?, updated_at = ?
 WHERE id = ? AND status = ?
 `, formatTime(now), formatTime(now), id, string(StatusPlaying))
@@ -279,7 +483,14 @@ WHERE id = ? AND status = ?
 	if changed == 0 {
 		return Video{}, fmt.Errorf("video %d is not playing", id)
 	}
-	return s.Get(ctx, id)
+	video, err := getVideo(ctx, tx, id)
+	if err != nil {
+		return Video{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Video{}, err
+	}
+	return video, nil
 }
 
 func (s *Store) StartNext(ctx context.Context) (*Video, error) {
@@ -311,18 +522,19 @@ SELECT id FROM videos WHERE status = ? ORDER BY queue_position ASC, created_at A
 	}
 
 	if _, err := tx.ExecContext(ctx, `
-UPDATE videos SET status = ?, started_at = ?, updated_at = ?, queue_position = 0 WHERE id = ?
-`, string(StatusPlaying), formatTime(now), formatTime(now), id); err != nil {
+UPDATE videos SET status = ?, started_at = ?, updated_at = ?, queue_position = 0
+WHERE id = ? AND status = ?
+`, string(StatusPlaying), formatTime(now), formatTime(now), id, string(StatusReady)); err != nil {
 		return nil, err
 	}
 	if err := compactReadyPositions(ctx, tx); err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
+	video, err := getVideo(ctx, tx, id)
+	if err != nil {
 		return nil, err
 	}
-	video, err := s.Get(ctx, id)
-	if err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return &video, nil
@@ -343,10 +555,11 @@ func (s *Store) Cancel(ctx context.Context, id int64) error {
 	}
 	defer rollback(tx)
 
+	now := time.Now().UTC()
 	res, err := tx.ExecContext(ctx, `
-UPDATE videos SET status = ?, updated_at = ?, queue_position = 0
+UPDATE videos SET status = ?, updated_at = ?, finished_at = ?, queue_position = 0
 WHERE id = ? AND status IN (?, ?)
-`, string(StatusCanceled), formatTime(time.Now().UTC()), id, string(StatusReady), string(StatusDownloading))
+`, string(StatusCanceled), formatTime(now), formatTime(now), id, string(StatusReady), string(StatusDownloading))
 	if err != nil {
 		return err
 	}
@@ -435,9 +648,15 @@ func (s *Store) History(ctx context.Context, limit int) ([]Video, error) {
 	if limit <= 0 {
 		limit = 10
 	}
+	if limit > maxHistoryRows {
+		limit = maxHistoryRows
+	}
 	return s.list(ctx, `
-SELECT `+videoColumns+` FROM videos WHERE status IN (?, ?, ?)
-ORDER BY updated_at DESC LIMIT ?
+SELECT `+videoColumns+` FROM videos
+INDEXED BY idx_videos_updated_status
+WHERE status IN (?, ?, ?)
+ORDER BY updated_at DESC, id DESC
+LIMIT ?
 `, string(StatusPlayed), string(StatusCanceled), string(StatusFailed), limit)
 }
 
@@ -456,31 +675,77 @@ FROM videos
 	return stats, err
 }
 
-func (s *Store) Played(ctx context.Context) ([]Video, error) {
+func (s *Store) PlayedFallbackCandidates(ctx context.Context, limit int) ([]Video, error) {
+	if limit <= 0 || limit > MaxFallbackCandidates {
+		limit = MaxFallbackCandidates
+	}
 	return s.list(ctx, `
 SELECT `+videoColumns+` FROM videos
-WHERE status = ?
-ORDER BY finished_at ASC, updated_at ASC
-`, string(StatusPlayed))
-}
-
-func (s *Store) PlayedFallbackCandidates(ctx context.Context, limit int) ([]Video, error) {
-	query := `
-SELECT ` + videoColumns + ` FROM videos
 WHERE status = ? AND local_path <> ''
 ORDER BY finished_at DESC, updated_at DESC
-`
-	if limit <= 0 {
-		return s.list(ctx, query, string(StatusPlayed))
-	}
-	return s.list(ctx, query+`
 LIMIT ?
 `, string(StatusPlayed), limit)
 }
 
-func (s *Store) Delete(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM videos WHERE id = ?`, id)
-	return err
+func (s *Store) TerminalCount(ctx context.Context, statuses ...Status) (int, error) {
+	args, placeholders, err := terminalStatusArgs(statuses)
+	if err != nil {
+		return 0, err
+	}
+	var count int
+	err = s.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM videos WHERE status IN (`+placeholders+`)
+`, args...).Scan(&count)
+	return count, err
+}
+
+func (s *Store) OldestTerminal(ctx context.Context, statuses []Status, limit int) ([]Video, error) {
+	args, placeholders, err := terminalStatusArgs(statuses)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > maxRetentionBatchRows {
+		limit = maxRetentionBatchRows
+	}
+	args = append(args, limit)
+	return s.list(ctx, `
+SELECT `+videoColumns+` FROM videos
+INDEXED BY idx_videos_finished_status
+WHERE status IN (`+placeholders+`)
+ORDER BY finished_at ASC, updated_at ASC, id ASC
+LIMIT ?
+`, args...)
+}
+
+func terminalStatusArgs(statuses []Status) ([]any, string, error) {
+	if len(statuses) == 0 {
+		return nil, "", errors.New("at least one terminal status is required")
+	}
+	args := make([]any, 0, len(statuses))
+	for _, status := range statuses {
+		switch status {
+		case StatusPlayed, StatusCanceled, StatusFailed:
+			args = append(args, string(status))
+		default:
+			return nil, "", fmt.Errorf("status %q is not terminal", status)
+		}
+	}
+	return args, strings.TrimSuffix(strings.Repeat("?,", len(args)), ","), nil
+}
+
+func (s *Store) DeleteTerminal(ctx context.Context, id int64, status Status) (bool, error) {
+	if _, _, err := terminalStatusArgs([]Status{status}); err != nil {
+		return false, err
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM videos WHERE id = ? AND status = ?`, id, string(status))
+	if err != nil {
+		return false, err
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
 }
 
 func (s *Store) LocalPathReferenced(ctx context.Context, path string, excludeID int64) (bool, error) {
@@ -495,29 +760,26 @@ SELECT COUNT(*) FROM videos WHERE local_path = ? AND id <> ?
 }
 
 func (s *Store) Get(ctx context.Context, id int64) (Video, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+videoColumns+` FROM videos WHERE id = ?`, id)
-	if err != nil {
-		return Video{}, err
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		return Video{}, sql.ErrNoRows
-	}
-	return scanVideo(rows)
+	return getVideo(ctx, s.db, id)
+}
+
+type queryRower interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func getVideo(ctx context.Context, db queryRower, id int64) (Video, error) {
+	row := db.QueryRowContext(ctx, `SELECT `+videoColumns+` FROM videos WHERE id = ?`, id)
+	return scanVideo(row)
 }
 
 func (s *Store) firstByStatus(ctx context.Context, status Status) (*Video, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	row := s.db.QueryRowContext(ctx, `
 SELECT `+videoColumns+` FROM videos WHERE status = ? ORDER BY queue_position ASC, created_at ASC LIMIT 1
 `, string(status))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	if !rows.Next() {
+	video, err := scanVideo(row)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
-	video, err := scanVideo(rows)
 	if err != nil {
 		return nil, err
 	}
@@ -583,11 +845,15 @@ UPDATE videos SET queue_position = ? WHERE id = ?
 	return nil
 }
 
-func scanVideo(rows *sql.Rows) (Video, error) {
+type rowScanner interface {
+	Scan(...any) error
+}
+
+func scanVideo(row rowScanner) (Video, error) {
 	var v Video
 	var createdAt, updatedAt string
 	var startedAt, finishedAt sql.NullString
-	err := rows.Scan(
+	err := row.Scan(
 		&v.ID, &v.TelegramFileID, &v.TelegramUniqueID, &v.SubmitterID, &v.SubmitterName,
 		&v.ChatID, &v.MessageID, &v.FileName, &v.LocalPath, &v.MimeType, &v.SizeBytes,
 		&v.DurationSeconds, &v.QueuePosition, &v.Status, &v.Error, &createdAt, &updatedAt,
@@ -596,14 +862,26 @@ func scanVideo(rows *sql.Rows) (Video, error) {
 	if err != nil {
 		return v, err
 	}
-	v.CreatedAt = parseTime(createdAt)
-	v.UpdatedAt = parseTime(updatedAt)
+	v.CreatedAt, err = parseTime("created_at", createdAt)
+	if err != nil {
+		return v, err
+	}
+	v.UpdatedAt, err = parseTime("updated_at", updatedAt)
+	if err != nil {
+		return v, err
+	}
 	if startedAt.Valid {
-		t := parseTime(startedAt.String)
+		t, err := parseTime("started_at", startedAt.String)
+		if err != nil {
+			return v, err
+		}
 		v.StartedAt = &t
 	}
 	if finishedAt.Valid {
-		t := parseTime(finishedAt.String)
+		t, err := parseTime("finished_at", finishedAt.String)
+		if err != nil {
+			return v, err
+		}
 		v.FinishedAt = &t
 	}
 	return v, nil
@@ -613,9 +891,12 @@ func formatTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
-func parseTime(raw string) time.Time {
-	t, _ := time.Parse(time.RFC3339Nano, raw)
-	return t
+func parseTime(field, raw string) (time.Time, error) {
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse videos.%s timestamp %q: %w", field, raw, err)
+	}
+	return t, nil
 }
 
 func rollback(tx *sql.Tx) {

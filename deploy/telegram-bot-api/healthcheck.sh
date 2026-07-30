@@ -42,6 +42,7 @@ is_placeholder() {
 }
 
 [ -f "$ENV_FILE" ] || die ".env is required at repo root"
+chmod 600 "$ENV_FILE" || die "could not secure .env"
 
 reject_env_xtrace
 disable_xtrace
@@ -58,7 +59,8 @@ fi
 
 BASE_URL=${TELEGRAM_API_BASE_URL%/}
 curl_status=0
-printf 'url = "%s/bot%s/getMe"\n' "$BASE_URL" "$TELEGRAM_BOT_TOKEN" | curl -fsS --config - || curl_status=$?
+printf 'url = "%s/bot%s/getMe"\n' "$BASE_URL" "$TELEGRAM_BOT_TOKEN" |
+  curl --connect-timeout 2 --max-time 5 -fsS --config - || curl_status=$?
 if [ "$curl_status" -ne 0 ]; then
   die "Local Bot API getMe failed (curl exit $curl_status)"
 fi
