@@ -1,11 +1,14 @@
 package library
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseLoopFilename(t *testing.T) {
@@ -227,6 +230,73 @@ func TestScanReturnsStructuredIssuesAndValidAssets(t *testing.T) {
 	}
 }
 
+func TestScanRejectsEmptyAndSymlinkAssets(t *testing.T) {
+	mediaDir := t.TempDir()
+	loopDir := filepath.Join(mediaDir, "loops")
+	musicDir := filepath.Join(mediaDir, "music")
+	mkdir(t, loopDir)
+	mkdir(t, musicDir)
+
+	emptyLoop := filepath.Join(loopDir, "loop_morning_empty_001.mp4")
+	if err := os.WriteFile(emptyLoop, nil, 0o644); err != nil {
+		t.Fatalf("write empty loop: %v", err)
+	}
+	targetMusic := filepath.Join(mediaDir, "outside.mp3")
+	writeFile(t, targetMusic)
+	symlinkMusic := filepath.Join(musicDir, "music_link.mp3")
+	if err := os.Symlink(targetMusic, symlinkMusic); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	lib, err := Scan(mediaDir)
+	if len(lib.Loops) != 0 || len(lib.Music) != 0 {
+		t.Fatalf("invalid assets entered snapshot: %#v", lib)
+	}
+	var scanErr *ScanError
+	if !errors.As(err, &scanErr) {
+		t.Fatalf("scan error = %v, want structured issues", err)
+	}
+	if len(scanErr.Issues) != 2 {
+		t.Fatalf("issues = %#v, want empty and symlink issues", scanErr.Issues)
+	}
+	for _, issue := range scanErr.Issues {
+		if issue.Code != ErrorInvalidAsset {
+			t.Fatalf("issue = %#v, want %s", issue, ErrorInvalidAsset)
+		}
+	}
+}
+
+func TestValidateScannedAssetRejectsFIFOAndDevice(t *testing.T) {
+	for _, fixture := range []struct {
+		name string
+		mode os.FileMode
+	}{
+		{name: "fifo", mode: os.ModeNamedPipe | 0o600},
+		{name: "device", mode: os.ModeDevice | 0o600},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			entry := syntheticDirEntry{
+				info: syntheticFileInfo{
+					name: "loop_day_cafe_001.mp4",
+					mode: fixture.mode,
+					size: 1,
+				},
+			}
+			issue := validateScannedAsset(
+				entry,
+				KindLoop,
+				"loops/loop_day_cafe_001.mp4",
+			)
+			if issue == nil || issue.Code != ErrorInvalidAsset {
+				t.Fatalf("issue = %#v, want invalid-asset rejection", issue)
+			}
+			if issue.Field != "type" || !strings.Contains(issue.Error(), "regular file") {
+				t.Fatalf("issue = %#v, want non-regular type rejection", issue)
+			}
+		})
+	}
+}
+
 func TestScanMissingDirectoriesIsEmptyLibrary(t *testing.T) {
 	lib, err := Scan(t.TempDir())
 	if err != nil {
@@ -236,6 +306,28 @@ func TestScanMissingDirectoriesIsEmptyLibrary(t *testing.T) {
 		t.Fatalf("expected empty library, got %#v", lib)
 	}
 }
+
+type syntheticDirEntry struct {
+	info syntheticFileInfo
+}
+
+func (entry syntheticDirEntry) Name() string               { return entry.info.Name() }
+func (entry syntheticDirEntry) IsDir() bool                { return entry.info.IsDir() }
+func (entry syntheticDirEntry) Type() os.FileMode          { return entry.info.Mode().Type() }
+func (entry syntheticDirEntry) Info() (os.FileInfo, error) { return entry.info, nil }
+
+type syntheticFileInfo struct {
+	name string
+	mode os.FileMode
+	size int64
+}
+
+func (info syntheticFileInfo) Name() string       { return info.name }
+func (info syntheticFileInfo) Size() int64        { return info.size }
+func (info syntheticFileInfo) Mode() os.FileMode  { return info.mode }
+func (info syntheticFileInfo) ModTime() time.Time { return time.Unix(0, 0) }
+func (info syntheticFileInfo) IsDir() bool        { return info.mode.IsDir() }
+func (info syntheticFileInfo) Sys() any           { return nil }
 
 func TestScanDirectoryCapacityBoundaries(t *testing.T) {
 	t.Run("below and equal limit", func(t *testing.T) {
@@ -284,6 +376,39 @@ func TestScanDirectoryCapacityBoundaries(t *testing.T) {
 			t.Fatalf("capacity issue = %#v", scanErr.Issues[0])
 		}
 	})
+}
+
+func TestScanDirsContextCheckpointsCompletedBatchesAndHonorsCancellation(t *testing.T) {
+	root := t.TempDir()
+	loopDir := filepath.Join(root, "loops")
+	musicDir := filepath.Join(root, "music")
+	mkdir(t, loopDir)
+	mkdir(t, musicDir)
+	writeFile(t, filepath.Join(loopDir, "loop_morning_calm_a.mp4"))
+	writeFile(t, filepath.Join(loopDir, "loop_day_focus_b.mp4"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	progress := 0
+	lib, err := scanDirsWithLimitContext(
+		ctx,
+		loopDir,
+		musicDir,
+		10,
+		1,
+		func() {
+			progress++
+			cancel()
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("scan error = %v, want context cancellation", err)
+	}
+	if progress != 1 {
+		t.Fatalf("progress checkpoints = %d, want exactly one completed batch", progress)
+	}
+	if len(lib.Loops) != 0 || len(lib.Music) != 0 {
+		t.Fatalf("canceled scan published partial result: %#v", lib)
+	}
 }
 
 func TestSummaryCounts(t *testing.T) {

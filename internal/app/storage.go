@@ -14,7 +14,6 @@ import (
 
 	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/media"
-	"github.com/tiwb/tg-obs-bot/internal/queue"
 )
 
 const (
@@ -24,10 +23,12 @@ const (
 	staleLibraryImportAge   = 6 * time.Hour
 	stagingSweepBatchSize   = 256
 	copyBufferSize          = 256 * 1024
+	libraryMediaFileMode    = 0o644
 )
 
 type copyDataFunc func(context.Context, io.Writer, io.Reader) (int64, error)
 type prePublishFunc func(context.Context, string) error
+type publishNoReplaceFunc func(string, string) error
 
 type stagingSweepStats struct {
 	Inspected int
@@ -36,6 +37,7 @@ type stagingSweepStats struct {
 
 type atomicCopyOps struct {
 	copyData      copyDataFunc
+	publishFile   publishNoReplaceFunc
 	syncDirectory func(string) error
 	removeFile    func(string) error
 }
@@ -47,43 +49,7 @@ func (s *Service) preflightUpload(ctx context.Context, fileName string, declared
 	if declaredSize <= 0 {
 		return publicError("無法確認檔案大小，請重新上傳。")
 	}
-	if s.libraryMode() {
-		return s.preflightLibraryUpload(ctx, fileName, declaredSize)
-	}
-	return s.preflightQueueUpload(ctx, declaredSize, s.store.CheckVideoCapacity)
-}
-
-func (s *Service) preflightQueueUpload(
-	ctx context.Context,
-	declaredSize int64,
-	checkVideoCapacity func(context.Context) error,
-) error {
-	s.storageMu.Lock()
-	defer s.storageMu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := checkVideoCapacity(ctx); err != nil {
-		if errors.Is(err, queue.ErrVideoCapacity) {
-			return videoCapacityPublicError()
-		}
-		return err
-	}
-	length, err := s.store.QueueLength(ctx)
-	if err != nil {
-		return err
-	}
-	if length >= s.cfg.MaxQueueLength {
-		return publicError(fmt.Sprintf("佇列已滿，目前上限是 %d 支", s.cfg.MaxQueueLength))
-	}
-	return s.ensureStorageHeadroom(s.cfg.TelegramBotAPIDir, declaredSize)
-}
-
-func videoCapacityPublicError() error {
-	return publicError(fmt.Sprintf(
-		"影片紀錄已達 %d 筆上限，請先清理已完成的歷史紀錄後再重試。",
-		queue.MaxVideoRows,
-	))
+	return s.preflightLibraryUpload(ctx, fileName, declaredSize)
 }
 
 func (s *Service) ensureStorageHeadroom(path string, incomingBytes int64) error {
@@ -257,6 +223,14 @@ func copyOpenedFileAtomicWith(
 		_ = tmp.Close()
 		return 0, err
 	}
+	// The staging directory remains private, but the published media must be
+	// readable by OBS when it runs as a different OS user or container UID.
+	// Change the mode through the still-open file descriptor so the permission
+	// applies to the exact validated file identity that will be published.
+	if err := tmp.Chmod(libraryMediaFileMode); err != nil {
+		_ = tmp.Close()
+		return 0, fmt.Errorf("make imported library media readable: %w", err)
+	}
 	var fileSyncErr error
 	func() {
 		syncScope := tracker.Scope(liveness.PhaseDurabilitySync)
@@ -278,7 +252,11 @@ func copyOpenedFileAtomicWith(
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if err := os.Rename(tmpPath, dst); err != nil {
+	publish := ops.publishFile
+	if publish == nil {
+		publish = publishFileNoReplace
+	}
+	if err := publish(tmpPath, dst); err != nil {
 		return 0, err
 	}
 	cleanupTemp = false
@@ -307,6 +285,27 @@ func copyOpenedFileAtomicWith(
 		return 0, errors.Join(syncErr, removeErr, rollbackSyncErr)
 	}
 	return written, nil
+}
+
+// publishFileNoReplace atomically makes a same-filesystem staging file visible
+// without ever replacing an existing destination. The hard link is the
+// publication point; unlinking the staging name leaves the destination bound
+// to the exact bytes that were validated.
+func publishFileNoReplace(stagingPath, destinationPath string) error {
+	if err := os.Link(stagingPath, destinationPath); err != nil {
+		return err
+	}
+	if err := os.Remove(stagingPath); err != nil {
+		rollbackErr := os.Remove(destinationPath)
+		if errors.Is(rollbackErr, os.ErrNotExist) {
+			rollbackErr = nil
+		}
+		if rollbackErr != nil {
+			rollbackErr = fmt.Errorf("rollback published library file: %w", rollbackErr)
+		}
+		return errors.Join(fmt.Errorf("remove published staging link: %w", err), rollbackErr)
+	}
+	return nil
 }
 
 func ensureLibraryStagingDir(destDir string) (string, error) {

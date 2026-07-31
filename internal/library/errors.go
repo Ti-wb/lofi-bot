@@ -12,6 +12,7 @@ type ErrorCode string
 const (
 	ErrorUnsupportedExtension ErrorCode = "unsupported_extension"
 	ErrorInvalidFilename      ErrorCode = "invalid_filename"
+	ErrorInvalidAsset         ErrorCode = "invalid_asset"
 	ErrorInvalidPeriod        ErrorCode = "invalid_period"
 	ErrorReadDirectory        ErrorCode = "read_directory"
 	ErrorDirectoryCapacity    ErrorCode = "directory_capacity"

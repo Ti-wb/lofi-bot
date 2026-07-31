@@ -14,16 +14,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tiwb/tg-obs-bot/internal/config"
 	medialib "github.com/tiwb/tg-obs-bot/internal/library"
 	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/media"
-	"github.com/tiwb/tg-obs-bot/internal/queue"
 	"github.com/tiwb/tg-obs-bot/internal/telegram"
 )
 
 func TestUploadPreflightRejectsUnknownDeclaredSize(t *testing.T) {
-	svc, _, _ := newLocalUploadTestService(t, config.Config{})
+	svc, _ := newLibraryTestService(t)
 	svc.diskUsage = func(string) (media.DiskUsage, error) {
 		t.Fatal("unknown size should fail before disk admission")
 		return media.DiskUsage{}, nil
@@ -38,74 +36,6 @@ func TestUploadPreflightRejectsUnknownDeclaredSize(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "無法確認檔案大小") {
 			t.Fatalf("declared size %d error = %v, want fail-closed rejection", size, err)
 		}
-	}
-}
-
-func TestQueueUploadPreflightRejectsFullQueueBeforeDiskAdmission(t *testing.T) {
-	ctx := context.Background()
-	svc, _, _ := newLocalUploadTestService(t, config.Config{MaxQueueLength: 1})
-	addReadyVideo(t, ctx, svc, "already-queued.mp4")
-	svc.diskUsage = func(string) (media.DiskUsage, error) {
-		t.Fatal("full queue should fail before disk admission")
-		return media.DiskUsage{}, nil
-	}
-
-	err := svc.telegramHooks().PreflightUpload(ctx, telegram.Upload{
-		FileName:  "next.mp4",
-		SizeBytes: 5,
-	})
-	if err == nil || !strings.Contains(err.Error(), "佇列已滿") {
-		t.Fatalf("preflight error = %v, want queue-full rejection", err)
-	}
-}
-
-func TestQueueVideoCapacityPreflightRejectsBeforeDiskAdmission(t *testing.T) {
-	svc, _, _ := newLocalUploadTestService(t, config.Config{})
-	svc.diskUsage = func(string) (media.DiskUsage, error) {
-		t.Fatal("video row capacity should fail before disk admission")
-		return media.DiskUsage{}, nil
-	}
-	checks := 0
-	err := svc.preflightQueueUpload(context.Background(), 5, func(context.Context) error {
-		checks++
-		return queue.ErrVideoCapacity
-	})
-	if err == nil ||
-		!strings.Contains(err.Error(), "10000") ||
-		!strings.Contains(err.Error(), "清理") {
-		t.Fatalf("preflight error = %v, want actionable video capacity rejection", err)
-	}
-	if checks != 1 {
-		t.Fatalf("capacity checks = %d, want 1", checks)
-	}
-}
-
-func TestQueueUploadPreflightUsesConfiguredBotAPIDir(t *testing.T) {
-	svc, _, _ := newLocalUploadTestService(t, config.Config{
-		MinFreeDiskBytes: 100,
-	})
-	var probedPath string
-	available := uint64(104)
-	svc.diskUsage = func(path string) (media.DiskUsage, error) {
-		probedPath = path
-		return media.DiskUsage{AvailableBytes: available}, nil
-	}
-
-	preflight := svc.telegramHooks().PreflightUpload
-	upload := telegram.Upload{
-		FileName:  "next.mp4",
-		SizeBytes: 5,
-	}
-	err := preflight(context.Background(), upload)
-	if err == nil || !strings.Contains(err.Error(), "磁碟可用空間不足") {
-		t.Fatalf("preflight error = %v, want declared-size headroom rejection", err)
-	}
-	if filepath.Clean(probedPath) != filepath.Clean(svc.cfg.TelegramBotAPIDir) {
-		t.Fatalf("disk probe path = %q, want configured Bot API directory %q", probedPath, svc.cfg.TelegramBotAPIDir)
-	}
-	available = 105
-	if err := preflight(context.Background(), upload); err != nil {
-		t.Fatalf("admissible queue metadata rejected: %v", err)
 	}
 }
 
@@ -241,11 +171,11 @@ func TestOverCapacityScanRetainsSnapshotButOrdinaryIssuesRemainPartial(t *testin
 	svc.librarySnapshot = original
 
 	capacityErr := fmt.Errorf("external writer exceeded limit: %w", medialib.ErrDirectoryCapacity)
-	err := svc.scanLibraryLockedWith(ctx, func(string, string) (medialib.Library, error) {
+	err := svc.scanLibraryWith(ctx, func(string, string) (medialib.Library, error) {
 		return medialib.Library{
 			Loops: []medialib.Loop{{ID: "incomplete-over-capacity"}},
 		}, capacityErr
-	})
+	}, false)
 	if !errors.Is(err, medialib.ErrDirectoryCapacity) {
 		t.Fatalf("scan error = %v, want capacity sentinel", err)
 	}
@@ -253,8 +183,8 @@ func TestOverCapacityScanRetainsSnapshotButOrdinaryIssuesRemainPartial(t *testin
 		svc.librarySnapshot.Loops[0].ID != "last-known-good" {
 		t.Fatalf("over-capacity scan replaced snapshot: %#v", svc.librarySnapshot)
 	}
-	if !strings.Contains(svc.libraryScanErr, medialib.ErrDirectoryCapacity.Error()) {
-		t.Fatalf("library scan error = %q, want recorded capacity error", svc.libraryScanErr)
+	if svc.libraryScanErr != "媒體庫目錄超過 10000 個項目的安全上限；詳細資訊請查看服務日誌。" {
+		t.Fatalf("library scan error = %q, want safe capacity summary", svc.libraryScanErr)
 	}
 
 	partial := medialib.Library{
@@ -265,9 +195,9 @@ func TestOverCapacityScanRetainsSnapshotButOrdinaryIssuesRemainPartial(t *testin
 		Kind: medialib.KindLoop,
 		Err:  errors.New("bad filename"),
 	}}}
-	err = svc.scanLibraryLockedWith(ctx, func(string, string) (medialib.Library, error) {
+	err = svc.scanLibraryWith(ctx, func(string, string) (medialib.Library, error) {
 		return partial, ordinaryErr
-	})
+	}, false)
 	if !errors.Is(err, ordinaryErr) {
 		t.Fatalf("ordinary scan error = %v", err)
 	}
@@ -277,95 +207,274 @@ func TestOverCapacityScanRetainsSnapshotButOrdinaryIssuesRemainPartial(t *testin
 	}
 }
 
-func TestQueueAdmissionUsesActualSizeAndSourceFilesystem(t *testing.T) {
-	ctx := context.Background()
-	svc, _, _ := newLocalUploadTestService(t, config.Config{
-		MaxVideoSizeBytes:       1024,
-		MaxVideoDurationSeconds: 120,
-		MinFreeDiskBytes:        100,
-	})
-	source := writeBotAPIFile(t, svc, "actual-size.mp4")
-	var probedPath string
-	svc.diskUsage = func(path string) (media.DiskUsage, error) {
-		probedPath = path
-		return media.DiskUsage{AvailableBytes: 104}, nil
-	}
-
-	_, err := svc.EnqueueUpload(ctx, UploadRequest{
-		LocalPath:        source,
-		TelegramFileID:   "actual",
-		TelegramUniqueID: "actual",
-		FileName:         "actual-size.mp4",
-		SizeBytes:        1,
-	})
-	if err == nil || !strings.Contains(err.Error(), "磁碟可用空間不足") {
-		t.Fatalf("enqueue error = %v, want low-space rejection based on actual 5-byte file", err)
-	}
-	if probedPath != source {
-		t.Fatalf("disk probe path = %q, want source filesystem path %q", probedPath, source)
-	}
-	if length, lengthErr := svc.store.QueueLength(ctx); lengthErr != nil {
-		t.Fatalf("queue length: %v", lengthErr)
-	} else if length != 0 {
-		t.Fatalf("queue length = %d, want no AddDownloading before admission", length)
-	}
-	if !fileExists(source) {
-		t.Fatal("low-space rejection deleted Telegram-owned input")
+func TestLibraryScanIssueCountAggregatesJoinedScanErrors(t *testing.T) {
+	first := &medialib.ScanError{Issues: []*medialib.Error{
+		{Code: medialib.ErrorInvalidFilename},
+	}}
+	second := &medialib.ScanError{Issues: []*medialib.Error{
+		{Code: medialib.ErrorInvalidAsset},
+		{Code: medialib.ErrorInvalidAsset},
+	}}
+	if got := libraryScanIssueCount(errors.Join(first, second)); got != 3 {
+		t.Fatalf("joined scan issue count = %d, want 3", got)
 	}
 }
 
-func TestQueueAdmissionIgnoresDeclaredSizeAndStoresActualSize(t *testing.T) {
+func TestUnreadableDirectoryScanRetainsLastKnownGoodSnapshot(t *testing.T) {
 	ctx := context.Background()
-	svc, _, _ := newLocalUploadTestService(t, config.Config{
-		MaxVideoSizeBytes:       1024,
-		MaxVideoDurationSeconds: 120,
-		MinFreeDiskBytes:        100,
-	})
-	source := writeBotAPIFile(t, svc, "declared-size.mp4")
-	svc.diskUsage = func(string) (media.DiskUsage, error) {
-		return media.DiskUsage{AvailableBytes: 105}, nil
+	svc, _ := newLibraryTestService(t)
+	svc.librarySnapshot = medialib.Library{
+		Loops: []medialib.Loop{{ID: "last-known-good"}},
+	}
+	readErr := &medialib.ScanError{Issues: []*medialib.Error{{
+		Code:  medialib.ErrorReadDirectory,
+		Kind:  medialib.KindMusic,
+		Field: "directory",
+		Err:   errors.New("injected unreadable mount"),
+	}}}
+
+	err := svc.scanLibraryWith(ctx, func(string, string) (medialib.Library, error) {
+		return medialib.Library{
+			Loops: []medialib.Loop{{ID: "incomplete"}},
+		}, readErr
+	}, false)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("scan error = %v, want read-directory failure", err)
+	}
+	if len(svc.librarySnapshot.Loops) != 1 ||
+		svc.librarySnapshot.Loops[0].ID != "last-known-good" {
+		t.Fatalf("unreadable-directory scan replaced snapshot: %#v", svc.librarySnapshot)
+	}
+	if svc.libraryScanErr != "媒體庫掃描發現 1 個無效或不可播放項目；詳細資訊請查看服務日誌。" {
+		t.Fatalf("scan warning = %q, want safe issue-count summary", svc.libraryScanErr)
+	}
+}
+
+func TestLibraryScanDoesNotHoldPlaybackLockDuringSlowEnumeration(t *testing.T) {
+	svc, _ := newLibraryTestService(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+
+	go func() {
+		done <- svc.scanLibraryWith(context.Background(), func(string, string) (medialib.Library, error) {
+			close(started)
+			<-release
+			return medialib.Library{}, nil
+		}, false)
+	}()
+	<-started
+
+	lockAcquired := make(chan struct{})
+	go func() {
+		svc.playbackMu.Lock()
+		close(lockAcquired)
+		svc.playbackMu.Unlock()
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(500 * time.Millisecond):
+		close(release)
+		t.Fatal("slow library scan held playbackMu")
 	}
 
-	video, err := svc.EnqueueUpload(ctx, UploadRequest{
-		LocalPath:        source,
-		TelegramFileID:   "declared",
-		TelegramUniqueID: "declared",
-		FileName:         "declared-size.mp4",
-		SizeBytes:        1 << 30,
-	})
-	if err != nil {
-		t.Fatalf("enqueue: %v", err)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("slow scan: %v", err)
 	}
-	if video.SizeBytes != 5 {
-		t.Fatalf("stored size = %d, want actual size 5", video.SizeBytes)
+}
+
+func TestCanceledLibraryScanPreservesLastKnownGoodSnapshot(t *testing.T) {
+	svc, _ := newLibraryTestService(t)
+	svc.librarySnapshot = medialib.Library{
+		Loops: []medialib.Loop{{ID: "last-known-good"}},
+	}
+	svc.libraryScanErr = "previous warning"
+	svc.librarySnapshotPublished = true
+	ctx, cancel := context.WithCancel(context.Background())
+
+	err := svc.scanLibraryWith(ctx, func(string, string) (medialib.Library, error) {
+		cancel()
+		return medialib.Library{
+				Loops: []medialib.Loop{{ID: "canceled-partial"}},
+			}, &medialib.ScanError{Issues: []*medialib.Error{{
+				Code: medialib.ErrorInvalidAsset,
+				Kind: medialib.KindLoop,
+				Err:  context.Canceled,
+			}}}
+	}, false)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled scan error = %v, want context cancellation", err)
+	}
+	if len(svc.librarySnapshot.Loops) != 1 ||
+		svc.librarySnapshot.Loops[0].ID != "last-known-good" {
+		t.Fatalf("canceled scan replaced snapshot: %#v", svc.librarySnapshot)
+	}
+	if svc.libraryScanErr != "previous warning" {
+		t.Fatalf("canceled scan warning = %q, want previous warning preserved", svc.libraryScanErr)
+	}
+}
+
+func TestCanceledScanWaitingToPublishPreservesLastKnownGoodState(t *testing.T) {
+	svc, _ := newLibraryTestService(t)
+	svc.librarySnapshot = medialib.Library{
+		Loops: []medialib.Loop{{ID: "last-known-good"}},
+	}
+	svc.libraryScanErr = "previous warning"
+	svc.libraryRejectedCount = 7
+	svc.librarySnapshotPublished = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	scanReturned := make(chan struct{})
+	done := make(chan error, 1)
+	svc.playbackMu.Lock()
+	go func() {
+		done <- svc.scanLibraryWith(ctx, func(string, string) (medialib.Library, error) {
+			close(scanReturned)
+			return medialib.Library{
+				Loops: []medialib.Loop{{ID: "must-not-publish"}},
+			}, errors.New("must-not-publish warning")
+		}, false)
+	}()
+	<-scanReturned
+	cancel()
+	svc.playbackMu.Unlock()
+
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("scan error = %v, want cancellation at publication barrier", err)
+	}
+	if len(svc.librarySnapshot.Loops) != 1 ||
+		svc.librarySnapshot.Loops[0].ID != "last-known-good" {
+		t.Fatalf("canceled publication replaced snapshot: %#v", svc.librarySnapshot)
+	}
+	if svc.libraryScanErr != "previous warning" || svc.libraryRejectedCount != 7 {
+		t.Fatalf(
+			"canceled publication changed diagnostics: warning=%q rejected=%d",
+			svc.libraryScanErr,
+			svc.libraryRejectedCount,
+		)
+	}
+}
+
+func TestConcurrentLibraryScansSerializeAndNewestCompletedScanPublishes(t *testing.T) {
+	svc, _ := newLibraryTestService(t)
+	olderStarted := make(chan struct{})
+	releaseOlder := make(chan struct{})
+	olderDone := make(chan error, 1)
+	newerStarted := make(chan struct{})
+	newerDone := make(chan error, 1)
+
+	go func() {
+		olderDone <- svc.scanLibraryWith(context.Background(), func(string, string) (medialib.Library, error) {
+			close(olderStarted)
+			<-releaseOlder
+			return medialib.Library{Loops: []medialib.Loop{{ID: "older"}}}, nil
+		}, false)
+	}()
+	<-olderStarted
+
+	go func() {
+		newerDone <- svc.scanLibraryWith(context.Background(), func(string, string) (medialib.Library, error) {
+			close(newerStarted)
+			return medialib.Library{Loops: []medialib.Loop{{ID: "newer"}}}, nil
+		}, false)
+	}()
+	select {
+	case <-newerStarted:
+		close(releaseOlder)
+		t.Fatal("newer scan started before the older complete scan released its gate")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseOlder)
+	if err := <-olderDone; err != nil {
+		t.Fatalf("older scan: %v", err)
+	}
+	select {
+	case <-newerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("newer scan did not start after the older scan completed")
+	}
+	if err := <-newerDone; err != nil {
+		t.Fatalf("newer scan: %v", err)
+	}
+	if len(svc.librarySnapshot.Loops) != 1 ||
+		svc.librarySnapshot.Loops[0].ID != "newer" {
+		t.Fatalf("newest completed scan did not publish: %#v", svc.librarySnapshot)
+	}
+}
+
+func TestCanceledScanWaitingOnGateDoesNotSuppressCompleteScan(t *testing.T) {
+	svc, _ := newLibraryTestService(t)
+	olderStarted := make(chan struct{})
+	releaseOlder := make(chan struct{})
+	olderDone := make(chan error, 1)
+	go func() {
+		olderDone <- svc.scanLibraryWith(context.Background(), func(string, string) (medialib.Library, error) {
+			close(olderStarted)
+			<-releaseOlder
+			return medialib.Library{Loops: []medialib.Loop{{ID: "complete"}}}, nil
+		}, false)
+	}()
+	<-olderStarted
+
+	ctx, cancel := context.WithCancel(context.Background())
+	invoked := make(chan struct{}, 1)
+	waiterDone := make(chan error, 1)
+	go func() {
+		waiterDone <- svc.scanLibraryWith(ctx, func(string, string) (medialib.Library, error) {
+			invoked <- struct{}{}
+			return medialib.Library{}, nil
+		}, false)
+	}()
+	select {
+	case <-invoked:
+		close(releaseOlder)
+		t.Fatal("waiting scan invoked filesystem enumeration before acquiring the gate")
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	err := <-waiterDone
+	if !errors.Is(err, context.Canceled) {
+		close(releaseOlder)
+		t.Fatalf("waiting scan error = %v, want context cancellation", err)
+	}
+	select {
+	case <-invoked:
+		close(releaseOlder)
+		t.Fatal("canceled waiting scan invoked filesystem enumeration")
+	default:
+	}
+	close(releaseOlder)
+	if err := <-olderDone; err != nil {
+		t.Fatalf("complete scan: %v", err)
+	}
+	if len(svc.librarySnapshot.Loops) != 1 ||
+		svc.librarySnapshot.Loops[0].ID != "complete" {
+		t.Fatalf("canceled waiter suppressed complete scan: %#v", svc.librarySnapshot)
 	}
 }
 
 func TestZeroDiskReserveStillRequiresActualFileSize(t *testing.T) {
 	ctx := context.Background()
-	svc, _, _ := newLocalUploadTestService(t, config.Config{
-		MaxVideoSizeBytes:       1024,
-		MaxVideoDurationSeconds: 120,
-		MinFreeDiskBytes:        0,
-	})
-	source := writeBotAPIFile(t, svc, "zero-reserve.mp4")
+	svc, _ := newLibraryTestService(t)
+	svc.cfg.MinFreeDiskBytes = 0
+	source := writeBotAPIFile(t, svc, "loop_morning_cafe_zero-reserve.mp4")
 	svc.diskUsage = func(string) (media.DiskUsage, error) {
 		return media.DiskUsage{AvailableBytes: 4}, nil
 	}
 
-	_, err := svc.EnqueueUpload(ctx, UploadRequest{
-		LocalPath:        source,
-		TelegramFileID:   "zero-reserve",
-		TelegramUniqueID: "zero-reserve",
-		FileName:         "zero-reserve.mp4",
+	_, err := svc.ImportLibraryUpload(ctx, UploadRequest{
+		LocalPath: source,
+		FileName:  "loop_morning_cafe_zero-reserve.mp4",
 	})
 	if err == nil || !strings.Contains(err.Error(), "磁碟可用空間不足") {
-		t.Fatalf("enqueue error = %v, want actual-size admission with zero reserve", err)
+		t.Fatalf("import error = %v, want actual-size admission with zero reserve", err)
 	}
-	if length, lengthErr := svc.store.QueueLength(ctx); lengthErr != nil {
-		t.Fatalf("queue length: %v", lengthErr)
-	} else if length != 0 {
-		t.Fatalf("queue length = %d, want no row after admission failure", length)
+	if !fileExists(source) {
+		t.Fatal("low-space rejection deleted Telegram-owned input")
+	}
+	if fileExists(filepath.Join(svc.cfg.LoopMediaDir, "loop_morning_cafe_zero-reserve.mp4")) {
+		t.Fatal("library destination exists after rejected admission")
 	}
 }
 
@@ -383,7 +492,6 @@ func TestLibraryAdmissionUsesActualSizeAndDestinationFilesystem(t *testing.T) {
 	_, err := svc.ImportLibraryUpload(ctx, UploadRequest{
 		LocalPath: source,
 		FileName:  "loop_morning_cafe_lowspace.mp4",
-		SizeBytes: 1,
 	})
 	if err == nil || !strings.Contains(err.Error(), "磁碟可用空間不足") {
 		t.Fatalf("import error = %v, want destination low-space rejection", err)
@@ -413,7 +521,6 @@ func TestLibraryMusicImportEnforcesOpenedSourceActualSize(t *testing.T) {
 	_, err := svc.ImportLibraryUpload(ctx, UploadRequest{
 		LocalPath: source,
 		FileName:  "music_oversized.mp3",
-		SizeBytes: 1,
 	})
 	if err == nil || !strings.Contains(err.Error(), "檔案太大") {
 		t.Fatalf("import error = %v, want opened-source actual-size rejection", err)
@@ -608,6 +715,48 @@ func TestAtomicLibraryCopyPublishesOnlyCompleteFile(t *testing.T) {
 	if string(body) != "complete-media" {
 		t.Fatalf("destination = %q, want complete media", body)
 	}
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatalf("stat destination: %v", err)
+	}
+	if got := info.Mode().Perm(); got != libraryMediaFileMode {
+		t.Fatalf("destination mode = %04o, want %04o", got, libraryMediaFileMode)
+	}
+	requireNoOwnedImportTemps(t, dir)
+}
+
+func TestAtomicLibraryCopyNeverReplacesConcurrentDestination(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.mp4")
+	dest := filepath.Join(dir, "dest.mp4")
+	if err := os.WriteFile(source, []byte("validated-library-media"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	external := []byte("external-writer-wins")
+	publishReached := false
+
+	_, err := copyFileAtomicWith(context.Background(), dest, source, 1024, nil, nil, atomicCopyOps{
+		publishFile: func(stagingPath, destinationPath string) error {
+			publishReached = true
+			if err := os.WriteFile(destinationPath, external, 0o600); err != nil {
+				t.Fatalf("create concurrent destination: %v", err)
+			}
+			return publishFileNoReplace(stagingPath, destinationPath)
+		},
+	})
+	if !publishReached {
+		t.Fatal("copy never reached publication")
+	}
+	if !errors.Is(err, os.ErrExist) {
+		t.Fatalf("copy error = %v, want destination-exists failure", err)
+	}
+	got, readErr := os.ReadFile(dest)
+	if readErr != nil {
+		t.Fatalf("read concurrent destination: %v", readErr)
+	}
+	if string(got) != string(external) {
+		t.Fatalf("destination = %q, want untouched external bytes %q", got, external)
+	}
 	requireNoOwnedImportTemps(t, dir)
 }
 
@@ -733,15 +882,11 @@ func TestLibraryLoopValidationFailureNeverPublishesFinal(t *testing.T) {
 	if err := os.WriteFile(probePath, []byte("#!/bin/sh\nprintf '%s\\n' '{\"format\":{}}'\n"), 0o700); err != nil {
 		t.Fatalf("write durationless ffprobe: %v", err)
 	}
-	manager, err := media.NewManager(svc.cfg.MediaDir, probePath)
-	if err != nil {
-		t.Fatalf("new media manager: %v", err)
-	}
-	svc.media = manager
+	svc.media = media.NewManager(probePath)
 	source := writeBotAPIFile(t, svc, "loop_morning_cafe_invalid.mp4")
 	dest := filepath.Join(svc.cfg.LoopMediaDir, "loop_morning_cafe_invalid.mp4")
 
-	_, err = svc.ImportLibraryUpload(ctx, UploadRequest{
+	_, err := svc.ImportLibraryUpload(ctx, UploadRequest{
 		LocalPath: source,
 		FileName:  "loop_morning_cafe_invalid.mp4",
 	})

@@ -39,6 +39,12 @@ var (
 	ErrAlreadyConnected = errors.New("obs client already connected")
 	ErrNotConnected     = errors.New("obs client is not connected")
 	ErrClosed           = errors.New("obs client is closed")
+	// ErrSourceMayBeMutated marks a PlaySourceFile failure after an OBS
+	// SetInputSettings request was attempted. The response can be lost after
+	// OBS applied the new path, and later mute/restart requests can fail after
+	// the path was definitely applied. Callers must therefore stop or
+	// explicitly restore the source before trusting their previous state.
+	ErrSourceMayBeMutated = errors.New("OBS media source may have been modified")
 )
 
 type State string
@@ -51,18 +57,16 @@ const (
 )
 
 type Options struct {
-	URL             string
-	Password        string
-	MediaSourceName string
-	EventBuffer     int
-	RequestTimeout  time.Duration
-	Logger          *slog.Logger
-	Dialer          *websocket.Dialer
+	URL            string
+	Password       string
+	EventBuffer    int
+	RequestTimeout time.Duration
+	Logger         *slog.Logger
+	Dialer         *websocket.Dialer
 }
 
 type Status struct {
 	State       State
-	CurrentFile string
 	LastError   string
 	ConnectedAt time.Time
 }
@@ -133,7 +137,6 @@ type Client struct {
 	state           State
 	conn            *websocket.Conn
 	connectedAt     time.Time
-	currentFile     string
 	currentFiles    map[string]string
 	supersededFiles map[string][]supersededSourceFile
 	lastErr         error
@@ -149,9 +152,6 @@ type Client struct {
 func NewClient(opts Options) (*Client, error) {
 	if opts.URL == "" {
 		return nil, errors.New("obs URL is required")
-	}
-	if opts.MediaSourceName == "" {
-		return nil, errors.New("OBS media source name is required")
 	}
 	if opts.EventBuffer <= 0 {
 		opts.EventBuffer = 8
@@ -249,7 +249,6 @@ func (c *Client) Status() Status {
 
 	status := Status{
 		State:       c.state,
-		CurrentFile: c.currentFile,
 		ConnectedAt: c.connectedAt,
 	}
 	if c.lastErr != nil {
@@ -297,13 +296,6 @@ func (c *Client) GetInputSettings(ctx context.Context, inputName string) (InputS
 	}, nil
 }
 
-func (c *Client) PlayFile(ctx context.Context, path string) error {
-	return c.PlaySourceFile(ctx, c.opts.MediaSourceName, path, PlaySourceOptions{
-		Restart:         true,
-		CenterSceneItem: true,
-	})
-}
-
 func (c *Client) PlaySourceFile(ctx context.Context, sourceName string, path string, options PlaySourceOptions) error {
 	if sourceName == "" {
 		return errors.New("OBS source name is required")
@@ -324,14 +316,14 @@ func (c *Client) PlaySourceFile(ctx context.Context, sourceName string, path str
 		"inputSettings": inputSettings,
 		"overlay":       true,
 	}); err != nil {
-		return err
+		return sourceMutationError(err)
 	}
 	if options.Mute != nil {
 		if err := c.request(ctx, "SetInputMute", map[string]any{
 			"inputName":  sourceName,
 			"inputMuted": *options.Mute,
 		}); err != nil {
-			return err
+			return sourceMutationError(err)
 		}
 	}
 	if options.CenterSceneItem {
@@ -343,6 +335,9 @@ func (c *Client) PlaySourceFile(ctx context.Context, sourceName string, path str
 				"source", sourceName,
 				"error", c.boundedLogError(err),
 			)
+			return sourceMutationError(
+				fmt.Errorf("center OBS media source %s: %w", sourceName, err),
+			)
 		} else {
 			c.logSamples.success(&c.logSamples.centerSource)
 		}
@@ -352,12 +347,19 @@ func (c *Client) PlaySourceFile(ctx context.Context, sourceName string, path str
 			"inputName":   sourceName,
 			"mediaAction": mediaActionRestart,
 		}); err != nil {
-			return err
+			return sourceMutationError(err)
 		}
 	}
 
 	c.setCurrentFile(sourceName, path)
 	return nil
+}
+
+func sourceMutationError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrSourceMayBeMutated, err)
 }
 
 func (c *Client) centerCurrentProgramSceneItem(ctx context.Context, sourceName string) error {
@@ -400,10 +402,6 @@ func (c *Client) centerCurrentProgramSceneItem(ctx context.Context, sourceName s
 	})
 }
 
-func (c *Client) StopCurrent(ctx context.Context) error {
-	return c.StopSource(ctx, c.opts.MediaSourceName)
-}
-
 func (c *Client) StopSource(ctx context.Context, sourceName string) error {
 	if sourceName == "" {
 		return errors.New("OBS source name is required")
@@ -421,7 +419,7 @@ func (c *Client) StopSource(ctx context.Context, sourceName string) error {
 
 func (c *Client) setCurrentFile(sourceName string, path string) {
 	c.mu.Lock()
-	now := time.Now().UTC()
+	now := time.Now()
 	if previous, ok := c.currentFiles[sourceName]; ok {
 		if previous != "" && previous != path {
 			c.supersededFiles[sourceName] = appendSupersededSourceFile(c.supersededFiles[sourceName], supersededSourceFile{
@@ -433,9 +431,6 @@ func (c *Client) setCurrentFile(sourceName string, path string) {
 		delete(c.supersededFiles, sourceName)
 	}
 	c.currentFiles[sourceName] = path
-	if sourceName == c.opts.MediaSourceName {
-		c.currentFile = path
-	}
 	c.mu.Unlock()
 }
 
@@ -456,9 +451,6 @@ func (c *Client) clearCurrentFile(sourceName string) {
 	c.mu.Lock()
 	delete(c.currentFiles, sourceName)
 	delete(c.supersededFiles, sourceName)
-	if sourceName == c.opts.MediaSourceName {
-		c.currentFile = ""
-	}
 	c.mu.Unlock()
 }
 
@@ -662,7 +654,10 @@ func (c *Client) handleEvent(raw json.RawMessage) {
 	event := Event{
 		Type:      EventMediaEnded,
 		InputName: inputName,
-		At:        time.Now().UTC(),
+		// Keep the monotonic component for superseded-generation window
+		// comparisons. Convert a copy to UTC only at an external presentation
+		// boundary if one is ever added.
+		At: time.Now(),
 	}
 	c.mu.Lock()
 	if c.closed {
@@ -673,19 +668,12 @@ func (c *Client) handleEvent(raw json.RawMessage) {
 		event.Path = supersededPath
 	} else {
 		path, tracked := c.currentFiles[inputName]
-		if inputName != c.opts.MediaSourceName && !tracked {
+		if !tracked {
 			c.mu.Unlock()
 			return
 		}
-		if tracked {
-			event.Path = path
-			delete(c.currentFiles, inputName)
-		} else {
-			event.Path = c.currentFile
-		}
-		if inputName == c.opts.MediaSourceName {
-			c.currentFile = ""
-		}
+		event.Path = path
+		delete(c.currentFiles, inputName)
 	}
 	dropped := false
 	select {

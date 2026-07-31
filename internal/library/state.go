@@ -27,6 +27,11 @@ type PeriodPlan struct {
 	LoopID string
 }
 
+type PruneResult struct {
+	Overrides   int64
+	PeriodPlans int64
+}
+
 func OpenState(ctx context.Context, path string) (*StateStore, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -176,9 +181,143 @@ DELETE FROM library_period_plans WHERE date_key = ? AND period = ?
 	return err
 }
 
+func (s *StateStore) ClearOverrideAndPeriodPlan(ctx context.Context, date string, period Period) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM library_overrides WHERE date_key = ?
+`, date); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM library_period_plans WHERE date_key = ? AND period = ?
+`, date, string(period)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RestorePlaybackSelection atomically restores the user override for
+// overrideDate and the persisted loop plan for planDate/period. It is used
+// when tentative candidate selection changed durable state but no OBS
+// candidate was successfully activated.
+func (s *StateStore) RestorePlaybackSelection(
+	ctx context.Context,
+	overrideDate string,
+	override Override,
+	planDate string,
+	period Period,
+	plan PeriodPlan,
+	planExists bool,
+) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if override.Theme == "" && override.DirectLoopID == "" {
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM library_overrides WHERE date_key = ?
+`, overrideDate); err != nil {
+			return err
+		}
+	} else {
+		now := formatStateTime(time.Now())
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO library_overrides (date_key, theme, direct_loop_id, updated_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(date_key) DO UPDATE SET
+	theme = excluded.theme,
+	direct_loop_id = excluded.direct_loop_id,
+	updated_at = excluded.updated_at
+`, overrideDate, override.Theme, override.DirectLoopID, now); err != nil {
+			return err
+		}
+	}
+
+	if planExists {
+		now := formatStateTime(time.Now())
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO library_period_plans (date_key, period, theme, loop_id, updated_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(date_key, period) DO UPDATE SET
+	theme = excluded.theme,
+	loop_id = excluded.loop_id,
+	updated_at = excluded.updated_at
+`, planDate, string(period), plan.Theme, plan.LoopID, now); err != nil {
+			return err
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM library_period_plans WHERE date_key = ? AND period = ?
+`, planDate, string(period)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *StateStore) ClearPlansForDate(ctx context.Context, date string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM library_period_plans WHERE date_key = ?`, date)
 	return err
+}
+
+func (s *StateStore) PruneBefore(ctx context.Context, beforeDate string, limit int) (PruneResult, error) {
+	if beforeDate == "" {
+		return PruneResult{}, errors.New("prune cutoff date is required")
+	}
+	if limit <= 0 {
+		return PruneResult{}, errors.New("prune limit must be positive")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	defer tx.Rollback()
+
+	overrideResult, err := tx.ExecContext(ctx, `
+DELETE FROM library_overrides
+WHERE rowid IN (
+	SELECT rowid
+	FROM library_overrides
+	WHERE date_key < ?
+	ORDER BY date_key
+	LIMIT ?
+)
+`, beforeDate, limit)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	planResult, err := tx.ExecContext(ctx, `
+DELETE FROM library_period_plans
+WHERE rowid IN (
+	SELECT rowid
+	FROM library_period_plans
+	WHERE date_key < ?
+	ORDER BY date_key, period
+	LIMIT ?
+)
+`, beforeDate, limit)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	overrides, err := overrideResult.RowsAffected()
+	if err != nil {
+		return PruneResult{}, err
+	}
+	plans, err := planResult.RowsAffected()
+	if err != nil {
+		return PruneResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return PruneResult{}, err
+	}
+	return PruneResult{Overrides: overrides, PeriodPlans: plans}, nil
 }
 
 func (s *StateStore) LastMusicID(ctx context.Context) (string, error) {

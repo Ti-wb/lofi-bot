@@ -37,9 +37,8 @@ func TestEventSamplerDoesNotResetOnAlternatingSuccess(t *testing.T) {
 func TestOBSDecodeWarningsAreSampledWithoutDelayingEventStream(t *testing.T) {
 	var logs bytes.Buffer
 	client, err := NewClient(Options{
-		URL:             "ws://unused.invalid",
-		MediaSourceName: "queue",
-		Logger:          slog.New(slog.NewTextHandler(&logs, nil)),
+		URL:    "ws://unused.invalid",
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)

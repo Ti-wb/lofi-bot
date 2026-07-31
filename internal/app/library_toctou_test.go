@@ -25,7 +25,6 @@ func TestLibraryImportRejectsFinalSymlinkEscape(t *testing.T) {
 	_, err := svc.ImportLibraryUpload(context.Background(), UploadRequest{
 		LocalPath: sourcePath,
 		FileName:  "music_final_escape.mp3",
-		SizeBytes: int64(len("outside-media")),
 	})
 	if err == nil {
 		t.Fatal("expected final symlink rejection")
@@ -51,7 +50,6 @@ func TestLibraryImportRejectsParentSymlinkEscape(t *testing.T) {
 	_, err := svc.ImportLibraryUpload(context.Background(), UploadRequest{
 		LocalPath: filepath.Join(parentPath, "outside.mp4"),
 		FileName:  "music_parent_escape.mp3",
-		SizeBytes: int64(len("outside-media")),
 	})
 	if err == nil {
 		t.Fatal("expected parent symlink rejection")

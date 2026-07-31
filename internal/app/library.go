@@ -7,8 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	medialib "github.com/tiwb/tg-obs-bot/internal/library"
@@ -25,53 +25,375 @@ type libraryUploadPlan struct {
 	label    string
 }
 
+type libraryPlaybackSelectionSnapshot struct {
+	overrideDate string
+	override     medialib.Override
+	planDate     string
+	period       medialib.Period
+	plan         medialib.PeriodPlan
+	planExists   bool
+}
+
+type obsFailClosedBudget struct {
+	once   sync.Once
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+type obsFailClosedBudgetContextKey struct{}
+
 type libraryScanFunc func(string, string) (medialib.Library, error)
 
-func (s *Service) libraryMode() bool {
-	return s.cfg.PlayerMode == "library"
+type libraryProgressScanFunc func(
+	context.Context,
+	string,
+	string,
+	func(),
+) (medialib.Library, error)
+
+func (s *Service) libraryPlaybackMissing() bool {
+	s.playbackMu.Lock()
+	defer s.playbackMu.Unlock()
+	return s.activeLoopPath == ""
 }
 
 func (s *Service) ScanLibrary(ctx context.Context) error {
-	s.playbackMu.Lock()
-	defer s.playbackMu.Unlock()
-	return s.scanLibraryLocked(ctx)
+	return s.scanLibraryWithProgress(ctx, medialib.ScanDirsContext, true)
 }
 
-func (s *Service) scanLibraryLocked(ctx context.Context) error {
-	return s.scanLibraryLockedWith(ctx, medialib.ScanDirs)
+// scanLibraryWith performs filesystem enumeration and ffprobe validation
+// without holding playbackMu. Only the final, generation-checked snapshot
+// publication takes the playback lock, so a slow scan cannot freeze period
+// transitions, OBS recovery, or Telegram playback controls.
+func (s *Service) scanLibraryWith(
+	ctx context.Context,
+	scan libraryScanFunc,
+	validate bool,
+) error {
+	return s.scanLibraryWithProgress(
+		ctx,
+		func(
+			_ context.Context,
+			loopDir string,
+			musicDir string,
+			progress func(),
+		) (medialib.Library, error) {
+			lib, err := scan(loopDir, musicDir)
+			if progress != nil {
+				progress()
+			}
+			return lib, err
+		},
+		validate,
+	)
 }
 
-func (s *Service) scanLibraryLockedWith(ctx context.Context, scan libraryScanFunc) error {
+func (s *Service) scanLibraryWithProgress(
+	ctx context.Context,
+	scan libraryProgressScanFunc,
+	validate bool,
+) error {
 	tracker := liveness.WorkerFromContext(ctx)
-	scanScope := tracker.Scope(liveness.PhaseLibraryScan)
-	defer scanScope.Close()
-
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(s.cfg.LoopMediaDir, 0o755); err != nil {
-		s.setLastErr(err)
+	if err := s.acquireLibraryScan(ctx, tracker); err != nil {
 		return err
+	}
+	defer s.releaseLibraryScan()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	scanScope := tracker.Scope(liveness.PhaseLibraryScan)
+	defer scanScope.Close()
+	generation := s.libraryScanGeneration.Add(1)
+
+	if err := os.MkdirAll(s.cfg.LoopMediaDir, 0o755); err != nil {
+		return s.publishLibraryScanFailure(ctx, generation, err)
 	}
 	if err := os.MkdirAll(s.cfg.MusicMediaDir, 0o755); err != nil {
-		s.setLastErr(err)
+		return s.publishLibraryScanFailure(ctx, generation, err)
+	}
+	lib, err := scan(
+		ctx,
+		s.cfg.LoopMediaDir,
+		s.cfg.MusicMediaDir,
+		func() {
+			scanScope.Checkpoint()
+		},
+	)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
-	lib, err := scan(s.cfg.LoopMediaDir, s.cfg.MusicMediaDir)
-	if !errors.Is(err, medialib.ErrDirectoryCapacity) {
-		s.librarySnapshot = lib
+	if errors.Is(err, medialib.ErrDirectoryCapacity) {
+		return s.publishLibraryScanFailure(ctx, generation, err)
 	}
-	if err != nil {
-		s.libraryScanErr = err.Error()
+	if libraryScanIsIncomplete(err) {
+		return s.publishLibraryScanFailure(ctx, generation, err)
+	}
+
+	rejectedCount := libraryScanIssueCount(err)
+	seen := libraryPaths(lib)
+	var validationCache map[string]libraryValidationEntry
+	if validate {
+		cacheSnapshot := s.libraryValidationCacheSnapshot()
+		var validationIssues []*medialib.Error
+		lib, validationCache, seen, validationIssues = s.validateScannedLibrary(
+			ctx,
+			lib,
+			cacheSnapshot,
+			func() {
+				scanScope.Checkpoint()
+			},
+		)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// Cancellation is not a new view of the filesystem. Preserve the
+			// complete last-known-good snapshot and its diagnostics.
+			return ctxErr
+		}
+		rejectedCount += len(validationIssues)
+		if len(validationIssues) > 0 {
+			err = errors.Join(err, &medialib.ScanError{Issues: validationIssues})
+		}
+	}
+	return s.publishLibraryScan(
+		ctx,
+		generation,
+		lib,
+		validationCache,
+		seen,
+		rejectedCount,
+		err,
+		validate,
+	)
+}
+
+func (s *Service) acquireLibraryScan(
+	ctx context.Context,
+	tracker *liveness.Worker,
+) error {
+	s.libraryScanGateOnce.Do(func() {
+		s.libraryScanGate = make(chan struct{}, 1)
+		s.libraryScanGate <- struct{}{}
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.libraryScanGate:
+		if err := ctx.Err(); err != nil {
+			s.releaseLibraryScan()
+			return err
+		}
+		return nil
+	default:
+	}
+
+	tracker.Advance(liveness.PhaseRetryWait)
+	pulse := time.NewTicker(tracker.ProgressInterval())
+	defer pulse.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			tracker.Advance(liveness.PhaseCancelWait)
+			return ctx.Err()
+		case <-pulse.C:
+			// Waiting for the current complete scan is an intentional,
+			// cancellable resource wait, not evidence that the scan itself
+			// progressed.
+			tracker.Advance(liveness.PhaseRetryWait)
+		case <-s.libraryScanGate:
+			if err := ctx.Err(); err != nil {
+				s.releaseLibraryScan()
+				tracker.Advance(liveness.PhaseCancelWait)
+				return err
+			}
+			tracker.Advance(liveness.PhaseOperation)
+			return nil
+		}
+	}
+}
+
+func (s *Service) releaseLibraryScan() {
+	s.libraryScanGate <- struct{}{}
+}
+
+func (s *Service) ensureLibraryScanned(ctx context.Context) error {
+	s.playbackMu.Lock()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		s.playbackMu.Unlock()
+		return ctxErr
+	}
+	published := s.librarySnapshotPublished ||
+		len(s.librarySnapshot.Loops) > 0 ||
+		len(s.librarySnapshot.Music) > 0
+	s.playbackMu.Unlock()
+	if published {
+		return nil
+	}
+	return s.ScanLibrary(ctx)
+}
+
+func (s *Service) publishLibraryScanFailure(
+	ctx context.Context,
+	generation uint64,
+	err error,
+) error {
+	if err == nil {
+		return nil
+	}
+	published := false
+	s.playbackMu.Lock()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		s.playbackMu.Unlock()
+		return ctxErr
+	}
+	if generation == s.libraryScanGeneration.Load() {
+		s.libraryScanErr = s.publicScanDiagnostic(err)
+		published = true
+	}
+	s.playbackMu.Unlock()
+	if published {
 		s.setLastErr(err)
-		return err
 	}
-	s.libraryScanErr = ""
+	return err
+}
+
+func (s *Service) publishLibraryScan(
+	ctx context.Context,
+	generation uint64,
+	lib medialib.Library,
+	validationCache map[string]libraryValidationEntry,
+	seen map[string]struct{},
+	rejectedCount int,
+	scanErr error,
+	replaceValidationCache bool,
+) error {
+	s.playbackMu.Lock()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		s.playbackMu.Unlock()
+		return ctxErr
+	}
+	if generation != s.libraryScanGeneration.Load() {
+		s.playbackMu.Unlock()
+		return scanErr
+	}
+
+	if replaceValidationCache {
+		s.libraryValidationCache = validationCache
+	}
+	for path := range s.libraryQuarantine {
+		if _, ok := seen[path]; !ok {
+			delete(s.libraryQuarantine, path)
+		}
+	}
+
+	filtered := medialib.Library{
+		Loops: make([]medialib.Loop, 0, len(lib.Loops)),
+		Music: make([]medialib.Music, 0, len(lib.Music)),
+	}
+	quarantineIssues := make([]*medialib.Error, 0)
+	for _, loop := range lib.Loops {
+		if reason := s.libraryAssetQuarantineReasonLocked(loop.Path); reason != "" {
+			quarantineIssues = append(quarantineIssues, invalidPlayableAssetIssue(
+				medialib.KindLoop,
+				loop.RelPath,
+				errors.New(reason),
+			))
+			continue
+		}
+		filtered.Loops = append(filtered.Loops, loop)
+	}
+	for _, music := range lib.Music {
+		if reason := s.libraryAssetQuarantineReasonLocked(music.Path); reason != "" {
+			quarantineIssues = append(quarantineIssues, invalidPlayableAssetIssue(
+				medialib.KindMusic,
+				music.RelPath,
+				errors.New(reason),
+			))
+			continue
+		}
+		filtered.Music = append(filtered.Music, music)
+	}
+	if len(quarantineIssues) > 0 {
+		scanErr = errors.Join(scanErr, &medialib.ScanError{Issues: quarantineIssues})
+		rejectedCount += len(quarantineIssues)
+	}
+
+	s.librarySnapshot = filtered
+	s.libraryRejectedCount = rejectedCount
+	s.librarySnapshotPublished = true
+	if scanErr != nil {
+		s.libraryScanErr = s.publicScanDiagnostic(scanErr)
+	} else {
+		s.libraryScanErr = ""
+	}
+	s.playbackMu.Unlock()
+
+	if scanErr != nil {
+		s.setLastErr(scanErr)
+		return scanErr
+	}
 	return nil
+}
+
+func libraryPaths(lib medialib.Library) map[string]struct{} {
+	seen := make(map[string]struct{}, len(lib.Loops)+len(lib.Music))
+	for _, loop := range lib.Loops {
+		seen[loop.Path] = struct{}{}
+	}
+	for _, music := range lib.Music {
+		seen[music.Path] = struct{}{}
+	}
+	return seen
+}
+
+func libraryScanIssueCount(err error) int {
+	if err == nil {
+		return 0
+	}
+	if scanErr, ok := err.(*medialib.ScanError); ok {
+		return len(scanErr.Issues)
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		count := 0
+		for _, child := range joined.Unwrap() {
+			count += libraryScanIssueCount(child)
+		}
+		return count
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return libraryScanIssueCount(wrapped.Unwrap())
+	}
+	return 0
+}
+
+func libraryScanIsIncomplete(err error) bool {
+	var scanErr *medialib.ScanError
+	if !errors.As(err, &scanErr) {
+		return false
+	}
+	for _, issue := range scanErr.Issues {
+		if issue != nil &&
+			(issue.Code == medialib.ErrorReadDirectory ||
+				issue.Code == medialib.ErrorDirectoryCapacity) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) librarySchedulerLoop(ctx context.Context) error {
 	tracker := liveness.WorkerFromContext(ctx)
+	tracker.Advance(liveness.PhaseOperation)
+	if err := s.ScanLibrary(ctx); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		s.logger.Warn("initial media library scan found issues", "error", s.redactError(err))
+	}
 	retries := newRecurringRetry(librarySchedulerInterval, libraryRetryMaxDelay, s.retryRandom)
 	schedule := newRecurringSchedule(librarySchedulerInterval, false, s.retryClockNow)
 	delay := schedule.delay()
@@ -99,6 +421,7 @@ func (s *Service) librarySchedulerLoop(ctx context.Context) error {
 			}
 			s.setLastErr(err)
 			failure := retries.failure()
+			failure.attempt.Delay = s.capLibraryRetryAtPeriodBoundary(failure.attempt.Delay)
 			logRecurringFailure(s.logger, "library playback check failed", s.redactError(err), failure)
 			delay = schedule.failureDelay(failure.attempt.Delay)
 			waitPhase = liveness.PhaseRetryWait
@@ -110,13 +433,39 @@ func (s *Service) librarySchedulerLoop(ctx context.Context) error {
 	}
 }
 
+func (s *Service) capLibraryRetryAtPeriodBoundary(delay time.Duration) time.Duration {
+	now := time.Now()
+	if s.now != nil {
+		now = s.now()
+	}
+	untilBoundary := medialib.PeriodInfoAt(now).EndsAt.Sub(now)
+	if untilBoundary <= 0 {
+		return 0
+	}
+	if delay > untilBoundary {
+		return untilBoundary
+	}
+	return delay
+}
+
 func (s *Service) recoverLibraryPlaybackAfterOBSConnect(ctx context.Context) error {
-	var scanErr error
+	// Reconnect from the last complete snapshot instead of forcing a full
+	// filesystem/probe pass while obsRecoveryInProgress blocks event handling
+	// and scheduled transitions. A fresh process (including one whose first
+	// incomplete scan failed) still scans here because it has no published
+	// snapshot yet. Imports and explicit /scan requests own later refreshes.
+	scanErr := s.ensureLibraryScanned(ctx)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
 	var reconcileErr error
 	func() {
 		s.playbackMu.Lock()
 		defer s.playbackMu.Unlock()
-		scanErr = s.scanLibraryLocked(ctx)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			reconcileErr = ctxErr
+			return
+		}
 		reconcileErr = s.reconcileLibraryPlaybackLocked(ctx, true)
 	}()
 
@@ -137,16 +486,31 @@ func (s *Service) handleLibraryOBSEventAttempt(ctx context.Context, event obs.Ev
 	}
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
 	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
 		return false, nil
 	}
-	if event.InputName == s.cfg.OBSMusicSourceName &&
-		event.Path != "" &&
-		s.activeMusicPath != "" &&
-		event.Path != s.activeMusicPath {
+	var activePath string
+	switch event.InputName {
+	case s.cfg.OBSMusicSourceName:
+		activePath = s.activeMusicPath
+	case s.cfg.OBSLoopSourceName:
+		activePath = s.activeLoopPath
+	}
+	if event.Path != "" && activePath != "" && event.Path != activePath {
 		return true, nil
 	}
-	return true, s.reconcileLibrarySourceLocked(ctx, event.InputName, false)
+	ctx, cancelFailClosed := s.withOBSFailClosedBudget(ctx)
+	defer cancelFailClosed()
+	operationCtx, cancelOperation := s.libraryPlaybackOperationContext(ctx)
+	defer cancelOperation()
+	err := s.reconcileLibrarySourceLocked(operationCtx, event.InputName, false)
+	if operationErr := operationCtx.Err(); operationErr != nil {
+		err = errors.Join(err, operationErr)
+	}
+	return true, err
 }
 
 func (s *Service) restartLibraryLoopAfterEndedLocked(ctx context.Context) error {
@@ -155,17 +519,297 @@ func (s *Service) restartLibraryLoopAfterEndedLocked(ctx context.Context) error 
 }
 
 func (s *Service) restartLibraryLoopLocked(ctx context.Context) error {
-	loop, info, _, err := s.loopForTimeLocked(ctx, s.now(), false)
+	_, err := s.activateScheduledLibraryLoopLocked(ctx, s.now(), false, true)
+	return err
+}
+
+func (s *Service) activateScheduledLibraryLoopLocked(
+	ctx context.Context,
+	now time.Time,
+	redrawPlan bool,
+	alwaysPlay bool,
+) (lastInfo medialib.PeriodInfo, resultErr error) {
+	ctx, cancelFailClosed := s.withOBSFailClosedBudget(ctx)
+	defer cancelFailClosed()
+	selectionSnapshot, err := s.capturePlaybackSelectionLocked(ctx, now)
 	if err != nil {
+		return medialib.PeriodInfoAt(now), err
+	}
+	operationCtx, cancelOperation := s.libraryPlaybackOperationContext(ctx)
+	defer cancelOperation()
+
+	attemptLimit := boundedLibraryCandidateAttempts(len(s.librarySnapshot.Loops))
+	lastInfo = medialib.PeriodInfoAt(now)
+	var (
+		playbackErrors error
+		tentativePaths []string
+		attemptedOBS   bool
+		succeeded      bool
+	)
+	defer func() {
+		if succeeded {
+			return
+		}
+		// An alternate candidate never proved the RPC failure asset-specific.
+		// Avoid pinning a transient OBS/source outage into quarantine.
+		for _, path := range tentativePaths {
+			delete(s.libraryQuarantine, path)
+		}
+		if attemptedOBS {
+			restoreCtx, cancelRestore := s.obsFailClosedContext(ctx)
+			err := s.libDB.RestorePlaybackSelection(
+				restoreCtx,
+				selectionSnapshot.overrideDate,
+				selectionSnapshot.override,
+				selectionSnapshot.planDate,
+				selectionSnapshot.period,
+				selectionSnapshot.plan,
+				selectionSnapshot.planExists,
+			)
+			cancelRestore()
+			liveness.WorkerFromContext(ctx).Advance(liveness.PhaseOperation)
+			if err != nil {
+				resultErr = errors.Join(
+					resultErr,
+					fmt.Errorf("restore library playback selection after OBS failure: %w", err),
+				)
+			}
+		}
+	}()
+
+	for attempt := 0; attempt < attemptLimit; attempt++ {
+		loop, info, _, err := s.loopForTimeLocked(
+			operationCtx,
+			now,
+			redrawPlan && attempt == 0,
+		)
+		lastInfo = info
+		if err != nil {
+			return lastInfo, errors.Join(playbackErrors, err)
+		}
+		needsPlay := alwaysPlay ||
+			s.activeLoopID != loop.ID ||
+			s.activeLoopPath != loop.Path ||
+			s.activeLoopPeriod != info.Period ||
+			!s.activeLoopEndsAt.Equal(info.EndsAt) ||
+			!now.Before(s.activeLoopEndsAt)
+		if !needsPlay {
+			succeeded = true
+			return lastInfo, nil
+		}
+		if err := s.playLibraryLoopLocked(operationCtx, loop, info); err != nil {
+			if errors.Is(err, errUnhealthyLibraryAsset) {
+				continue
+			}
+			attemptedOBS = true
+			if playbackOperationMustAbort(ctx, operationCtx, err) ||
+				errors.Is(err, errOBSPlayCleanupFailed) ||
+				s.obs.Status().State != obs.StateConnected {
+				return lastInfo, errors.Join(playbackErrors, err)
+			}
+			playbackErrors = errors.Join(playbackErrors, err)
+			s.quarantineLibraryAssetLocked(
+				loop.Path,
+				fmt.Errorf("OBS rejected media playback: %w", err),
+			)
+			tentativePaths = append(tentativePaths, loop.Path)
+			continue
+		}
+		succeeded = true
+		return lastInfo, nil
+	}
+	return lastInfo, errors.Join(
+		playbackErrors,
+		publicError(fmt.Sprintf(
+			"在單次安全上限 %d 個候選內，沒有可啟動的目前時段 loop 影片。",
+			attemptLimit,
+		)),
+	)
+}
+
+func (s *Service) capturePlaybackSelectionLocked(
+	ctx context.Context,
+	now time.Time,
+) (libraryPlaybackSelectionSnapshot, error) {
+	info := medialib.PeriodInfoAt(now)
+	snapshot := libraryPlaybackSelectionSnapshot{
+		overrideDate: overrideDateKey(now),
+		planDate:     periodPlanDate(now, info.Period),
+		period:       info.Period,
+	}
+	override, err := s.libDB.Override(ctx, snapshot.overrideDate)
+	if err != nil {
+		return libraryPlaybackSelectionSnapshot{}, err
+	}
+	// Do not resurrect a direct override whose asset was already absent or
+	// quarantined before this activation attempt began.
+	if override.DirectLoopID != "" {
+		if _, ok := s.findLoopByID(override.DirectLoopID); !ok {
+			override.DirectLoopID = ""
+		}
+	}
+	snapshot.override = override
+
+	plan, exists, err := s.libDB.PeriodPlan(ctx, snapshot.planDate, info.Period)
+	if err != nil {
+		return libraryPlaybackSelectionSnapshot{}, err
+	}
+	if exists {
+		loop, healthy := s.findLoopByID(plan.LoopID)
+		if !healthy || loop.Period != info.Period {
+			exists = false
+		}
+	}
+	// The previous day's early-night override/plan is intentionally expired by
+	// loopForTimeLocked. A failed OBS attempt must not revive that stale plan.
+	if info.Period == medialib.PeriodNight &&
+		now.Hour() < 6 &&
+		snapshot.planDate != snapshot.overrideDate {
+		previousOverride, err := s.libDB.Override(ctx, snapshot.planDate)
+		if err != nil {
+			return libraryPlaybackSelectionSnapshot{}, err
+		}
+		if previousOverride.Theme != "" || previousOverride.DirectLoopID != "" {
+			exists = false
+		}
+	}
+	snapshot.plan = plan
+	snapshot.planExists = exists
+	return snapshot, nil
+}
+
+func boundedLibraryCandidateAttempts(count int) int {
+	if count <= 0 {
+		return 1
+	}
+	if count > maxLibraryPlaybackCandidates {
+		return maxLibraryPlaybackCandidates
+	}
+	return count
+}
+
+func (s *Service) libraryPlaybackOperationContext(
+	ctx context.Context,
+) (context.Context, context.CancelFunc) {
+	timeout := s.obsPlaybackTimeout
+	if timeout <= 0 {
+		timeout = defaultOBSPlaybackOperationTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+func playbackOperationMustAbort(
+	parent context.Context,
+	operation context.Context,
+	err error,
+) bool {
+	return parent.Err() != nil ||
+		operation.Err() != nil ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
+func (s *Service) playOBSFileLocked(
+	ctx context.Context,
+	sourceName string,
+	path string,
+	options obs.PlaySourceOptions,
+) error {
+	playCtx, cancelPlay := s.libraryPlaybackOperationContext(ctx)
+	err := s.obs.PlaySourceFile(playCtx, sourceName, path, options)
+	cancelPlay()
+	tracker := liveness.WorkerFromContext(ctx)
+	tracker.Advance(liveness.PhaseOperation)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, obs.ErrSourceMayBeMutated) {
 		return err
 	}
-	return s.playLibraryLoopLocked(ctx, loop, info)
+
+	// The OBS request may have applied local_file before its response or a
+	// later mute/restart request failed. Stop the source using an independent,
+	// bounded cleanup context so an expired activation deadline cannot leave
+	// an uncommitted candidate playing.
+	cleanupCtx, cancelCleanup := s.obsFailClosedStopContext(ctx)
+	stopErr := s.obs.StopSource(cleanupCtx, sourceName)
+	cancelCleanup()
+	tracker.Advance(liveness.PhaseOperation)
+	s.clearMediaProgressLocked(sourceName)
+	switch sourceName {
+	case s.cfg.OBSLoopSourceName:
+		s.clearActiveLoopLocked()
+	case s.cfg.OBSMusicSourceName:
+		s.clearActiveMusicLocked()
+	}
+	if stopErr != nil {
+		return errors.Join(
+			err,
+			fmt.Errorf("%w: stop %s: %v", errOBSPlayCleanupFailed, sourceName, stopErr),
+		)
+	}
+	return err
+}
+
+func (s *Service) obsFailClosedContext(
+	ctx context.Context,
+) (context.Context, context.CancelFunc) {
+	cleanupTimeout := s.obsCleanupTimeout
+	if cleanupTimeout <= 0 {
+		cleanupTimeout = defaultOBSFailClosedBudgetTimeout
+	}
+	if budget, ok := ctx.Value(obsFailClosedBudgetContextKey{}).(*obsFailClosedBudget); ok {
+		budget.once.Do(func() {
+			budget.ctx, budget.cancel = context.WithTimeout(
+				context.WithoutCancel(ctx),
+				cleanupTimeout,
+			)
+		})
+		return budget.ctx, func() {}
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+}
+
+func (s *Service) obsFailClosedStopContext(
+	ctx context.Context,
+) (context.Context, context.CancelFunc) {
+	budgetCtx, cancelBudget := s.obsFailClosedContext(ctx)
+	actionTimeout := defaultOBSFailClosedActionTimeout
+	if s.obsCleanupTimeout > 0 {
+		actionTimeout = s.obsCleanupTimeout / 2
+		if actionTimeout <= 0 {
+			actionTimeout = time.Millisecond
+		}
+	}
+	actionCtx, cancelAction := context.WithTimeout(budgetCtx, actionTimeout)
+	return actionCtx, func() {
+		cancelAction()
+		cancelBudget()
+	}
+}
+
+func (s *Service) withOBSFailClosedBudget(
+	ctx context.Context,
+) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Value(obsFailClosedBudgetContextKey{}).(*obsFailClosedBudget); ok {
+		return ctx, func() {}
+	}
+	budget := &obsFailClosedBudget{}
+	budgetCtx := context.WithValue(ctx, obsFailClosedBudgetContextKey{}, budget)
+	return budgetCtx, func() {
+		if budget.cancel != nil {
+			budget.cancel()
+		}
+	}
 }
 
 func (s *Service) playLibraryLoopLocked(ctx context.Context, loop medialib.Loop, info medialib.PeriodInfo) error {
+	if err := s.ensurePlayableLibraryAssetLocked(ctx, medialib.KindLoop, loop.Path); err != nil {
+		return err
+	}
 	looping := true
 	mute := true
-	if err := s.obs.PlaySourceFile(ctx, s.cfg.OBSLoopSourceName, loop.Path, obs.PlaySourceOptions{
+	if err := s.playOBSFileLocked(ctx, s.cfg.OBSLoopSourceName, loop.Path, obs.PlaySourceOptions{
 		Restart:         true,
 		Looping:         &looping,
 		Mute:            &mute,
@@ -177,9 +821,8 @@ func (s *Service) playLibraryLoopLocked(ctx context.Context, loop medialib.Loop,
 	s.activeLoopID = loop.ID
 	s.activeLoopPath = loop.Path
 	s.activeLoopTheme = loop.Theme
-	s.activeLoopPeriod = loop.Period
+	s.activeLoopPeriod = info.Period
 	s.activeLoopEndsAt = info.EndsAt
-	s.setPlaybackState(playbackFile, 0, loop.Path)
 	return nil
 }
 
@@ -207,6 +850,9 @@ func (s *Service) reconcileLibraryPlaybackAttempt(ctx context.Context) (bool, er
 	}
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
 	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
 		return false, nil
 	}
@@ -214,23 +860,39 @@ func (s *Service) reconcileLibraryPlaybackAttempt(ctx context.Context) (bool, er
 }
 
 func (s *Service) reconcileLibraryPlaybackLocked(ctx context.Context, recovering bool) error {
+	ctx, cancelFailClosed := s.withOBSFailClosedBudget(ctx)
+	defer cancelFailClosed()
+	operationCtx, cancelOperation := s.libraryPlaybackOperationContext(ctx)
+	defer cancelOperation()
 	previousLoopID := s.activeLoopID
 	previousLoopPath := s.activeLoopPath
 	previousMusicID := s.activeMusicID
 	previousMusicPath := s.activeMusicPath
-	if err := s.ensureLibraryPlaybackLocked(ctx, false); err != nil {
-		return err
+	reconcileErr := s.ensureLibraryPlaybackLocked(operationCtx, false)
+	if operationErr := operationCtx.Err(); operationErr != nil {
+		return errors.Join(reconcileErr, operationErr)
 	}
 
-	var reconcileErr error
 	if previousLoopID == s.activeLoopID && previousLoopPath == s.activeLoopPath && s.activeLoopPath != "" {
-		reconcileErr = s.reconcileLibrarySourceLocked(ctx, s.cfg.OBSLoopSourceName, recovering)
+		reconcileErr = errors.Join(
+			reconcileErr,
+			s.reconcileLibrarySourceLocked(operationCtx, s.cfg.OBSLoopSourceName, recovering),
+		)
+	}
+	if operationErr := operationCtx.Err(); operationErr != nil {
+		return errors.Join(reconcileErr, operationErr)
 	}
 	if reconcileErr != nil && s.obs.Status().State != obs.StateConnected {
 		return reconcileErr
 	}
 	if previousMusicID == s.activeMusicID && previousMusicPath == s.activeMusicPath && s.activeMusicPath != "" {
-		reconcileErr = errors.Join(reconcileErr, s.reconcileLibrarySourceLocked(ctx, s.cfg.OBSMusicSourceName, recovering))
+		reconcileErr = errors.Join(
+			reconcileErr,
+			s.reconcileLibrarySourceLocked(operationCtx, s.cfg.OBSMusicSourceName, recovering),
+		)
+	}
+	if operationErr := operationCtx.Err(); operationErr != nil {
+		return errors.Join(reconcileErr, operationErr)
 	}
 	return reconcileErr
 }
@@ -252,16 +914,25 @@ func (s *Service) reconcileLibrarySourceLocked(ctx context.Context, inputName st
 		if inspection.PathMismatch && inspection.Settling && !recovering {
 			return nil
 		}
+		if inspection.Stalled && expectedPath != "" {
+			return s.failoverStalledLibrarySourceLocked(ctx, inputName, expectedPath)
+		}
 		if inputName == s.cfg.OBSLoopSourceName {
 			return s.restartLibraryLoopLocked(ctx)
 		}
 		return s.replayActiveMusicLocked(ctx)
 	}
+	if inspection.Status.State == obs.MediaStateError && expectedPath != "" {
+		s.quarantineLibraryAssetLocked(
+			expectedPath,
+			errors.New("OBS reported a media playback error"),
+		)
+	}
 	switch inspection.Status.State {
 	case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering:
 		return nil
 	case obs.MediaStateStopped, obs.MediaStateEnded, obs.MediaStateError:
-		if inspection.Settling && !recovering {
+		if inspection.Status.State != obs.MediaStateError && inspection.Settling && !recovering {
 			return nil
 		}
 	case obs.MediaStateNone, obs.MediaStatePaused:
@@ -288,9 +959,36 @@ func (s *Service) reconcileLibrarySourceLocked(ctx context.Context, inputName st
 	return s.replayActiveMusicLocked(ctx)
 }
 
+func (s *Service) failoverStalledLibrarySourceLocked(
+	ctx context.Context,
+	inputName string,
+	expectedPath string,
+) error {
+	if err := s.obs.StopSource(ctx, inputName); err != nil {
+		return fmt.Errorf("stop stalled OBS media source %s: %w", inputName, err)
+	}
+	s.quarantineLibraryAssetLocked(
+		expectedPath,
+		errors.New("OBS media progress stalled"),
+	)
+	s.clearMediaProgressLocked(inputName)
+	if inputName == s.cfg.OBSLoopSourceName {
+		s.clearActiveLoopLocked()
+		return s.restartLibraryLoopLocked(ctx)
+	}
+	s.clearActiveMusicLocked()
+	return s.playNextMusicLocked(ctx, false)
+}
+
 func (s *Service) ensureLibraryPlayback(ctx context.Context, forceLoop bool) error {
+	if err := s.ensureLibraryScanned(ctx); err != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
 	return s.ensureLibraryPlaybackLocked(ctx, forceLoop)
 }
 
@@ -298,31 +996,98 @@ func (s *Service) ensureLibraryPlaybackLocked(ctx context.Context, forceLoop boo
 	if s.libDB == nil {
 		return errors.New("library state store is not configured")
 	}
-	if len(s.librarySnapshot.Loops) == 0 && len(s.librarySnapshot.Music) == 0 && s.libraryScanErr == "" {
-		_ = s.scanLibraryLocked(ctx)
-	}
-
+	ctx, cancelFailClosed := s.withOBSFailClosedBudget(ctx)
+	defer cancelFailClosed()
 	now := s.now()
-	loop, info, _, err := s.loopForTimeLocked(ctx, now, forceLoop)
+	info, err := s.activateScheduledLibraryLoopLocked(ctx, now, forceLoop, forceLoop)
+	var loopErr error
 	if err != nil {
-		s.setPlaybackState(playbackIdle, 0, "")
-		return err
-	}
-	if forceLoop || s.activeLoopID != loop.ID || s.activeLoopPath != loop.Path || now.After(s.activeLoopEndsAt) || now.Equal(s.activeLoopEndsAt) {
-		if err := s.playLibraryLoopLocked(ctx, loop, info); err != nil {
-			return err
+		loopErr = s.failClosedExpiredLoopLocked(ctx, now, info, err)
+		if ctx.Err() != nil ||
+			errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, errOBSPlayCleanupFailed) ||
+			s.obs.Status().State != obs.StateConnected {
+			return loopErr
 		}
 	}
 
-	if s.activeMusicID == "" || s.activeMusicPath == "" {
-		return s.playNextMusicLocked(ctx, false)
+	var persistenceErr error
+	if s.pendingLastMusicID != "" {
+		persistenceErr = s.persistLastMusicLocked(ctx)
 	}
-	return nil
+
+	if len(s.librarySnapshot.Music) == 0 {
+		return errors.Join(loopErr, persistenceErr, s.playNextMusicLocked(ctx, false))
+	}
+	if s.activeMusicID != "" && s.activeMusicPath != "" {
+		music, ok := s.findMusicByID(s.activeMusicID)
+		if !ok || music.Path != s.activeMusicPath {
+			if err := s.obs.StopSource(ctx, s.cfg.OBSMusicSourceName); err != nil {
+				return errors.Join(
+					loopErr,
+					persistenceErr,
+					fmt.Errorf("stop music removed from library snapshot: %w", err),
+				)
+			}
+			s.clearMediaProgressLocked(s.cfg.OBSMusicSourceName)
+			s.clearActiveMusicLocked()
+		}
+	}
+	if s.activeMusicID == "" || s.activeMusicPath == "" {
+		return errors.Join(loopErr, persistenceErr, s.playNextMusicLocked(ctx, false))
+	}
+	return errors.Join(loopErr, persistenceErr)
+}
+
+// failClosedExpiredLoopLocked prevents an already-ended schedule slot from
+// leaking into a new period when selection or OBS playback fails. A healthy
+// loop that still belongs to the current slot is left running through
+// transient state-store or force-redraw failures.
+func (s *Service) failClosedExpiredLoopLocked(
+	ctx context.Context,
+	now time.Time,
+	info medialib.PeriodInfo,
+	cause error,
+) error {
+	if s.activeLoopPath == "" &&
+		errors.Is(cause, obs.ErrSourceMayBeMutated) &&
+		!errors.Is(cause, errOBSPlayCleanupFailed) {
+		// playOBSFileLocked already stopped this possibly-mutated source and
+		// cleared its in-memory state. Avoid spending the shared cleanup budget
+		// on a redundant second StopSource request.
+		return cause
+	}
+	if s.activeLoopPath != "" &&
+		s.activeLoopPeriod == info.Period &&
+		now.Before(s.activeLoopEndsAt) {
+		if active, healthy := s.findLoopByID(s.activeLoopID); healthy &&
+			active.Path == s.activeLoopPath {
+			return cause
+		}
+	}
+
+	cleanupCtx, cancelCleanup := s.obsFailClosedStopContext(ctx)
+	stopErr := s.obs.StopSource(cleanupCtx, s.cfg.OBSLoopSourceName)
+	cancelCleanup()
+	liveness.WorkerFromContext(ctx).Advance(liveness.PhaseOperation)
+	if stopErr != nil {
+		return errors.Join(
+			cause,
+			fmt.Errorf("stop expired library loop after transition failure: %w", stopErr),
+		)
+	}
+	s.clearMediaProgressLocked(s.cfg.OBSLoopSourceName)
+	s.clearActiveLoopLocked()
+	return cause
 }
 
 func (s *Service) playNextMusic(ctx context.Context, force bool) error {
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
 	return s.playNextMusicLocked(ctx, force)
 }
 
@@ -330,7 +1095,14 @@ func (s *Service) playNextMusicLocked(ctx context.Context, force bool) error {
 	if s.libDB == nil {
 		return nil
 	}
+	ctx, cancelFailClosed := s.withOBSFailClosedBudget(ctx)
+	defer cancelFailClosed()
 	if len(s.librarySnapshot.Music) == 0 {
+		if err := s.obs.StopSource(ctx, s.cfg.OBSMusicSourceName); err != nil {
+			return fmt.Errorf("stop stale OBS music for empty library: %w", err)
+		}
+		s.clearMediaProgressLocked(s.cfg.OBSMusicSourceName)
+		s.clearActiveMusicLocked()
 		if force {
 			return publicError("媒體庫沒有可播放的音樂。")
 		}
@@ -338,21 +1110,65 @@ func (s *Service) playNextMusicLocked(ctx context.Context, force bool) error {
 	}
 	previousID := s.activeMusicID
 	if previousID == "" {
-		if stored, err := s.libDB.LastMusicID(ctx); err == nil {
+		if s.pendingLastMusicID != "" {
+			previousID = s.pendingLastMusicID
+		} else {
+			stored, err := s.libDB.LastMusicID(ctx)
+			if err != nil {
+				return err
+			}
 			previousID = stored
 		}
 	}
-	music, err := s.librarySnapshot.ChooseMusic(previousID, s.rng)
-	if err != nil {
-		return err
+	operationCtx, cancelOperation := s.libraryPlaybackOperationContext(ctx)
+	defer cancelOperation()
+	attemptLimit := boundedLibraryCandidateAttempts(len(s.librarySnapshot.Music))
+	var (
+		playbackErrors error
+		tentativePaths []string
+		succeeded      bool
+	)
+	defer func() {
+		if succeeded {
+			return
+		}
+		for _, path := range tentativePaths {
+			delete(s.libraryQuarantine, path)
+		}
+	}()
+	for attempt := 0; attempt < attemptLimit; attempt++ {
+		music, err := s.playableLibraryLocked().ChooseMusic(previousID, s.rng)
+		if err != nil {
+			return errors.Join(playbackErrors, err)
+		}
+		if err := s.playMusicAssetLocked(operationCtx, music); err != nil {
+			if errors.Is(err, errUnhealthyLibraryAsset) {
+				continue
+			}
+			if playbackOperationMustAbort(ctx, operationCtx, err) ||
+				errors.Is(err, errOBSPlayCleanupFailed) ||
+				s.obs.Status().State != obs.StateConnected {
+				return errors.Join(playbackErrors, err)
+			}
+			playbackErrors = errors.Join(playbackErrors, err)
+			s.quarantineLibraryAssetLocked(
+				music.Path,
+				fmt.Errorf("OBS rejected media playback: %w", err),
+			)
+			tentativePaths = append(tentativePaths, music.Path)
+			continue
+		}
+		succeeded = true
+		s.pendingLastMusicID = music.ID
+		return s.persistLastMusicLocked(ctx)
 	}
-	if err := s.playMusicAssetLocked(ctx, music); err != nil {
-		return err
-	}
-	if err := s.libDB.SetLastMusicID(ctx, music.ID); err != nil && force {
-		return err
-	}
-	return nil
+	return errors.Join(
+		playbackErrors,
+		publicError(fmt.Sprintf(
+			"在單次安全上限 %d 個候選內，沒有可啟動的音樂。",
+			attemptLimit,
+		)),
+	)
 }
 
 func (s *Service) replayActiveMusicLocked(ctx context.Context) error {
@@ -360,6 +1176,9 @@ func (s *Service) replayActiveMusicLocked(ctx context.Context) error {
 		if music, ok := s.findMusicByID(s.activeMusicID); ok && music.Path == s.activeMusicPath {
 			if err := s.playMusicAssetLocked(ctx, music); err != nil {
 				s.clearActiveMusicLocked()
+				if errors.Is(err, errUnhealthyLibraryAsset) {
+					return s.playNextMusicLocked(ctx, false)
+				}
 				return err
 			}
 			return nil
@@ -370,9 +1189,12 @@ func (s *Service) replayActiveMusicLocked(ctx context.Context) error {
 }
 
 func (s *Service) playMusicAssetLocked(ctx context.Context, music medialib.Music) error {
+	if err := s.ensurePlayableLibraryAssetLocked(ctx, medialib.KindMusic, music.Path); err != nil {
+		return err
+	}
 	looping := false
 	mute := false
-	if err := s.obs.PlaySourceFile(ctx, s.cfg.OBSMusicSourceName, music.Path, obs.PlaySourceOptions{
+	if err := s.playOBSFileLocked(ctx, s.cfg.OBSMusicSourceName, music.Path, obs.PlaySourceOptions{
 		Restart:         true,
 		Looping:         &looping,
 		Mute:            &mute,
@@ -386,10 +1208,18 @@ func (s *Service) playMusicAssetLocked(ctx context.Context, music medialib.Music
 	return nil
 }
 
-func (s *Service) loopForTimeLocked(ctx context.Context, t time.Time, force bool) (medialib.Loop, medialib.PeriodInfo, string, error) {
-	if len(s.librarySnapshot.Loops) == 0 && s.libraryScanErr == "" {
-		_ = s.scanLibraryLocked(ctx)
+func (s *Service) persistLastMusicLocked(ctx context.Context) error {
+	if s.pendingLastMusicID == "" {
+		return nil
 	}
+	if err := s.libDB.SetLastMusicID(ctx, s.pendingLastMusicID); err != nil {
+		return fmt.Errorf("persist last library music %s: %w", s.pendingLastMusicID, err)
+	}
+	s.pendingLastMusicID = ""
+	return nil
+}
+
+func (s *Service) loopForTimeLocked(ctx context.Context, t time.Time, force bool) (medialib.Loop, medialib.PeriodInfo, string, error) {
 	info := medialib.PeriodInfoAt(t)
 	date := periodPlanDate(t, info.Period)
 	overrideDate := overrideDateKey(t)
@@ -398,15 +1228,12 @@ func (s *Service) loopForTimeLocked(ctx context.Context, t time.Time, force bool
 		return medialib.Loop{}, info, "", err
 	}
 	expiredPreviousOverride := false
-	if info.Period == medialib.PeriodNight && t.Hour() < 6 && override.Theme == "" && override.DirectLoopID == "" {
+	if info.Period == medialib.PeriodNight && t.Hour() < 6 {
 		if previousOverride, err := s.libDB.Override(ctx, date); err != nil {
 			return medialib.Loop{}, info, "", err
 		} else if previousOverride.Theme != "" || previousOverride.DirectLoopID != "" {
 			expiredPreviousOverride = true
-			if err := s.libDB.ClearOverride(ctx, date); err != nil {
-				return medialib.Loop{}, info, "", err
-			}
-			if err := s.libDB.ClearPeriodPlan(ctx, date, info.Period); err != nil {
+			if err := s.libDB.ClearOverrideAndPeriodPlan(ctx, date, info.Period); err != nil {
 				return medialib.Loop{}, info, "", err
 			}
 		}
@@ -452,7 +1279,7 @@ func (s *Service) canReusePeriodPlan(period medialib.Period, overrideTheme strin
 	if overrideTheme == "" || overrideTheme == planTheme {
 		return true
 	}
-	for _, loop := range s.librarySnapshot.Loops {
+	for _, loop := range s.playableLibraryLocked().Loops {
 		if loop.Period == period && loop.Theme == overrideTheme {
 			return false
 		}
@@ -466,25 +1293,24 @@ func (s *Service) previewLoopLocked(ctx context.Context) (medialib.Loop, mediali
 }
 
 func (s *Service) chooseLoop(period medialib.Period, preferredTheme string) (medialib.Loop, string, error) {
+	playable := s.playableLibraryLocked()
 	if preferredTheme != "" {
-		if loop, err := s.librarySnapshot.ChooseLoop(period, preferredTheme, s.rng); err == nil {
+		if loop, err := playable.ChooseLoop(period, preferredTheme, s.rng); err == nil {
 			return loop, "", nil
 		}
 	}
-	theme, err := s.librarySnapshot.ChooseTheme(period, s.rng)
+	theme, err := playable.ChooseTheme(period, s.rng)
 	if err == nil {
-		loop, err := s.librarySnapshot.ChooseLoop(period, theme, s.rng)
+		loop, err := playable.ChooseLoop(period, theme, s.rng)
 		return loop, fallbackReason(preferredTheme, theme), err
 	}
-	if len(s.librarySnapshot.Loops) == 0 {
+	if len(playable.Loops) == 0 {
 		return medialib.Loop{}, "", publicError("媒體庫沒有可播放的 loop 影片。")
 	}
-	loops := make([]medialib.Loop, len(s.librarySnapshot.Loops))
-	copy(loops, s.librarySnapshot.Loops)
-	sort.Slice(loops, func(i, j int) bool {
-		return loops[i].RelPath < loops[j].RelPath
-	})
-	return loops[s.rng.Intn(len(loops))], "目前時段沒有素材，已退回任一可用 loop", nil
+	return medialib.Loop{}, "", publicError(fmt.Sprintf(
+		"媒體庫沒有可播放的%s時段 loop 影片；為避免播放錯誤時段，已停止切換。",
+		periodLabel(period),
+	))
 }
 
 func fallbackReason(preferredTheme string, actualTheme string) string {
@@ -496,7 +1322,7 @@ func fallbackReason(preferredTheme string, actualTheme string) string {
 
 func (s *Service) findLoopByID(id string) (medialib.Loop, bool) {
 	for _, loop := range s.librarySnapshot.Loops {
-		if loop.ID == id {
+		if loop.ID == id && s.libraryAssetQuarantineReasonLocked(loop.Path) == "" {
 			return loop, true
 		}
 	}
@@ -505,7 +1331,7 @@ func (s *Service) findLoopByID(id string) (medialib.Loop, bool) {
 
 func (s *Service) findMusicByID(id string) (medialib.Music, bool) {
 	for _, music := range s.librarySnapshot.Music {
-		if music.ID == id {
+		if music.ID == id && s.libraryAssetQuarantineReasonLocked(music.Path) == "" {
 			return music, true
 		}
 	}
@@ -551,7 +1377,17 @@ func (s *Service) ImportLibraryUpload(ctx context.Context, req UploadRequest) (s
 	}
 
 	if err := s.ScanLibrary(ctx); err != nil {
-		return fmt.Sprintf("已匯入素材：%s（掃描時發現問題：%v）", plan.label, err), nil
+		s.playbackMu.Lock()
+		scanWarning := s.libraryScanErr
+		s.playbackMu.Unlock()
+		if scanWarning == "" {
+			// A canceled or superseded scan may not have published a retained
+			// warning. Keep the successful import response useful without ever
+			// copying raw scanner, ffprobe, path, or operating-system details
+			// into the Telegram group.
+			scanWarning = s.publicScanDiagnostic(err)
+		}
+		return fmt.Sprintf("已匯入素材：%s（掃描提醒：%s）", plan.label, scanWarning), nil
 	}
 	return fmt.Sprintf("已匯入素材：%s", plan.label), nil
 }
@@ -682,7 +1518,14 @@ func (s *Service) storeOpenedLibraryUploadWithLimit(
 		if err != nil {
 			return err
 		}
-		return s.media.Validate(meta, s.cfg.MaxVideoSizeBytes, s.cfg.MaxVideoDurationSeconds)
+		switch kind {
+		case medialib.KindLoop:
+			return s.media.ValidateVideo(meta, s.cfg.MaxVideoSizeBytes, s.cfg.MaxVideoDurationSeconds)
+		case medialib.KindMusic:
+			return s.media.ValidateAudio(meta, s.cfg.MaxVideoSizeBytes, s.cfg.MaxVideoDurationSeconds)
+		default:
+			return fmt.Errorf("unsupported media library kind: %s", kind)
+		}
 	}
 	_, err := copyOpenedFileAtomic(
 		ctx,

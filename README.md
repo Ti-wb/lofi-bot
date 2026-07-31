@@ -5,7 +5,6 @@ Go backend for a 24h Lo-Fi Music channel workflow:
 - OBS plays time-of-day loop animations from a local media library.
 - Independent Lo-Fi tracks play through a separate OBS source.
 - Telegram group admins import media, switch the day theme, force a loop, skip playback, and preview the next period.
-- The legacy Telegram queue player remains available through `PLAYER_MODE=queue`.
 
 ## Requirements
 
@@ -31,7 +30,7 @@ brew install go ffmpeg
 6. Keep looping disabled in OBS; the app sets loop/music behavior through OBS WebSocket.
 7. Keep the backend running on the same host.
 
-The app mutes the loop source, plays music through the music source, and centers the loop source in the current Program scene without changing scale, bounds, or crop. The legacy queue source name is still configured by `OBS_MEDIA_SOURCE_NAME`.
+The app mutes and loops the animation source, plays music through the music source without source looping, and centers the loop source in the current Program scene without changing scale, bounds, or crop. The two configured source names must be different.
 
 ## Telegram Setup
 
@@ -98,11 +97,22 @@ After changing `.env`, restart the root `./run.sh up` process so both child serv
 
 Runtime entrypoints set `.env` to owner-only mode `0600` before reading it, and env migration creates its backup and replacement temp files private from their first write. The backend likewise creates or repairs `DATA_DIR` as owner-only mode `0700` before opening persistent state, and keeps the SQLite database plus its WAL/SHM sidecars at mode `0600` even when `DATABASE_PATH` points elsewhere.
 
-Before deploying a new build, back up the production `.env`. You can run `./run.sh migrate-env` to apply the stack helper's lightweight `.env` repair without starting the Go app. It copies the original to `.env.backup.<unix_timestamp>`, updates older schema markers, and appends missing fields needed by the Local Bot API helper. If appended Local Bot API Server defaults are not correct for production, edit `.env` before starting the stack.
+Before deploying a new build, back up the production `.env`. You can run `./run.sh migrate-env` to apply the stack helper's lightweight `.env` repair without starting the Go app. It copies the original to `.env.backup.<unix_timestamp>`, updates older schema markers, removes queue-only fields, and appends missing fields needed by the Local Bot API helper. If appended Local Bot API Server defaults are not correct for production, edit `.env` before starting the stack.
 
-Numeric config values must be valid integers; malformed values fail startup instead of silently falling back to defaults. `OBS_PORT` must be `1..65535`; `MAX_VIDEO_SIZE_MB` and `MAX_QUEUE_LENGTH` must be positive; `MAX_VIDEO_DURATION_SECONDS`, `MIN_FREE_DISK_MB`, and `RETENTION_MAX_FILES` may be `0` to disable that limit where supported; and `RETENTION_DAYS` must be `0..106751`. `MIN_FREE_DISK_MB` defaults to `512`; uploads require a positive declared size and enough configured cache/destination headroom before Local Bot API `getFile`, followed by authoritative checks against the actual local file. Setting it to `0` disables only the additional reserve—the actual-size filesystem admission and `MAX_VIDEO_SIZE_MB` limit remain enforced. `RETENTION_DELETE_LOCAL_FILES` defaults to `false`, so retention removes old SQLite rows without deleting Telegram Local Bot API media files unless you explicitly opt in.
+Numeric config values must be valid integers; malformed values fail startup instead of silently falling back to defaults. `OBS_PORT` must be `1..65535`, `MAX_VIDEO_SIZE_MB` must be positive, and `MAX_VIDEO_DURATION_SECONDS` plus `MIN_FREE_DISK_MB` may be `0` to disable that limit where supported. `MIN_FREE_DISK_MB` defaults to `512`; uploads require a positive declared size and enough configured cache/destination headroom before Local Bot API `getFile`, followed by authoritative checks against the actual local file. Setting it to `0` disables only the additional reserve—the actual-size filesystem admission and `MAX_VIDEO_SIZE_MB` limit remain enforced.
 
-Persistent media state also has fixed, non-configurable ceilings: 10,000 entries in each loop/music directory and 10,000 total rows in the `videos` table. Uploads that would exceed either ceiling are rejected before Local Bot API `getFile` and rechecked at the authoritative write boundary; the app never auto-deletes library assets or Telegram-owned cache files to make room.
+Each loop/music directory has a fixed, non-configurable ceiling of 10,000 top-level entries. Uploads that would exceed the destination ceiling are rejected before Local Bot API `getFile` and rechecked at the authoritative write boundary; the app never auto-deletes library assets or Telegram-owned cache files to make room.
+
+Version 7 is library-only and gives fresh configurations the neutral
+`DATA_DIR/state.db` default. Upgrades from schema v6 or older preserve an
+explicit `DATABASE_PATH`; when an older config omitted that value, migration
+materializes its historical `DATA_DIR/queue.db` path before advancing the
+schema so existing state is never stranded. The loader temporarily accepts a
+deprecated `PLAYER_MODE=library` value so an unmigrated deployment can fail
+safely into the migration path; `./run.sh migrate-env` removes it together
+with all other queue-only keys. `PLAYER_MODE=queue` fails closed before any
+migration write with upgrade instructions, so the app never silently turns an
+old queue deployment into live library playback.
 
 The stack helpers run this migration before validating Local Bot API Server fields, so `./run.sh up`, `./run.sh doctor`, and `./run.sh env` can handle older `.env` files that are missing supported schema defaults. The Go app itself only reads config at startup; it does not rewrite `.env`.
 
@@ -127,7 +137,7 @@ Common runtime commands:
 ./run.sh health          # check local Telegram Bot API /getMe, not app or OBS readiness
 ./run.sh doctor          # check config, tools, data dir, and common ports
 ./run.sh env             # print sanitized runtime config
-./run.sh migrate-env     # back up .env and append missing schema defaults
+./run.sh migrate-env     # back up .env, remove queue-only keys, add required defaults
 ./run.sh logout-public   # manually log out from public Telegram Bot API
 ```
 
@@ -135,24 +145,29 @@ Common runtime commands:
 
 - Telegram group admins can manage library playback automatically; no separate admin ID list is required.
 - The bot registers Telegram command menus and adds inline buttons to common responses.
-- `/library` shows available loop/music assets by period and theme.
+- `/library [page]` shows available loop/music assets by period and theme.
 - `/now` shows the current period, loop, theme, and music.
 - `/preview` shows the next period's planned loop under the current algorithm.
-- `/theme <theme|random>` sets or clears today's theme override.
+- `/theme <theme|random>` sets or clears today's theme override. A theme must
+  fit both the 240-rune and 240-byte UTF-8 bounds and may not contain `_`, `/`,
+  or `\`.
 - `/select <asset_id|clear>` forces or clears today's direct loop override.
 - `/skip loop` redraws the current period loop.
 - `/skip music` skips to another music track.
 - `/scan` rescans the media library.
-- `/status` shows OBS, library, override, disk, and error state.
+- `/status` shows OBS, playable/rejected assets, overrides, last errors, and
+  separate loop/music/Telegram-cache disk readings.
 
 ## Notes
 
 - The MVP avoids transcoding to keep CPU use low on the MacBook.
 - Imported library media is copied into `LOOP_MEDIA_DIR` or `MUSIC_MEDIA_DIR`.
-- Library imports are validated in a dedicated staging directory on the destination filesystem before atomic publication; startup and periodic maintenance remove interrupted staging files older than six hours in bounded batches.
+- Library imports are validated in a dedicated staging directory on the destination filesystem before no-overwrite atomic publication; startup and periodic maintenance remove interrupted staging files older than six hours in bounded batches.
+- Every scan applies the same stream/duration/size validation to files added
+  directly by an operator. Invalid or OBS-failed assets are excluded and
+  surfaced through `/status`; a changed file is eligible for validation again.
 - When `MAX_VIDEO_DURATION_SECONDS` is enabled, a missing or invalid `ffprobe` duration rejects the video instead of treating it as zero.
 - SQLite state is stored under `DATA_DIR` so today's overrides and period picks survive restarts.
-- `PLAYER_MODE=queue` enables the legacy queue player; `FALLBACK_MODE=random_played` only applies there.
 - `OBS_PASSWORD` can be left empty when OBS WebSocket authentication is disabled.
 - `TELEGRAM_API_BASE_URL` must point at the Local Bot API Server, for example `http://127.0.0.1:8081`.
 

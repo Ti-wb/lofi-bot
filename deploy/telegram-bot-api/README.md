@@ -81,7 +81,7 @@ telegram-bot-api \
 
 `BOT_API_DIR` is the absolute path resolved from `TELEGRAM_BOT_API_DIR`; relative values are resolved from the repository root.
 
-Keep `TELEGRAM_BOT_API_DIR` stable across restarts. Changing or deleting it can invalidate file paths that were already returned by `getFile` and stored in the queue.
+Keep `TELEGRAM_BOT_API_DIR` stable and writable across restarts. Upload handlers securely open files returned by Local Bot API from this directory, validate them, and copy accepted assets into the production loop/music library. Production playback never depends on the Telegram cache copy after publication.
 
 Keep `TELEGRAM_BOT_API_HOST=127.0.0.1` unless you have a specific local network reason to expose the server. The server accepts HTTP; do not expose it directly to the public internet.
 

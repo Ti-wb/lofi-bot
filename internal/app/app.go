@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -15,11 +16,11 @@ import (
 	"time"
 
 	"github.com/tiwb/tg-obs-bot/internal/config"
+	"github.com/tiwb/tg-obs-bot/internal/journalstore"
 	medialib "github.com/tiwb/tg-obs-bot/internal/library"
 	"github.com/tiwb/tg-obs-bot/internal/liveness"
 	"github.com/tiwb/tg-obs-bot/internal/media"
 	"github.com/tiwb/tg-obs-bot/internal/obs"
-	"github.com/tiwb/tg-obs-bot/internal/queue"
 	retryloop "github.com/tiwb/tg-obs-bot/internal/retry"
 	"github.com/tiwb/tg-obs-bot/internal/secret"
 	"github.com/tiwb/tg-obs-bot/internal/singleton"
@@ -27,50 +28,55 @@ import (
 )
 
 type Service struct {
-	cfg          config.Config
-	logger       *slog.Logger
-	instanceLock *singleton.Lock
-	store        *queue.Store
-	libDB        *medialib.StateStore
-	media        *media.Manager
-	obs          obsController
-	bot          telegramMessenger
-	now          func() time.Time
-	rng          *rand.Rand
-	removeFile   func(string) error
-	diskUsage    func(string) (media.DiskUsage, error)
+	cfg           config.Config
+	logger        *slog.Logger
+	instanceLock  *singleton.Lock
+	journalStore  telegramJournalPruner
+	libDB         *medialib.StateStore
+	media         *media.Manager
+	obs           obsController
+	bot           telegramMessenger
+	now           func() time.Time
+	mediaClockNow func() time.Time
+	rng           *rand.Rand
+	diskUsage     func(string) (media.DiskUsage, error)
 
-	mu                    sync.Mutex
-	playbackMu            sync.Mutex
-	storageMu             sync.Mutex
-	lastErr               string
-	playback              playbackKind
-	randomFallbackID      int64
-	randomFallbackPath    string
-	randomFallbackNotice  bool
-	librarySnapshot       medialib.Library
-	libraryScanErr        string
-	activeLoopID          string
-	activeLoopPath        string
-	activeLoopTheme       string
-	activeLoopPeriod      medialib.Period
-	activeLoopEndsAt      time.Time
-	activeMusicID         string
-	activeMusicPath       string
-	mediaProgressByInput  map[string]mediaProgress
-	obsRecoveryInProgress atomic.Bool
-	shutdown              []func() error
-	workerStopGrace       time.Duration
-	maintenanceInterval   time.Duration
-	maintenanceFn         func(context.Context) maintenanceCycleResult
-	retryRandom           func() uint64
-	retrySleep            func(context.Context, time.Duration) error
-	retryNow              func() time.Time
-	playbackNotices       [playbackNoticeKinds]playbackNotice
-	libraryScanLogMu      sync.Mutex
-	libraryScanLog        *eventErrorSampler
-	livenessRegistry      *liveness.Registry
-	livenessReporter      requiredLivenessReporter
+	mu                       sync.Mutex
+	playbackMu               sync.Mutex
+	storageMu                sync.Mutex
+	lastErr                  string
+	librarySnapshot          medialib.Library
+	libraryScanErr           string
+	libraryRejectedCount     int
+	librarySnapshotPublished bool
+	libraryScanGeneration    atomic.Uint64
+	libraryScanGateOnce      sync.Once
+	libraryScanGate          chan struct{}
+	libraryValidationCache   map[string]libraryValidationEntry
+	libraryQuarantine        map[string]libraryQuarantineEntry
+	activeLoopID             string
+	activeLoopPath           string
+	activeLoopTheme          string
+	activeLoopPeriod         medialib.Period
+	activeLoopEndsAt         time.Time
+	activeMusicID            string
+	activeMusicPath          string
+	pendingLastMusicID       string
+	mediaProgressByInput     map[string]mediaProgress
+	obsRecoveryInProgress    atomic.Bool
+	obsPlaybackTimeout       time.Duration
+	obsCleanupTimeout        time.Duration
+	shutdown                 []func() error
+	workerStopGrace          time.Duration
+	maintenanceInterval      time.Duration
+	maintenanceFn            func(context.Context) maintenanceCycleResult
+	retryRandom              func() uint64
+	retrySleep               func(context.Context, time.Duration) error
+	retryNow                 func() time.Time
+	libraryScanLogMu         sync.Mutex
+	libraryScanLog           *eventErrorSampler
+	livenessRegistry         *liveness.Registry
+	livenessReporter         requiredLivenessReporter
 }
 
 type obsController interface {
@@ -80,41 +86,37 @@ type obsController interface {
 	Probe(context.Context) error
 	GetMediaInputStatus(context.Context, string) (obs.MediaInputStatus, error)
 	GetInputSettings(context.Context, string) (obs.InputSettings, error)
-	PlayFile(context.Context, string) error
 	PlaySourceFile(context.Context, string, string, obs.PlaySourceOptions) error
-	StopCurrent(context.Context) error
 	StopSource(context.Context, string) error
 	Status() obs.Status
 }
 
 type telegramMessenger interface {
 	Run(context.Context) error
-	SendMessage(context.Context, int64, string) error
 }
 
-type playbackKind string
+type telegramJournalPruner interface {
+	PruneTelegramUpdateJournal(context.Context) (done int64, dead int64, err error)
+}
 
 const (
-	playbackIdle   playbackKind = "idle"
-	playbackNormal playbackKind = "normal_queue"
-	playbackRandom playbackKind = "random_played"
-	playbackFile   playbackKind = "fallback_file"
-
-	playbackWatchdogInterval  = 30 * time.Second
-	playbackWatchdogGrace     = 60 * time.Second
-	obsEndedEventSettleGrace  = 2 * time.Second
-	staleDownloadingAge       = 6 * time.Hour
-	obsConnectAttemptTimeout  = 15 * time.Second
-	obsPlaybackCleanupTimeout = 5 * time.Second
-	uploadProbeTimeout        = 2 * time.Minute
-	uploadFailureTimeout      = 5 * time.Second
-	retentionBatchSize        = 256
-	mediaProgressGrace        = 2 * time.Minute
-	mediaProgressHardGrace    = 2 * mediaProgressGrace
-	mediaCursorEpsilonMillis  = 1.0
-	defaultWorkerStopGrace    = telegram.RecommendedParentDrainGrace
-	defaultMaintenancePeriod  = 10 * time.Minute
-	maintenanceDeferredMax    = time.Minute
+	obsEndedEventSettleGrace           = 2 * time.Second
+	obsConnectAttemptTimeout           = 15 * time.Second
+	defaultOBSPlaybackOperationTimeout = 40 * time.Second
+	defaultOBSFailClosedBudgetTimeout  = 8 * time.Second
+	defaultOBSFailClosedActionTimeout  = 3 * time.Second
+	maxLibraryPlaybackCandidates       = 8
+	uploadProbeTimeout                 = 2 * time.Minute
+	mediaProgressGrace                 = 2 * time.Minute
+	mediaProgressHardGrace             = 2 * mediaProgressGrace
+	mediaCursorEpsilonMillis           = 1.0
+	mediaCursorConfirmationMin         = 100 * time.Millisecond
+	mediaCursorConfirmationMax         = 750 * time.Millisecond
+	mediaCursorFallbackGap             = 251 * time.Millisecond
+	defaultWorkerStopGrace             = telegram.RecommendedParentDrainGrace
+	defaultMaintenancePeriod           = 10 * time.Minute
+	maintenanceDeferredMax             = time.Minute
+	libraryStatePruneBatchSize         = 256
 )
 
 var (
@@ -122,6 +124,7 @@ var (
 	ErrRequiredInfrastructureStopped = errors.New("required service infrastructure stopped unexpectedly")
 	ErrWorkerShutdownStuck           = errors.New("service workers did not stop after cancellation")
 	ErrInfrastructureShutdownStuck   = errors.New("service infrastructure did not stop after cancellation")
+	errOBSPlayCleanupFailed          = errors.New("failed to fail-close a possibly modified OBS source")
 )
 
 type requiredLivenessReporter interface {
@@ -157,6 +160,7 @@ type mediaProgress struct {
 	State                    obs.MediaState
 	CursorMillis             float64
 	HasCursor                bool
+	ObservedAt               time.Time
 	GenerationStartedAt      time.Time
 	LastProgressAt           time.Time
 	LastDefinitiveProgressAt time.Time
@@ -175,16 +179,8 @@ type mediaInspection struct {
 }
 
 type UploadRequest struct {
-	LocalPath        string
-	TelegramFileID   string
-	TelegramUniqueID string
-	SubmitterID      int64
-	SubmitterName    string
-	ChatID           int64
-	MessageID        int
-	FileName         string
-	MimeType         string
-	SizeBytes        int64
+	LocalPath string
+	FileName  string
 }
 
 type publicError string
@@ -214,11 +210,16 @@ func New(cfg config.Config, logger *slog.Logger, options ...Option) (*Service, e
 		}
 	}
 
-	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
-		return nil, fmt.Errorf("create data directory: %w", err)
-	}
-	if err := os.Chmod(cfg.DataDir, 0o700); err != nil {
-		return nil, fmt.Errorf("secure data directory: %w", err)
+	// DataDir is a configuration default, not an independent runtime path.
+	// Preserve the private default database directory without making deployments
+	// with an explicit database path depend on an otherwise-unused base.
+	if pathUsesBase(cfg.DatabasePath, cfg.DataDir) {
+		if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+			return nil, fmt.Errorf("create data directory: %w", err)
+		}
+		if err := os.Chmod(cfg.DataDir, 0o700); err != nil {
+			return nil, fmt.Errorf("secure data directory: %w", err)
+		}
 	}
 
 	registry := liveness.NewRegistry(liveness.Options{})
@@ -251,42 +252,32 @@ func New(cfg config.Config, logger *slog.Logger, options ...Option) (*Service, e
 	// runtime lock from the database it protects.
 	cfg.DatabasePath = instanceLock.DatabasePath()
 
-	store, err := queue.Open(context.Background(), cfg.DatabasePath)
+	store, err := journalstore.Open(context.Background(), cfg.DatabasePath)
 	if err != nil {
 		return nil, err
 	}
-	manager, err := media.NewManager(cfg.MediaDir, cfg.FFProbePath)
+	manager := media.NewManager(cfg.FFProbePath)
+	if err := os.MkdirAll(cfg.LoopMediaDir, 0o755); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	if err := os.MkdirAll(cfg.MusicMediaDir, 0o755); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	libDB, err := medialib.OpenState(context.Background(), cfg.DatabasePath)
 	if err != nil {
 		_ = store.Close()
 		return nil, err
 	}
-	var libDB *medialib.StateStore
-	if cfg.PlayerMode == "library" {
-		if err := os.MkdirAll(cfg.LoopMediaDir, 0o755); err != nil {
-			_ = store.Close()
-			return nil, err
-		}
-		if err := os.MkdirAll(cfg.MusicMediaDir, 0o755); err != nil {
-			_ = store.Close()
-			return nil, err
-		}
-		libDB, err = medialib.OpenState(context.Background(), cfg.DatabasePath)
-		if err != nil {
-			_ = store.Close()
-			return nil, err
-		}
-	}
 	obsClient, err := obs.NewClient(obs.Options{
-		URL:             cfg.OBSURL(),
-		Password:        cfg.OBSPassword,
-		MediaSourceName: cfg.OBSMediaSourceName,
-		EventBuffer:     16,
-		Logger:          logger.With("component", "obs"),
+		URL:         cfg.OBSURL(),
+		Password:    cfg.OBSPassword,
+		EventBuffer: 16,
+		Logger:      logger.With("component", "obs"),
 	})
 	if err != nil {
-		if libDB != nil {
-			_ = libDB.Close()
-		}
+		_ = libDB.Close()
 		_ = store.Close()
 		return nil, err
 	}
@@ -295,15 +286,14 @@ func New(cfg config.Config, logger *slog.Logger, options ...Option) (*Service, e
 		cfg:                 cfg,
 		logger:              logger,
 		instanceLock:        instanceLock,
-		store:               store,
+		journalStore:        store,
 		libDB:               libDB,
 		media:               manager,
 		obs:                 obsClient,
 		now:                 time.Now,
+		mediaClockNow:       time.Now,
 		rng:                 rand.New(rand.NewSource(time.Now().UnixNano())),
-		removeFile:          media.RemoveFile,
 		diskUsage:           media.DiskUsageForPath,
-		playback:            playbackIdle,
 		workerStopGrace:     defaultWorkerStopGrace,
 		maintenanceInterval: defaultMaintenancePeriod,
 		livenessRegistry:    registry,
@@ -315,16 +305,13 @@ func New(cfg config.Config, logger *slog.Logger, options ...Option) (*Service, e
 	if reporter != nil {
 		service.shutdown = append(service.shutdown, reporter.Close)
 	}
-	if libDB != nil {
-		service.shutdown = append(service.shutdown, libDB.Close)
-	}
+	service.shutdown = append(service.shutdown, libDB.Close)
 
 	bot, err := telegram.New(telegram.Config{
 		Token:              cfg.TelegramBotToken,
 		APIBaseURL:         cfg.TelegramAPIBaseURL,
 		AllowedChatID:      cfg.AllowedChatID,
 		MaxUploadSizeBytes: cfg.MaxVideoSizeBytes,
-		PlayerMode:         cfg.PlayerMode,
 	}, service.telegramHooks(), logger.With("component", "telegram"), telegram.WithUpdateJournal(store))
 	if err != nil {
 		service.Close()
@@ -332,6 +319,27 @@ func New(cfg config.Config, logger *slog.Logger, options ...Option) (*Service, e
 	}
 	service.bot = bot
 	return service, nil
+}
+
+func pathUsesBase(path, base string) bool {
+	path = strings.TrimSpace(path)
+	base = strings.TrimSpace(base)
+	if path == "" || base == "" {
+		return false
+	}
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	absoluteBase, err := filepath.Abs(base)
+	if err != nil {
+		return false
+	}
+	relative, err := filepath.Rel(absoluteBase, absolutePath)
+	if err != nil {
+		return false
+	}
+	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func (s *Service) Close() {
@@ -343,7 +351,7 @@ func (s *Service) Close() {
 }
 
 func (s *Service) Run(parentCtx context.Context) error {
-	s.logger.Info("tg-obs-bot starting", "database", s.redactString(s.cfg.DatabasePath), "media_dir", s.redactString(s.cfg.MediaDir), "player_mode", s.cfg.PlayerMode)
+	s.logger.Info("tg-obs-bot starting", "database", s.redactString(s.cfg.DatabasePath), "media_dir", s.redactString(s.cfg.MediaDir))
 	runCtx, cancel := context.WithCancel(parentCtx)
 
 	workers, err := s.prepareRequiredWorkers()
@@ -355,12 +363,6 @@ func (s *Service) Run(parentCtx context.Context) error {
 	if err := s.recoverStartupState(runCtx); err != nil {
 		cancel()
 		return err
-	}
-
-	if s.libraryMode() {
-		if err := s.ScanLibrary(runCtx); err != nil {
-			s.logger.Warn("initial media library scan found issues", "error", s.redactError(err))
-		}
 	}
 
 	workerResults := make(chan serviceWorkerResult, len(workers))
@@ -487,21 +489,11 @@ func (s *Service) prepareRequiredWorkers() ([]serviceWorker, error) {
 			run:   s.maintenanceLoop,
 		},
 	}
-	playbackOwner := liveness.OwnerPlaybackWatchdog
 	playbackWorker := serviceWorker{
-		name:  "playback-watchdog",
+		name:  "library-scheduler",
 		id:    liveness.WorkerPlayback,
-		owner: playbackOwner,
-		run:   s.playbackWatchdogLoop,
-	}
-	if s.libraryMode() {
-		playbackOwner = liveness.OwnerLibraryScheduler
-		playbackWorker = serviceWorker{
-			name:  "library-scheduler",
-			id:    liveness.WorkerPlayback,
-			owner: playbackOwner,
-			run:   s.librarySchedulerLoop,
-		}
+		owner: liveness.OwnerLibraryScheduler,
+		run:   s.librarySchedulerLoop,
 	}
 	workers = append(workers, playbackWorker)
 
@@ -512,7 +504,7 @@ func (s *Service) prepareRequiredWorkers() ([]serviceWorker, error) {
 		}
 		workers[index].tracker = tracker
 	}
-	if err := registry.Seal(playbackOwner); err != nil {
+	if err := registry.Seal(); err != nil {
 		return nil, err
 	}
 	return workers, nil
@@ -679,466 +671,8 @@ func (s *Service) maintenanceLoop(ctx context.Context) error {
 	}
 }
 
-func (s *Service) EnqueueUpload(ctx context.Context, req UploadRequest) (queue.Video, error) {
-	if strings.TrimSpace(req.LocalPath) == "" {
-		err := errors.New("local video path is required")
-		s.setLastErr(err)
-		return queue.Video{}, err
-	}
-	if !filepath.IsAbs(req.LocalPath) {
-		err := fmt.Errorf("local video path must be absolute: %s", req.LocalPath)
-		s.setLastErr(err)
-		return queue.Video{}, err
-	}
-	s.storageMu.Lock()
-	video, err := s.addDownloadingUpload(ctx, req)
-	s.storageMu.Unlock()
-	if err != nil {
-		s.setLastErr(err)
-		return queue.Video{}, err
-	}
-
-	probeCtx, cancelProbe := context.WithTimeout(ctx, uploadProbeTimeout)
-	meta, err := s.media.Probe(probeCtx, req.LocalPath)
-	cancelProbe()
-	if err != nil {
-		s.markUploadFailed(ctx, video.ID, err)
-		s.setLastErr(err)
-		return queue.Video{}, err
-	}
-	if err := s.media.Validate(meta, s.cfg.MaxVideoSizeBytes, s.cfg.MaxVideoDurationSeconds); err != nil {
-		s.markUploadFailed(ctx, video.ID, err)
-		s.setLastErr(err)
-		return queue.Video{}, err
-	}
-
-	ready, err := s.store.MarkReady(ctx, video.ID, req.LocalPath, meta.SizeBytes, meta.DurationSeconds)
-	if err != nil {
-		s.markUploadFailed(ctx, video.ID, err)
-		s.setLastErr(err)
-		return queue.Video{}, err
-	}
-	if err := s.playIfIdle(ctx); err != nil {
-		s.logger.Warn("play after enqueue failed", "error", s.redactError(err))
-	}
-	return ready, nil
-}
-
-func (s *Service) addDownloadingUpload(ctx context.Context, req UploadRequest) (queue.Video, error) {
-	if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, req.LocalPath); err != nil {
-		return queue.Video{}, err
-	}
-	info, err := os.Stat(req.LocalPath)
-	if err != nil {
-		return queue.Video{}, fmt.Errorf("stat local video path: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return queue.Video{}, fmt.Errorf("local video path is not a regular file: %s", req.LocalPath)
-	}
-	actualSize := info.Size()
-	if actualSize <= 0 {
-		return queue.Video{}, publicError("影片檔案不可為空。")
-	}
-	if actualSize > s.cfg.MaxVideoSizeBytes {
-		return queue.Video{}, publicError(fmt.Sprintf("檔案太大，上限是 %s", formatBytes(s.cfg.MaxVideoSizeBytes)))
-	}
-	if err := s.ensureStorageHeadroom(req.LocalPath, actualSize); err != nil {
-		return queue.Video{}, err
-	}
-	length, err := s.store.QueueLength(ctx)
-	if err != nil {
-		return queue.Video{}, err
-	}
-	if length >= s.cfg.MaxQueueLength {
-		return queue.Video{}, publicError(fmt.Sprintf("佇列已滿，目前上限是 %d 支", s.cfg.MaxQueueLength))
-	}
-	video, err := s.store.AddDownloading(ctx, queue.Video{
-		TelegramFileID:   req.TelegramFileID,
-		TelegramUniqueID: req.TelegramUniqueID,
-		SubmitterID:      req.SubmitterID,
-		SubmitterName:    req.SubmitterName,
-		ChatID:           req.ChatID,
-		MessageID:        req.MessageID,
-		FileName:         CleanFileName(req.FileName),
-		LocalPath:        req.LocalPath,
-		MimeType:         req.MimeType,
-		SizeBytes:        actualSize,
-	})
-	if errors.Is(err, queue.ErrVideoCapacity) {
-		return queue.Video{}, videoCapacityPublicError()
-	}
-	return video, err
-}
-
-func (s *Service) advancePlayback(ctx context.Context) (*queue.Video, error) {
-	var video *queue.Video
-	var err error
-	func() {
-		s.playbackMu.Lock()
-		defer s.playbackMu.Unlock()
-		video, err = s.advancePlaybackLocked(ctx)
-	}()
-	s.flushPlaybackNotices()
-	return video, err
-}
-
-func (s *Service) advancePlaybackLocked(ctx context.Context) (*queue.Video, error) {
-	return s.advancePlaybackLockedAfter(ctx, 0, "")
-}
-
-func (s *Service) advancePlaybackLockedAfter(ctx context.Context, expectedCurrentID int64, expectedCurrentPath string) (*queue.Video, error) {
-	if expectedCurrentID > 0 {
-		current, err := s.store.Current(ctx)
-		if err != nil {
-			s.setLastErr(err)
-			return nil, err
-		}
-		if current == nil || current.ID != expectedCurrentID {
-			return nil, nil
-		}
-	}
-	if expectedCurrentPath != "" {
-		current, err := s.store.Current(ctx)
-		if err != nil {
-			s.setLastErr(err)
-			return nil, err
-		}
-		if current != nil && current.LocalPath != expectedCurrentPath {
-			return nil, nil
-		}
-		if current == nil && s.currentPlaybackPath() != expectedCurrentPath {
-			return nil, nil
-		}
-	}
-	if err := s.store.FinishCurrent(ctx); err != nil {
-		s.setLastErr(err)
-		return nil, err
-	}
-
-	// playbackMu is held across the durable transition and every following
-	// side effect. Once SQLite has no current row, memory must stop describing
-	// the previous generation before any later query or OBS operation can fail.
-	s.transitionQueuePlaybackToIdleLocked()
-	return s.startNextQueuePlaybackLocked(ctx)
-}
-
-// startNextQueuePlaybackLocked requires playbackMu and a durable queue state
-// with no playing row. It publishes a normal/fallback in-memory generation
-// only after the corresponding durable/OBS start operation succeeds.
-func (s *Service) startNextQueuePlaybackLocked(ctx context.Context) (*queue.Video, error) {
-	for {
-		video, err := s.store.NextReady(ctx)
-		if err != nil {
-			s.setLastErr(err)
-			return nil, err
-		}
-		if video == nil {
-			return nil, s.advanceFallbackLocked(ctx)
-		}
-		if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, video.LocalPath); err != nil {
-			if _, markErr := s.store.FailReady(ctx, video.ID, err.Error()); markErr != nil {
-				s.setLastErr(markErr)
-				return nil, markErr
-			}
-			s.setLastErr(err)
-			s.recordPlaybackNotice(playbackNoticeInvalidReady, video.ID, video.LocalPath, err)
-			continue
-		}
-		if err := s.obs.PlayFile(ctx, video.LocalPath); err != nil {
-			s.setLastErr(err)
-			return nil, err
-		}
-		playing, err := s.store.MarkPlaying(ctx, video.ID)
-		if err != nil {
-			transitionErr := s.stopUncommittedQueuePlaybackLocked(err)
-			s.setLastErr(transitionErr)
-			return nil, transitionErr
-		}
-		s.resetMediaProgressLocked(s.cfg.OBSMediaSourceName, video.LocalPath)
-		s.setPlaybackState(playbackNormal, 0, "")
-		return &playing, nil
-	}
-}
-
-// transitionQueuePlaybackToIdleLocked requires playbackMu. It clears every
-// in-memory claim about the queue media generation after SQLite no longer has
-// a matching playing row.
-func (s *Service) transitionQueuePlaybackToIdleLocked() {
-	s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.playback = playbackIdle
-	s.randomFallbackID = 0
-	s.randomFallbackPath = ""
-	// Keep the episode-level notice bit across an internal fallback rotation.
-	// A durable normal start or a true idle/off result resets it through
-	// setPlaybackState.
-}
-
-// stopUncommittedQueuePlaybackLocked requires playbackMu. PlayFile succeeded
-// but MarkPlaying did not, so OBS cleanup must not inherit an already-canceled
-// request context or leave memory claiming that the ready row is current.
-func (s *Service) stopUncommittedQueuePlaybackLocked(primaryErr error) error {
-	s.transitionQueuePlaybackToIdleLocked()
-	stopCtx, cancel := context.WithTimeout(context.Background(), obsPlaybackCleanupTimeout)
-	stopErr := s.obs.StopCurrent(stopCtx)
-	cancel()
-	if stopErr == nil {
-		return primaryErr
-	}
-	return errors.Join(
-		primaryErr,
-		fmt.Errorf("stop OBS after queue playback persistence failure: %w", stopErr),
-	)
-}
-
-func (s *Service) playIfIdle(ctx context.Context) error {
-	var err error
-	func() {
-		s.playbackMu.Lock()
-		defer s.playbackMu.Unlock()
-		err = s.playIfIdleLocked(ctx)
-	}()
-	s.flushPlaybackNotices()
-	return err
-}
-
-func (s *Service) playIfIdleLocked(ctx context.Context) error {
-	current, err := s.store.Current(ctx)
-	if err != nil {
-		return err
-	}
-	if current != nil {
-		return nil
-	}
-	kind := s.playbackState()
-	if kind == playbackNormal {
-		// Self-heal an interrupted queue transition. A normal generation without
-		// a durable current row is impossible and must not suppress retries.
-		s.transitionQueuePlaybackToIdleLocked()
-		kind = playbackIdle
-	}
-	if s.obs.Status().State != obs.StateConnected {
-		return nil
-	}
-	switch kind {
-	case playbackRandom, playbackFile:
-		return nil
-	case playbackIdle:
-	default:
-		s.transitionQueuePlaybackToIdleLocked()
-	}
-	_, err = s.startNextQueuePlaybackLocked(ctx)
-	return err
-}
-
 func (s *Service) recoverPlaybackAfterOBSConnect(ctx context.Context) error {
-	if s.libraryMode() {
-		return s.recoverLibraryPlaybackAfterOBSConnect(ctx)
-	}
-
-	s.playbackMu.Lock()
-	err := func() error {
-		defer s.playbackMu.Unlock()
-
-		current, err := s.store.Current(ctx)
-		if err != nil {
-			return err
-		}
-		if current == nil {
-			switch s.playbackState() {
-			case playbackRandom, playbackFile:
-				err := s.recoverFallbackPlaybackLocked(ctx)
-				if err != nil {
-					s.setPlaybackState(playbackIdle, 0, "")
-					return err
-				}
-				return nil
-			}
-			s.setPlaybackState(playbackIdle, 0, "")
-			return s.playIfIdleLocked(ctx)
-		}
-		if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, current.LocalPath); err != nil {
-			recoveryErr := fmt.Errorf("current video #%d media path is invalid: %w", current.ID, err)
-			if _, markErr := s.store.FailPlaying(ctx, current.ID, recoveryErr.Error()); markErr != nil {
-				return markErr
-			}
-			s.setLastErr(recoveryErr)
-			s.recordPlaybackNotice(playbackNoticeInvalidCurrent, current.ID, current.LocalPath, err)
-			s.setPlaybackState(playbackIdle, 0, "")
-			return s.playIfIdleLocked(ctx)
-		}
-		if s.playbackState() == playbackNormal {
-			err := s.recoverCurrentQueuePlaybackLocked(ctx, *current)
-			if err != nil {
-				s.setPlaybackState(playbackIdle, 0, "")
-				return err
-			}
-			return nil
-		}
-		return s.restartCurrentQueuePlaybackLocked(ctx, *current)
-	}()
-	s.flushPlaybackNotices()
-	return err
-}
-
-// Reconnect recovery must not consume the queue. A terminal OBS state can
-// belong to the connection that just failed, so replay the persisted current
-// item unless the matching source is observably healthy and progressing.
-func (s *Service) recoverCurrentQueuePlaybackLocked(ctx context.Context, current queue.Video) error {
-	inspection, err := s.inspectMediaInputLocked(ctx, s.cfg.OBSMediaSourceName, current.LocalPath)
-	if err != nil {
-		return err
-	}
-	if !inspection.PathMismatch {
-		switch inspection.Status.State {
-		case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering:
-			if !inspection.Stalled {
-				return nil
-			}
-		case obs.MediaStateNone, obs.MediaStatePaused, obs.MediaStateStopped, obs.MediaStateEnded, obs.MediaStateError:
-		default:
-			return fmt.Errorf("OBS media source %s returned unknown state %q", s.cfg.OBSMediaSourceName, inspection.Status.State)
-		}
-	}
-	return s.restartCurrentQueuePlaybackLocked(ctx, current)
-}
-
-func (s *Service) recoverFallbackPlaybackLocked(ctx context.Context) error {
-	kind := s.playbackState()
-	if kind != playbackRandom && kind != playbackFile {
-		return nil
-	}
-	expectedPath := s.currentPlaybackPath()
-	if expectedPath == "" {
-		return nil
-	}
-	inspection, err := s.inspectMediaInputLocked(ctx, s.cfg.OBSMediaSourceName, expectedPath)
-	if err != nil {
-		return err
-	}
-	if !inspection.PathMismatch {
-		switch inspection.Status.State {
-		case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering:
-			if !inspection.Stalled {
-				return nil
-			}
-		case obs.MediaStateNone, obs.MediaStatePaused, obs.MediaStateStopped, obs.MediaStateEnded, obs.MediaStateError:
-		default:
-			return fmt.Errorf("OBS media source %s returned unknown state %q", s.cfg.OBSMediaSourceName, inspection.Status.State)
-		}
-	}
-	return s.replayFallbackPlaybackLocked(ctx, kind, expectedPath)
-}
-
-func (s *Service) restartCurrentQueuePlaybackLocked(ctx context.Context, current queue.Video) error {
-	if err := s.obs.PlayFile(ctx, current.LocalPath); err != nil {
-		s.setPlaybackState(playbackIdle, 0, "")
-		s.setLastErr(err)
-		return err
-	}
-	if _, err := s.store.RestartPlaying(ctx, current.ID); err != nil {
-		_ = s.obs.StopCurrent(ctx)
-		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
-		s.setPlaybackState(playbackIdle, 0, "")
-		s.setLastErr(err)
-		return err
-	}
-	s.resetMediaProgressLocked(s.cfg.OBSMediaSourceName, current.LocalPath)
-	s.setPlaybackState(playbackNormal, 0, "")
-	s.recordPlaybackNotice(playbackNoticeRecovered, current.ID, current.LocalPath, nil)
-	return nil
-}
-
-func (s *Service) reconcileCurrentQueuePlaybackLocked(ctx context.Context, current queue.Video) (*queue.Video, bool, error) {
-	inspection, err := s.inspectMediaInputLocked(ctx, s.cfg.OBSMediaSourceName, current.LocalPath)
-	if err != nil {
-		return nil, false, err
-	}
-	if inspection.PathMismatch {
-		if inspection.Settling || s.queuePlaybackSettling(current) {
-			return nil, false, nil
-		}
-		return nil, true, s.restartCurrentQueuePlaybackLocked(ctx, current)
-	}
-	switch inspection.Status.State {
-	case obs.MediaStateStopped, obs.MediaStateEnded, obs.MediaStateError:
-		if inspection.Settling || s.queuePlaybackSettling(current) {
-			return nil, false, nil
-		}
-		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
-		next, err := s.advancePlaybackLockedAfter(ctx, current.ID, current.LocalPath)
-		return next, true, err
-	case obs.MediaStateNone, obs.MediaStatePaused:
-		return nil, true, s.restartCurrentQueuePlaybackLocked(ctx, current)
-	case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering:
-		if inspection.Stalled {
-			return nil, true, s.restartCurrentQueuePlaybackLocked(ctx, current)
-		}
-		return nil, false, nil
-	default:
-		return nil, false, fmt.Errorf("OBS media source %s returned unknown state %q", s.cfg.OBSMediaSourceName, inspection.Status.State)
-	}
-}
-
-func (s *Service) queuePlaybackSettling(current queue.Video) bool {
-	if current.StartedAt == nil {
-		return true
-	}
-	return s.nowUTC().Before(current.StartedAt.Add(obsEndedEventSettleGrace))
-}
-
-func (s *Service) reconcileFallbackPlaybackLocked(ctx context.Context) (*queue.Video, bool, error) {
-	kind := s.playbackState()
-	if kind != playbackRandom && kind != playbackFile {
-		return nil, false, nil
-	}
-	expectedPath := s.currentPlaybackPath()
-	if expectedPath == "" {
-		return nil, false, nil
-	}
-	inspection, err := s.inspectMediaInputLocked(ctx, s.cfg.OBSMediaSourceName, expectedPath)
-	if err != nil {
-		return nil, false, err
-	}
-	if inspection.PathMismatch {
-		if inspection.Settling {
-			return nil, false, nil
-		}
-		return nil, true, s.replayFallbackPlaybackLocked(ctx, kind, expectedPath)
-	}
-	switch inspection.Status.State {
-	case obs.MediaStateStopped, obs.MediaStateEnded, obs.MediaStateError:
-		if inspection.Settling {
-			return nil, false, nil
-		}
-		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
-		s.setPlaybackState(playbackIdle, 0, "")
-		next, err := s.advancePlaybackLocked(ctx)
-		return next, true, err
-	case obs.MediaStateNone, obs.MediaStatePaused:
-	case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering:
-		if !inspection.PathMismatch && !inspection.Stalled {
-			return nil, false, nil
-		}
-	default:
-		return nil, false, fmt.Errorf("OBS media source %s returned unknown state %q", s.cfg.OBSMediaSourceName, inspection.Status.State)
-	}
-
-	return nil, true, s.replayFallbackPlaybackLocked(ctx, kind, expectedPath)
-}
-
-func (s *Service) replayFallbackPlaybackLocked(ctx context.Context, kind playbackKind, expectedPath string) error {
-	if err := s.obs.PlayFile(ctx, expectedPath); err != nil {
-		return err
-	}
-	s.resetMediaProgressLocked(s.cfg.OBSMediaSourceName, expectedPath)
-	var randomID int64
-	if kind == playbackRandom {
-		randomID, _ = s.randomFallbackLock()
-	}
-	s.setPlaybackState(kind, randomID, expectedPath)
-	return nil
+	return s.recoverLibraryPlaybackAfterOBSConnect(ctx)
 }
 
 func (s *Service) inspectMediaInputLocked(ctx context.Context, inputName string, expectedPath string) (mediaInspection, error) {
@@ -1166,7 +700,95 @@ func (s *Service) inspectMediaInputLocked(ctx context.Context, inputName string,
 	case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering:
 		inspection.Stalled = s.mediaInputStalledLocked(inputName, expectedPath, status)
 	}
+	if inspection.Stalled &&
+		status.State == obs.MediaStatePlaying &&
+		status.CursorMilliseconds != nil {
+		confirmed, confirmErr := s.confirmStalledMediaInputLocked(
+			ctx,
+			inputName,
+			expectedPath,
+			status,
+		)
+		if confirmErr != nil {
+			return mediaInspection{}, confirmErr
+		}
+		return confirmed, nil
+	}
 	return inspection, nil
+}
+
+func (s *Service) confirmStalledMediaInputLocked(
+	ctx context.Context,
+	inputName string,
+	expectedPath string,
+	initialStatus obs.MediaInputStatus,
+) (mediaInspection, error) {
+	timer := time.NewTimer(mediaCursorConfirmationDelay(initialStatus))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return mediaInspection{}, ctx.Err()
+	case <-timer.C:
+	}
+
+	status, err := s.obs.GetMediaInputStatus(ctx, inputName)
+	if err != nil {
+		return mediaInspection{}, fmt.Errorf("confirm OBS media progress for %s: %w", inputName, err)
+	}
+	if err := validateMediaState(status.State); err != nil {
+		return mediaInspection{}, fmt.Errorf("OBS media source %s: %w", inputName, err)
+	}
+	inspection := mediaInspection{
+		Status:   status,
+		Settling: s.mediaGenerationSettlingLocked(inputName, expectedPath),
+	}
+	settings, err := s.obs.GetInputSettings(ctx, inputName)
+	if err != nil {
+		return mediaInspection{}, fmt.Errorf("confirm OBS input settings for %s: %w", inputName, err)
+	}
+	if !sameMediaPath(settings.LocalFile, expectedPath) {
+		inspection.PathMismatch = true
+		return inspection, nil
+	}
+	switch status.State {
+	case obs.MediaStatePlaying, obs.MediaStateOpening, obs.MediaStateBuffering:
+		inspection.Stalled = s.mediaInputStalledLocked(inputName, expectedPath, status)
+	}
+	return inspection, nil
+}
+
+func mediaCursorConfirmationDelay(status obs.MediaInputStatus) time.Duration {
+	if status.DurationMilliseconds == nil {
+		return mediaCursorFallbackGap
+	}
+	durationMillis := *status.DurationMilliseconds
+	if durationMillis <= 0 ||
+		math.IsNaN(durationMillis) ||
+		math.IsInf(durationMillis, 0) {
+		return mediaCursorFallbackGap
+	}
+
+	minMillis := float64(mediaCursorConfirmationMin) / float64(time.Millisecond)
+	maxMillis := float64(mediaCursorConfirmationMax) / float64(time.Millisecond)
+	halfMillis := durationMillis / 2
+	delayMillis := halfMillis
+	switch {
+	case halfMillis < minMillis:
+		// Add whole loop durations until the sample is practical while
+		// preserving a half-loop phase offset. This cannot land on the same
+		// phase for any positive reported duration.
+		cycles := math.Ceil((minMillis - halfMillis) / durationMillis)
+		delayMillis = cycles*durationMillis + halfMillis
+	case halfMillis > maxMillis:
+		// Here maxMillis is strictly less than one full duration, so it also
+		// cannot be a whole-loop phase.
+		delayMillis = maxMillis
+	}
+	delay := time.Duration(delayMillis * float64(time.Millisecond))
+	if delay <= 0 {
+		return mediaCursorFallbackGap
+	}
+	return delay
 }
 
 func validateMediaState(state obs.MediaState) error {
@@ -1217,7 +839,6 @@ func (s *Service) mediaInputStalledLocked(inputName string, path string, status 
 			definitiveProgress = true
 		}
 	}
-
 	lastProgressAt := previous.LastProgressAt
 	if progressed || lastProgressAt.IsZero() {
 		lastProgressAt = now
@@ -1235,6 +856,7 @@ func (s *Service) mediaInputStalledLocked(inputName string, path string, status 
 		State:                    status.State,
 		CursorMillis:             cursorMillis,
 		HasCursor:                hasCursor,
+		ObservedAt:               now,
 		GenerationStartedAt:      generationStartedAt,
 		LastProgressAt:           lastProgressAt,
 		LastDefinitiveProgressAt: lastDefinitiveProgressAt,
@@ -1250,6 +872,7 @@ func (s *Service) resetMediaProgressLocked(inputName string, path string) {
 	now := s.nowUTC()
 	s.mediaProgressByInput[inputName] = mediaProgress{
 		Path:                     path,
+		ObservedAt:               now,
 		GenerationStartedAt:      now,
 		LastProgressAt:           now,
 		LastDefinitiveProgressAt: now,
@@ -1261,222 +884,26 @@ func (s *Service) mediaGenerationSettlingLocked(inputName string, path string) b
 	if !ok || progress.Path != path || progress.GenerationStartedAt.IsZero() {
 		return false
 	}
-	return s.nowUTC().Before(progress.GenerationStartedAt.Add(obsEndedEventSettleGrace))
+	now := s.nowUTC()
+	if now.Before(progress.GenerationStartedAt) {
+		// A wall-clock rollback invalidates the old generation grace window;
+		// otherwise a same-period rollback could suppress terminal or
+		// path-mismatch recovery for minutes or hours.
+		return false
+	}
+	return now.Before(progress.GenerationStartedAt.Add(obsEndedEventSettleGrace))
 }
 
 func (s *Service) clearMediaProgressLocked(inputName string) {
 	delete(s.mediaProgressByInput, inputName)
 }
 
-func (s *Service) skipCurrent(ctx context.Context) (string, error) {
-	s.playbackMu.Lock()
-	message, err := func() (string, error) {
-		defer s.playbackMu.Unlock()
-
-		next, err := s.store.NextReady(ctx)
-		if err != nil {
-			return "", err
-		}
-		if next == nil {
-			if s.obs.Status().State == obs.StateConnected {
-				if err := s.obs.StopCurrent(ctx); err != nil {
-					s.setLastErr(err)
-					return "", err
-				}
-			}
-			if err := s.store.FinishCurrent(ctx); err != nil {
-				s.setLastErr(err)
-				return "", err
-			}
-			s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
-			s.setPlaybackState(playbackIdle, 0, "")
-			return "已跳過，目前沒有下一支影片。", nil
-		}
-		video, err := s.advancePlaybackLocked(ctx)
-		if err != nil {
-			return "", err
-		}
-		if video == nil {
-			return "已跳過，目前沒有下一支影片。", nil
-		}
-		return fmt.Sprintf("已跳到下一支：#%d %s", video.ID, video.FileName), nil
-	}()
-	s.flushPlaybackNotices()
-	return message, err
-}
-
-func (s *Service) advanceFallbackLocked(ctx context.Context) error {
-	switch s.cfg.FallbackMode {
-	case "off":
-		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
-		s.setPlaybackState(playbackIdle, 0, "")
-		return nil
-	case "file":
-		return s.playFallbackFileLocked(ctx)
-	case "random_played":
-		if video, err := s.playRandomFallbackLocked(ctx); err != nil {
-			return err
-		} else if video != nil {
-			return nil
-		}
-		return s.playFallbackFileLocked(ctx)
-	default:
-		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
-		s.setPlaybackState(playbackIdle, 0, "")
-		return nil
-	}
-}
-
-func (s *Service) playFallbackFileLocked(ctx context.Context) error {
-	if s.cfg.OBSFallbackFile == "" {
-		s.clearMediaProgressLocked(s.cfg.OBSMediaSourceName)
-		s.setPlaybackState(playbackIdle, 0, "")
-		return nil
-	}
-	if err := s.obs.PlayFile(ctx, s.cfg.OBSFallbackFile); err != nil {
-		s.setLastErr(err)
-		return err
-	}
-	s.resetMediaProgressLocked(s.cfg.OBSMediaSourceName, s.cfg.OBSFallbackFile)
-	s.setPlaybackState(playbackFile, 0, s.cfg.OBSFallbackFile)
-	return nil
-}
-
-func (s *Service) playRandomFallbackLocked(ctx context.Context) (*queue.Video, error) {
-	candidates, err := s.store.PlayedFallbackCandidates(ctx, queue.MaxFallbackCandidates)
-	if err != nil {
-		s.setLastErr(err)
-		return nil, err
-	}
-	order := rand.Perm(len(candidates))
-	if s.rng != nil {
-		order = s.rng.Perm(len(candidates))
-	}
-	for _, idx := range order {
-		video := candidates[idx]
-		if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, video.LocalPath); err != nil {
-			if _, markErr := s.store.QuarantinePlayed(ctx, video.ID, err.Error()); markErr != nil {
-				s.setLastErr(markErr)
-				return nil, markErr
-			}
-			s.setLastErr(err)
-			s.recordPlaybackNotice(playbackNoticeInvalidRandom, video.ID, video.LocalPath, err)
-			continue
-		}
-		if err := s.obs.PlayFile(ctx, video.LocalPath); err != nil {
-			s.setLastErr(err)
-			return nil, err
-		}
-		s.resetMediaProgressLocked(s.cfg.OBSMediaSourceName, video.LocalPath)
-		notify := s.setPlaybackState(playbackRandom, video.ID, video.LocalPath)
-		if notify {
-			_ = s.bot.SendMessage(ctx, s.cfg.AllowedChatID, fmt.Sprintf("佇列已播放完，正在隨機播放歷史影片：#%d %s", video.ID, video.FileName))
-		}
-		return &video, nil
-	}
-	return nil, nil
-}
-
-func (s *Service) RemoveQueued(ctx context.Context, id int64) error {
-	if err := s.store.Cancel(ctx, id); err != nil {
-		s.setLastErr(err)
-		return err
-	}
-	return nil
-}
-
-func (s *Service) MoveQueued(ctx context.Context, id int64, position int) error {
-	if err := s.store.Move(ctx, id, position); err != nil {
-		s.setLastErr(err)
-		return err
-	}
-	return nil
-}
-
-func (s *Service) QueueText(ctx context.Context) (string, error) {
-	videos, err := s.store.ListQueue(ctx, 20)
-	if err != nil {
-		return "", err
-	}
-	if len(videos) == 0 {
-		return "佇列目前是空的。", nil
-	}
-	lines := []string{"目前佇列："}
-	for _, v := range videos {
-		label := fmt.Sprintf("#%d", v.ID)
-		if v.Status == queue.StatusPlaying {
-			label += " [播放中]"
-		} else {
-			label += fmt.Sprintf(" [第 %d 位]", v.QueuePosition)
-		}
-		lines = append(lines, fmt.Sprintf("%s %s %s", label, v.FileName, formatDuration(v.DurationSeconds)))
-	}
-	return strings.Join(lines, "\n"), nil
-}
-
 func (s *Service) NowText(ctx context.Context) (string, error) {
-	if s.libraryMode() {
-		return s.LibraryNowText(ctx)
-	}
-	video, err := s.store.Current(ctx)
-	if err != nil {
-		return "", err
-	}
-	if video == nil {
-		return "目前沒有正在播放的影片。", nil
-	}
-	return fmt.Sprintf("正在播放：#%d %s %s", video.ID, video.FileName, formatDuration(video.DurationSeconds)), nil
-}
-
-func (s *Service) HistoryText(ctx context.Context) (string, error) {
-	videos, err := s.store.History(ctx, 10)
-	if err != nil {
-		return "", err
-	}
-	if len(videos) == 0 {
-		return "尚無歷史紀錄。", nil
-	}
-	lines := []string{"最近紀錄："}
-	for _, v := range videos {
-		lines = append(lines, fmt.Sprintf("#%d [%s] %s", v.ID, v.Status, v.FileName))
-	}
-	return strings.Join(lines, "\n"), nil
+	return s.LibraryNowText(ctx)
 }
 
 func (s *Service) StatusText(ctx context.Context, obsConnected bool) (string, error) {
-	if s.libraryMode() {
-		return s.LibraryStatusText(ctx, obsConnected)
-	}
-	stats, err := s.store.Stats(ctx)
-	if err != nil {
-		return "", err
-	}
-	diskText := "未知"
-	if usage, err := s.media.DiskUsage(); err == nil {
-		diskText = fmt.Sprintf("%s free / %s total", formatBytes(int64(usage.AvailableBytes)), formatBytes(int64(usage.TotalBytes)))
-	}
-	botAPIDiskText := "未知"
-	if usage, err := media.DiskUsageForPath(s.cfg.TelegramBotAPIDir); err == nil {
-		botAPIDiskText = fmt.Sprintf("%s free / %s total", formatBytes(int64(usage.AvailableBytes)), formatBytes(int64(usage.TotalBytes)))
-	}
-	lastErr := s.lastError()
-	if lastErr == "" {
-		lastErr = "無"
-	}
-	return fmt.Sprintf(
-		"狀態：\nOBS：%s\nReady：%d\nDownloading：%d\nPlayed：%d\nFailed：%d\nFallback：%s (%s)\nMedia DB：%s\nMedia Disk：%s\nBot API Disk：%s\nLast error：%s",
-		boolText(obsConnected),
-		stats.ReadyCount,
-		stats.DownloadingCount,
-		stats.PlayedCount,
-		stats.FailedCount,
-		s.cfg.FallbackMode,
-		s.playbackState(),
-		formatBytes(stats.TotalBytes),
-		diskText,
-		botAPIDiskText,
-		lastErr,
-	), nil
+	return s.LibraryStatusText(ctx, obsConnected)
 }
 
 func (s *Service) telegramHooks() telegram.Hooks {
@@ -1488,78 +915,22 @@ func (s *Service) telegramHooks() telegram.Hooks {
 			}
 			return err
 		},
-		EnqueueUpload: func(ctx context.Context, upload telegram.Upload) (string, error) {
-			if s.libraryMode() {
-				return s.ImportLibraryUpload(ctx, UploadRequest{
-					LocalPath:        upload.LocalPath,
-					TelegramFileID:   upload.FileID,
-					TelegramUniqueID: upload.FileUniqueID,
-					SubmitterID:      upload.SubmitterID,
-					SubmitterName:    upload.SubmitterName,
-					ChatID:           upload.ChatID,
-					MessageID:        upload.MessageID,
-					FileName:         upload.FileName,
-					MimeType:         upload.MimeType,
-					SizeBytes:        upload.SizeBytes,
-				})
-			}
-			video, err := s.EnqueueUpload(ctx, UploadRequest{
-				LocalPath:        upload.LocalPath,
-				TelegramFileID:   upload.FileID,
-				TelegramUniqueID: upload.FileUniqueID,
-				SubmitterID:      upload.SubmitterID,
-				SubmitterName:    upload.SubmitterName,
-				ChatID:           upload.ChatID,
-				MessageID:        upload.MessageID,
-				FileName:         upload.FileName,
-				MimeType:         upload.MimeType,
-				SizeBytes:        upload.SizeBytes,
+		ImportUpload: func(ctx context.Context, upload telegram.Upload) (string, error) {
+			return s.ImportLibraryUpload(ctx, UploadRequest{
+				LocalPath: upload.LocalPath,
+				FileName:  upload.FileName,
 			})
-			if err != nil {
-				return "", err
-			}
-			return fmt.Sprintf("已加入佇列：#%d %s，第 %d 位。", video.ID, video.FileName, video.QueuePosition), nil
 		},
-		Library:    s.LibraryText,
-		Scan:       s.ScanLibraryText,
-		Preview:    s.PreviewText,
-		SetTheme:   s.SetThemeText,
-		SelectLoop: s.SelectLoopText,
-		SkipLoop:   s.SkipLoopText,
-		SkipMusic:  s.SkipMusicText,
-		ListQueue: func(ctx context.Context) (string, error) {
-			if s.libraryMode() {
-				return s.LibraryText(ctx)
-			}
-			return s.QueueText(ctx)
-		},
-		Now: s.NowText,
-		History: func(ctx context.Context) (string, error) {
-			if s.libraryMode() {
-				return "Library mode 沒有 queue history；請使用 /library 查看素材。", nil
-			}
-			return s.HistoryText(ctx)
-		},
+		LibraryPage: s.LibraryPage,
+		Scan:        s.ScanLibraryText,
+		Preview:     s.PreviewText,
+		SetTheme:    s.SetThemeText,
+		SelectLoop:  s.SelectLoopText,
+		SkipLoop:    s.SkipLoopText,
+		SkipMusic:   s.SkipMusicText,
+		Now:         s.NowText,
 		Status: func(ctx context.Context) (string, error) {
 			return s.StatusText(ctx, s.obs.Status().State == obs.StateConnected)
-		},
-		Remove: func(ctx context.Context, id int64) (string, error) {
-			if err := s.RemoveQueued(ctx, id); err != nil {
-				return "", err
-			}
-			return fmt.Sprintf("已取消佇列影片 #%d。", id), nil
-		},
-		Move: func(ctx context.Context, id int64, position int) (string, error) {
-			if err := s.MoveQueued(ctx, id, position); err != nil {
-				return "", err
-			}
-			return fmt.Sprintf("已將 #%d 移到第 %d 位。", id, position), nil
-		},
-		Skip: func(ctx context.Context) (string, error) {
-			if s.libraryMode() {
-				return s.SkipLoopText(ctx)
-			}
-			return s.skipCurrent(ctx)
 		},
 	}
 }
@@ -1641,12 +1012,12 @@ func (s *Service) maintainOBSConnection(ctx context.Context) obsMaintenanceResul
 			return result
 		}
 		result.recoverProbe = true
-		if s.playbackState() == playbackIdle {
+		if s.libraryPlaybackMissing() {
 			if !s.obsRecoveryInProgress.CompareAndSwap(false, true) {
 				return result
 			}
 			defer s.obsRecoveryInProgress.Store(false)
-			if s.obs.Status().State != obs.StateConnected || s.playbackState() != playbackIdle {
+			if s.obs.Status().State != obs.StateConnected || !s.libraryPlaybackMissing() {
 				return result
 			}
 			if err := s.recoverPlaybackAfterOBSConnect(ctx); err != nil {
@@ -1664,143 +1035,10 @@ func (s *Service) maintainOBSConnection(ctx context.Context) obsMaintenanceResul
 	return result
 }
 
-func (s *Service) playbackWatchdogLoop(ctx context.Context) error {
-	tracker := liveness.WorkerFromContext(ctx)
-	retries := newRecurringRetry(playbackWatchdogInterval, watchdogRetryMaxDelay, s.retryRandom)
-	schedule := newRecurringSchedule(playbackWatchdogInterval, false, s.retryClockNow)
-	delay := schedule.delay()
-	waitPhase := liveness.PhaseScheduledWait
-	for {
-		if err := s.waitRecurring(ctx, tracker, waitPhase, delay); err != nil {
-			return err
-		}
-		tracker.Advance(liveness.PhaseOperation)
-		schedule.beginCycle()
-		if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
-			delay = schedule.delay()
-			waitPhase = liveness.PhaseScheduledWait
-			continue
-		}
-		attempted, err := s.checkPlaybackWatchdogAttempt(ctx)
-		if !attempted {
-			delay = schedule.delay()
-			waitPhase = liveness.PhaseScheduledWait
-			continue
-		}
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			s.setLastErr(err)
-			failure := retries.failure()
-			logRecurringFailure(s.logger, "playback watchdog failed", s.redactError(err), failure)
-			delay = schedule.failureDelay(failure.attempt.Delay)
-			waitPhase = liveness.PhaseRetryWait
-			continue
-		}
-		logRecurringRecovery(s.logger, "playback watchdog recovered", retries.recovery())
-		delay = schedule.delay()
-		waitPhase = liveness.PhaseScheduledWait
-	}
-}
-
-func (s *Service) checkPlaybackWatchdog(ctx context.Context) error {
-	_, err := s.checkPlaybackWatchdogAttempt(ctx)
-	return err
-}
-
-func (s *Service) checkPlaybackWatchdogAttempt(ctx context.Context) (bool, error) {
-	if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
-		return false, nil
-	}
-
-	var video *queue.Video
-	attempted := false
-	type overduePlayback struct {
-		videoID         int64
-		startedAt       *time.Time
-		durationSeconds int
-		deadline        time.Time
-	}
-	var overdue *overduePlayback
-	checkErr := func() error {
-		s.playbackMu.Lock()
-		defer s.playbackMu.Unlock()
-
-		if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
-			return nil
-		}
-		attempted = true
-		current, err := s.store.Current(ctx)
-		if err != nil {
-			return err
-		}
-		if current == nil {
-			switch s.playbackState() {
-			case playbackRandom, playbackFile:
-				video, _, err = s.reconcileFallbackPlaybackLocked(ctx)
-				return err
-			case playbackNormal:
-				// A prior transition may have durably finished the old row
-				// before a later queue/OBS operation failed.
-				s.transitionQueuePlaybackToIdleLocked()
-			case playbackIdle:
-			default:
-				s.transitionQueuePlaybackToIdleLocked()
-			}
-			video, err = s.startNextQueuePlaybackLocked(ctx)
-			return err
-		}
-		if s.playbackState() != playbackNormal {
-			return s.restartCurrentQueuePlaybackLocked(ctx, *current)
-		}
-
-		var changed bool
-		video, changed, err = s.reconcileCurrentQueuePlaybackLocked(ctx, *current)
-		if err != nil || changed {
-			return err
-		}
-		if current.StartedAt == nil || current.DurationSeconds <= 0 {
-			return nil
-		}
-		deadline := current.StartedAt.Add(time.Duration(current.DurationSeconds)*time.Second + playbackWatchdogGrace)
-		if s.nowUTC().Before(deadline) {
-			return nil
-		}
-
-		overdue = &overduePlayback{
-			videoID:         current.ID,
-			startedAt:       current.StartedAt,
-			durationSeconds: current.DurationSeconds,
-			deadline:        deadline,
-		}
-		var advanceErr error
-		video, advanceErr = s.advancePlaybackLockedAfter(ctx, current.ID, current.LocalPath)
-		return advanceErr
-	}()
-	s.flushPlaybackNotices()
-	if overdue != nil {
-		s.logger.Warn("playback exceeded expected duration; advancing without OBS ended event",
-			"video_id", overdue.videoID,
-			"started_at", overdue.startedAt,
-			"duration_seconds", overdue.durationSeconds,
-			"deadline", overdue.deadline,
-		)
-	}
-	if checkErr != nil {
-		return attempted, checkErr
-	}
-	if video != nil {
-		_ = s.bot.SendMessage(ctx, s.cfg.AllowedChatID, fmt.Sprintf("開始播放：#%d %s", video.ID, video.FileName))
-	}
-	return attempted, nil
-}
-
 func (s *Service) obsEventLoop(ctx context.Context) error {
 	tracker := liveness.WorkerFromContext(ctx)
 	events := s.obs.Events()
 	libraryFailures := newEventErrorSampler()
-	queueFailures := newEventErrorSampler()
 	progress := time.NewTicker(tracker.ProgressInterval())
 	defer progress.Stop()
 	for {
@@ -1826,139 +1064,26 @@ func (s *Service) obsEventLoop(ctx context.Context) error {
 			if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
 				continue
 			}
-			if s.libraryMode() {
-				attempted, err := s.handleLibraryOBSEventAttempt(ctx, event)
-				if !attempted {
-					continue
-				}
-				if err != nil {
-					logEventFailure(
-						s.logger,
-						"advance library playback after OBS event failed",
-						s.redactError(err),
-						libraryFailures.failure(),
-					)
-				} else {
-					libraryFailures.success()
-				}
-				continue
-			}
-			video, attempted, err := s.advancePlaybackForEndedEventAttempt(ctx, event)
+			attempted, err := s.handleLibraryOBSEventAttempt(ctx, event)
 			if !attempted {
 				continue
 			}
 			if err != nil {
 				logEventFailure(
 					s.logger,
-					"advance playback after OBS event failed",
+					"advance library playback after OBS event failed",
 					s.redactError(err),
-					queueFailures.failure(),
+					libraryFailures.failure(),
 				)
-				continue
-			}
-			queueFailures.success()
-			if video != nil {
-				_ = s.bot.SendMessage(ctx, s.cfg.AllowedChatID, fmt.Sprintf("開始播放：#%d %s", video.ID, video.FileName))
+			} else {
+				libraryFailures.success()
 			}
 		}
 	}
-}
-
-func (s *Service) advancePlaybackForEndedEvent(ctx context.Context, event obs.Event) (*queue.Video, error) {
-	video, _, err := s.advancePlaybackForEndedEventAttempt(ctx, event)
-	return video, err
-}
-
-func (s *Service) advancePlaybackForEndedEventAttempt(
-	ctx context.Context,
-	event obs.Event,
-) (*queue.Video, bool, error) {
-	type earlyEventNotice struct {
-		videoID         int64
-		eventPath       string
-		eventAt         time.Time
-		startedAt       *time.Time
-		durationSeconds int
-	}
-	var notice *earlyEventNotice
-	var video *queue.Video
-	attempted := false
-	err := func() error {
-		s.playbackMu.Lock()
-		defer s.playbackMu.Unlock()
-
-		if s.obsRecoveryInProgress.Load() || s.obs.Status().State != obs.StateConnected {
-			return nil
-		}
-		attempted = true
-		// MediaEnded is only a reconciliation hint. OBS status and input identity,
-		// read under the same playback lock as queue mutation, are authoritative.
-		current, err := s.store.Current(ctx)
-		if err != nil {
-			return err
-		}
-		if current != nil {
-			if event.Path != "" && !sameMediaPath(event.Path, current.LocalPath) {
-				return nil
-			}
-			if s.queueEndedEventIsTooEarly(event, *current) {
-				notice = &earlyEventNotice{
-					videoID:         current.ID,
-					eventPath:       event.Path,
-					eventAt:         event.At,
-					startedAt:       current.StartedAt,
-					durationSeconds: current.DurationSeconds,
-				}
-				return nil
-			}
-			var reconcileErr error
-			video, _, reconcileErr = s.reconcileCurrentQueuePlaybackLocked(ctx, *current)
-			return reconcileErr
-		}
-		var reconcileErr error
-		video, _, reconcileErr = s.reconcileFallbackPlaybackLocked(ctx)
-		return reconcileErr
-	}()
-	s.flushPlaybackNotices()
-	if notice != nil {
-		s.logger.Warn("ignore OBS ended event inside current playback guard window",
-			"video_id", notice.videoID,
-			"event_path", s.redactString(notice.eventPath),
-			"event_at", notice.eventAt,
-			"started_at", notice.startedAt,
-			"duration_seconds", notice.durationSeconds,
-		)
-	}
-	return video, attempted, err
-}
-
-func (s *Service) queueEndedEventIsTooEarly(event obs.Event, current queue.Video) bool {
-	if current.StartedAt == nil {
-		return true
-	}
-	trustedAfter := current.StartedAt.Add(obsEndedEventSettleGrace)
-	if current.DurationSeconds > 0 {
-		duration := time.Duration(current.DurationSeconds) * time.Second
-		tolerance := obsEndedEventSettleGrace
-		if duration <= tolerance {
-			tolerance = duration / 2
-		}
-		expectedEndGuard := current.StartedAt.Add(duration - tolerance)
-		if expectedEndGuard.After(trustedAfter) {
-			trustedAfter = expectedEndGuard
-		}
-	}
-	eventAt := event.At
-	if eventAt.IsZero() {
-		eventAt = s.nowUTC()
-	}
-	return eventAt.Before(trustedAfter)
 }
 
 func (s *Service) recoverStartupState(ctx context.Context) error {
-	staleErr := s.failStaleDownloading(ctx, "startup recovery: stale downloading item")
-	tempErr := s.sweepStaleLibraryImportTemps(ctx)
-	return errors.Join(staleErr, tempErr)
+	return s.sweepStaleLibraryImportTemps(ctx)
 }
 
 func (s *Service) performMaintenance(ctx context.Context) error {
@@ -1966,360 +1091,36 @@ func (s *Service) performMaintenance(ctx context.Context) error {
 }
 
 func (s *Service) performMaintenanceCycle(ctx context.Context) maintenanceCycleResult {
-	staleErr := s.failStaleDownloading(ctx, "periodic recovery: stale downloading item")
-	retentionAttempted, retentionErr := s.tryCleanupRetention(ctx)
-	_, _, journalErr := s.store.PruneTelegramUpdateJournal(ctx)
+	_, _, journalErr := s.journalStore.PruneTelegramUpdateJournal(ctx)
+	now := time.Now()
+	if s.now != nil {
+		now = s.now()
+	}
+	_, libraryStateErr := s.libDB.PruneBefore(
+		ctx,
+		now.AddDate(0, 0, -2).Format("2006-01-02"),
+		libraryStatePruneBatchSize,
+	)
 	tempAttempted, tempErr := s.trySweepStaleLibraryImportTemps(ctx)
 	return maintenanceCycleResult{
-		deferred: !retentionAttempted || !tempAttempted,
-		err:      errors.Join(staleErr, retentionErr, journalErr, tempErr),
+		deferred: !tempAttempted,
+		err:      errors.Join(journalErr, libraryStateErr, tempErr),
 	}
-}
-
-func (s *Service) failStaleDownloading(ctx context.Context, cause string) error {
-	count, err := s.store.FailStaleDownloading(ctx, staleDownloadingAge, cause)
-	if err != nil {
-		return err
-	}
-	if count > 0 {
-		s.logger.Warn("marked stale downloading queue items failed", "count", count)
-	}
-	return nil
-}
-
-func (s *Service) CleanupRetention(ctx context.Context) error {
-	maxAge := s.cfg.RetentionMaxAge()
-	maxFiles := s.cfg.RetentionMaxFiles
-	if maxAge <= 0 && maxFiles <= 0 {
-		return nil
-	}
-	var report retentionCleanupReport
-	var err error
-	func() {
-		s.playbackMu.Lock()
-		defer s.playbackMu.Unlock()
-		s.storageMu.Lock()
-		defer s.storageMu.Unlock()
-		report, err = s.cleanupRetentionLocked(ctx, maxAge, maxFiles)
-	}()
-	s.logRetentionCleanupReport(report)
-	return err
-}
-
-// tryCleanupRetention is used only by the recurring maintenance worker. It
-// preserves the playback-before-storage lock order but skips this cycle rather
-// than letting one required worker form a lock convoy behind another.
-func (s *Service) tryCleanupRetention(ctx context.Context) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return true, err
-	}
-	maxAge := s.cfg.RetentionMaxAge()
-	maxFiles := s.cfg.RetentionMaxFiles
-	if maxAge <= 0 && maxFiles <= 0 {
-		return true, nil
-	}
-	if !s.playbackMu.TryLock() {
-		return false, nil
-	}
-	var (
-		report     retentionCleanupReport
-		cleanupErr error
-		attempted  bool
-	)
-	func() {
-		defer s.playbackMu.Unlock()
-		if !s.storageMu.TryLock() {
-			return
-		}
-		defer s.storageMu.Unlock()
-		attempted = true
-		report, cleanupErr = s.cleanupRetentionLocked(ctx, maxAge, maxFiles)
-	}()
-	if !attempted {
-		return false, nil
-	}
-	s.logRetentionCleanupReport(report)
-	return true, cleanupErr
-}
-
-func (s *Service) logRetentionCleanupReport(report retentionCleanupReport) {
-	if report.skippedLocalDeletes > 0 {
-		s.logger.Warn(
-			"skip retention local file deletes",
-			"count", report.skippedLocalDeletes,
-			"first_video_id", report.firstSkipVideoID,
-			"first_path", report.firstSkipPath,
-			"first_error", report.firstSkipError,
-		)
-	}
-}
-
-type retentionCleanupReport struct {
-	skippedLocalDeletes int
-	firstSkipVideoID    int64
-	firstSkipPath       string
-	firstSkipError      string
-}
-
-func (s *Service) cleanupRetentionLocked(
-	ctx context.Context,
-	maxAge time.Duration,
-	maxFiles int,
-) (retentionCleanupReport, error) {
-	var report retentionCleanupReport
-	fallbackID, fallbackPath := s.randomFallbackLock()
-	playedCount, err := s.store.TerminalCount(ctx, queue.StatusPlayed)
-	if err != nil {
-		return report, err
-	}
-	failedCanceledCount, err := s.store.TerminalCount(ctx, queue.StatusFailed, queue.StatusCanceled)
-	if err != nil {
-		return report, err
-	}
-	var cutoff time.Time
-	if maxAge > 0 {
-		cutoff = s.nowUTC().Add(-maxAge)
-	}
-
-	remaining := retentionBatchSize
-	scanned, deleted, err := s.cleanupTerminalGroup(
-		ctx,
-		[]queue.Status{queue.StatusPlayed},
-		playedCount,
-		maxFiles,
-		cutoff,
-		fallbackID,
-		fallbackPath,
-		remaining/2,
-		&report,
-	)
-	if err != nil {
-		return report, err
-	}
-	remaining -= scanned
-	playedCount -= deleted
-	scanned, _, err = s.cleanupTerminalGroup(
-		ctx,
-		[]queue.Status{queue.StatusFailed, queue.StatusCanceled},
-		failedCanceledCount,
-		maxFiles,
-		cutoff,
-		0,
-		"",
-		remaining,
-		&report,
-	)
-	if err != nil {
-		return report, err
-	}
-	remaining -= scanned
-	if remaining == 0 {
-		return report, nil
-	}
-	_, _, err = s.cleanupTerminalGroup(
-		ctx,
-		[]queue.Status{queue.StatusPlayed},
-		playedCount,
-		maxFiles,
-		cutoff,
-		fallbackID,
-		fallbackPath,
-		remaining,
-		&report,
-	)
-	return report, err
-}
-
-func (s *Service) cleanupTerminalGroup(
-	ctx context.Context,
-	statuses []queue.Status,
-	count int,
-	maxFiles int,
-	cutoff time.Time,
-	protectedID int64,
-	protectedPath string,
-	limit int,
-	report *retentionCleanupReport,
-) (int, int, error) {
-	if limit <= 0 || (cutoff.IsZero() && (maxFiles <= 0 || count <= maxFiles)) {
-		return 0, 0, nil
-	}
-	videos, err := s.store.OldestTerminal(ctx, statuses, limit)
-	if err != nil {
-		return 0, 0, err
-	}
-	deletedCount := 0
-	tracker := liveness.WorkerFromContext(ctx)
-	for _, video := range videos {
-		expired := !cutoff.IsZero() && terminalTime(video).Before(cutoff)
-		excess := maxFiles > 0 && count > maxFiles
-		tracker.Advance(liveness.PhaseOperation)
-		if !expired && !excess {
-			continue
-		}
-		if video.ID == protectedID {
-			continue
-		}
-
-		deleteLocalFile := false
-		if s.cfg.RetentionDeleteLocalFiles && (protectedPath == "" || video.LocalPath != protectedPath) {
-			referenced, err := s.store.LocalPathReferenced(ctx, video.LocalPath, video.ID)
-			if err != nil {
-				return 0, 0, err
-			}
-			deleteLocalFile = !referenced
-		}
-		if deleteLocalFile {
-			if err := validateLocalBotAPIPath(s.cfg.TelegramBotAPIDir, video.LocalPath); err != nil {
-				if !errors.Is(err, os.ErrNotExist) {
-					report.skippedLocalDeletes++
-					if report.firstSkipError == "" {
-						report.firstSkipVideoID = video.ID
-						report.firstSkipPath = retryloop.BoundedText(
-							s.redactString(video.LocalPath),
-							retryloop.RecurringErrorMaxBytes,
-						)
-						report.firstSkipError = retryloop.BoundedErrorText(
-							s.redactError(err),
-							retryloop.RecurringErrorMaxBytes,
-						)
-					}
-				}
-			} else {
-				removeFile := s.removeFile
-				if removeFile == nil {
-					removeFile = media.RemoveFile
-				}
-				if err := removeFile(video.LocalPath); err != nil {
-					return 0, 0, err
-				}
-			}
-		}
-		deleted, err := s.store.DeleteTerminal(ctx, video.ID, video.Status)
-		if err != nil {
-			return 0, 0, err
-		}
-		if !deleted {
-			continue
-		}
-		count--
-		deletedCount++
-		tracker.Advance(liveness.PhaseOperation)
-	}
-	return len(videos), deletedCount, nil
-}
-
-func terminalTime(video queue.Video) time.Time {
-	if video.FinishedAt != nil {
-		return *video.FinishedAt
-	}
-	return video.UpdatedAt
-}
-
-func (s *Service) markUploadFailed(ctx context.Context, id int64, cause error) {
-	failCtx, cancel := context.WithTimeout(context.Background(), uploadFailureTimeout)
-	defer cancel()
-	changed, err := s.store.MarkFailed(failCtx, id, cause.Error())
-	if err != nil {
-		s.logger.Warn("mark upload failed", "video_id", id, "error", s.redactError(err))
-		return
-	}
-	if !changed && ctx.Err() == nil {
-		s.logger.Debug("upload failure state already changed", "video_id", id)
-	}
-}
-
-func validateLocalBotAPIPath(root string, path string) error {
-	root = strings.TrimSpace(root)
-	if root == "" {
-		return nil
-	}
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		return fmt.Errorf("resolve TELEGRAM_BOT_API_DIR: %w", err)
-	}
-	resolvedRoot, err := filepath.EvalSymlinks(absRoot)
-	if err != nil {
-		return fmt.Errorf("resolve TELEGRAM_BOT_API_DIR: %w", err)
-	}
-	resolvedPath, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return fmt.Errorf("resolve local video path: %w", err)
-	}
-	info, err := os.Stat(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("stat local video path: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("local video path is not a regular file: %s", path)
-	}
-	rel, err := filepath.Rel(resolvedRoot, resolvedPath)
-	if err != nil {
-		return fmt.Errorf("compare local video path with TELEGRAM_BOT_API_DIR: %w", err)
-	}
-	if rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." || filepath.IsAbs(rel) {
-		return fmt.Errorf("local video path is outside TELEGRAM_BOT_API_DIR: %s", path)
-	}
-	return nil
 }
 
 func (s *Service) setLastErr(err error) {
+	if err == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.lastErr = secret.RedactString(err.Error(), s.cfg.SensitiveValues()...)
+	s.lastErr = s.publicErrorDiagnostic(err)
 }
 
 func (s *Service) lastError() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastErr
-}
-
-func (s *Service) setPlaybackState(kind playbackKind, randomID int64, path string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	notify := kind == playbackRandom && !s.randomFallbackNotice
-	s.playback = kind
-	if kind == playbackRandom {
-		s.randomFallbackID = randomID
-		s.randomFallbackPath = path
-		s.randomFallbackNotice = true
-	} else if kind == playbackFile {
-		s.randomFallbackID = 0
-		s.randomFallbackPath = path
-		s.randomFallbackNotice = false
-	} else {
-		s.randomFallbackID = 0
-		s.randomFallbackPath = ""
-		s.randomFallbackNotice = false
-	}
-	return notify
-}
-
-func (s *Service) playbackState() playbackKind {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.playback
-}
-
-func (s *Service) currentPlaybackPath() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	switch s.playback {
-	case playbackRandom, playbackFile:
-		return s.randomFallbackPath
-	default:
-		return ""
-	}
-}
-
-func (s *Service) randomFallbackLock() (int64, string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.playback != playbackRandom {
-		return 0, ""
-	}
-	return s.randomFallbackID, s.randomFallbackPath
 }
 
 func (s *Service) redactError(err error) error {
@@ -2330,18 +1131,51 @@ func (s *Service) redactString(value string) string {
 	return secret.RedactString(value, s.cfg.SensitiveValues()...)
 }
 
-func (s *Service) nowUTC() time.Time {
-	if s.now == nil {
-		return time.Now().UTC()
+func (s *Service) publicErrorDiagnostic(err error) string {
+	type publicMessenger interface {
+		PublicMessage() string
 	}
-	return s.now().UTC()
+	var publicErr publicMessenger
+	if errors.As(err, &publicErr) {
+		return secret.RedactString(
+			publicErr.PublicMessage(),
+			s.cfg.SensitiveValues()...,
+		)
+	}
+	// Retained runtime errors are visible to every authorized group member via
+	// /status. Never copy internal error text into that public surface: OS,
+	// SQLite, OBS, and Telegram errors may contain absolute or relative paths,
+	// filenames with spaces, cache identifiers, or other operational details.
+	return "內部操作失敗；詳細資訊請查看服務日誌。"
 }
 
-func formatDuration(seconds int) string {
-	if seconds <= 0 {
+func (s *Service) publicScanDiagnostic(err error) string {
+	if err == nil {
 		return ""
 	}
-	return fmt.Sprintf("(%02d:%02d)", seconds/60, seconds%60)
+	if errors.Is(err, medialib.ErrDirectoryCapacity) {
+		return fmt.Sprintf(
+			"媒體庫目錄超過 %d 個項目的安全上限；詳細資訊請查看服務日誌。",
+			medialib.MaxDirectoryEntries,
+		)
+	}
+	if count := libraryScanIssueCount(err); count > 0 {
+		return fmt.Sprintf(
+			"媒體庫掃描發現 %d 個無效或不可播放項目；詳細資訊請查看服務日誌。",
+			count,
+		)
+	}
+	return "媒體庫掃描失敗；詳細資訊請查看服務日誌。"
+}
+
+func (s *Service) nowUTC() time.Time {
+	if s.mediaClockNow != nil {
+		return s.mediaClockNow()
+	}
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 func formatBytes(bytes int64) string {

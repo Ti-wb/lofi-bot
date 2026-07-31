@@ -9,15 +9,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const (
-	currentEnvSchemaVersion = 5
-	bytesPerMiB             = int64(1024 * 1024)
-	maxStorageMiB           = int64(^uint64(0)>>1) / bytesPerMiB
-	// maxRetentionDays is the largest whole-day window representable by time.Duration.
-	maxRetentionDays = int((1<<63 - 1) / (24 * time.Hour))
+	currentEnvSchemaVersion       = 7
+	stateDatabaseEnvSchemaVersion = 7
+	bytesPerMiB                   = int64(1024 * 1024)
+	maxStorageMiB                 = int64(^uint64(0)>>1) / bytesPerMiB
 )
 
 type Config struct {
@@ -29,25 +27,17 @@ type Config struct {
 	OBSHost            string
 	OBSPort            int
 	OBSPassword        string
-	OBSMediaSourceName string
 	OBSLoopSourceName  string
 	OBSMusicSourceName string
-	OBSFallbackFile    string
-	FallbackMode       string
 
-	DataDir                   string
-	MediaDir                  string
-	LoopMediaDir              string
-	MusicMediaDir             string
-	DatabasePath              string
-	PlayerMode                string
-	MaxVideoSizeBytes         int64
-	MaxVideoDurationSeconds   int
-	MinFreeDiskBytes          int64
-	MaxQueueLength            int
-	RetentionDays             int
-	RetentionMaxFiles         int
-	RetentionDeleteLocalFiles bool
+	DataDir                 string
+	MediaDir                string
+	LoopMediaDir            string
+	MusicMediaDir           string
+	DatabasePath            string
+	MaxVideoSizeBytes       int64
+	MaxVideoDurationSeconds int
+	MinFreeDiskBytes        int64
 
 	FFProbePath string
 	LogLevel    slog.Level
@@ -55,6 +45,14 @@ type Config struct {
 
 func Load() (Config, error) {
 	_ = loadDotEnv(".env")
+
+	if err := validateLegacyPlayerMode(os.Getenv("PLAYER_MODE")); err != nil {
+		return Config{}, err
+	}
+	databaseName, err := defaultDatabaseName(os.Getenv("ENV_SCHEMA_VERSION"))
+	if err != nil {
+		return Config{}, err
+	}
 
 	allowedChatID, err := getenvInt64("ALLOWED_CHAT_ID", 0)
 	if err != nil {
@@ -76,22 +74,6 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	maxQueueLength, err := getenvInt("MAX_QUEUE_LENGTH", 50)
-	if err != nil {
-		return Config{}, err
-	}
-	retentionDays, err := getenvInt("RETENTION_DAYS", 7)
-	if err != nil {
-		return Config{}, err
-	}
-	retentionMaxFiles, err := getenvInt("RETENTION_MAX_FILES", 100)
-	if err != nil {
-		return Config{}, err
-	}
-	retentionDeleteLocalFiles, err := getenvBool("RETENTION_DELETE_LOCAL_FILES", false)
-	if err != nil {
-		return Config{}, err
-	}
 	if maxVideoSizeMB <= 0 {
 		return Config{}, errors.New("MAX_VIDEO_SIZE_MB must be positive")
 	}
@@ -106,34 +88,29 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		TelegramBotToken:          strings.TrimSpace(getenv("TELEGRAM_BOT_TOKEN", "")),
-		TelegramAPIBaseURL:        strings.TrimRight(strings.TrimSpace(getenv("TELEGRAM_API_BASE_URL", "")), "/"),
-		TelegramBotAPIDir:         strings.TrimSpace(getenv("TELEGRAM_BOT_API_DIR", "./data/telegram-bot-api")),
-		AllowedChatID:             allowedChatID,
-		OBSHost:                   strings.TrimSpace(getenv("OBS_HOST", "127.0.0.1")),
-		OBSPort:                   obsPort,
-		OBSPassword:               getenv("OBS_PASSWORD", ""),
-		OBSMediaSourceName:        strings.TrimSpace(getenv("OBS_MEDIA_SOURCE_NAME", "tg_queue_player")),
-		OBSLoopSourceName:         strings.TrimSpace(getenv("OBS_LOOP_SOURCE_NAME", "tg_loop_player")),
-		OBSMusicSourceName:        strings.TrimSpace(getenv("OBS_MUSIC_SOURCE_NAME", "tg_music_player")),
-		OBSFallbackFile:           strings.TrimSpace(getenv("OBS_FALLBACK_FILE", "")),
-		FallbackMode:              strings.TrimSpace(getenv("FALLBACK_MODE", "random_played")),
-		PlayerMode:                strings.TrimSpace(getenv("PLAYER_MODE", "library")),
-		DataDir:                   strings.TrimSpace(getenv("DATA_DIR", "./data")),
-		MaxVideoSizeBytes:         maxVideoSizeMB * bytesPerMiB,
-		MaxVideoDurationSeconds:   maxVideoDurationSeconds,
-		MinFreeDiskBytes:          minFreeDiskMB * bytesPerMiB,
-		MaxQueueLength:            maxQueueLength,
-		RetentionDays:             retentionDays,
-		RetentionMaxFiles:         retentionMaxFiles,
-		RetentionDeleteLocalFiles: retentionDeleteLocalFiles,
-		FFProbePath:               strings.TrimSpace(getenv("FFPROBE_PATH", "ffprobe")),
-		LogLevel:                  parseLogLevel(strings.TrimSpace(getenv("LOG_LEVEL", "info"))),
+		TelegramBotToken:        strings.TrimSpace(getenv("TELEGRAM_BOT_TOKEN", "")),
+		TelegramAPIBaseURL:      strings.TrimRight(strings.TrimSpace(getenv("TELEGRAM_API_BASE_URL", "")), "/"),
+		TelegramBotAPIDir:       strings.TrimSpace(getenv("TELEGRAM_BOT_API_DIR", "./data/telegram-bot-api")),
+		AllowedChatID:           allowedChatID,
+		OBSHost:                 strings.TrimSpace(getenv("OBS_HOST", "127.0.0.1")),
+		OBSPort:                 obsPort,
+		OBSPassword:             getenv("OBS_PASSWORD", ""),
+		OBSLoopSourceName:       strings.TrimSpace(getenv("OBS_LOOP_SOURCE_NAME", "tg_loop_player")),
+		OBSMusicSourceName:      strings.TrimSpace(getenv("OBS_MUSIC_SOURCE_NAME", "tg_music_player")),
+		DataDir:                 strings.TrimSpace(getenv("DATA_DIR", "./data")),
+		MaxVideoSizeBytes:       maxVideoSizeMB * bytesPerMiB,
+		MaxVideoDurationSeconds: maxVideoDurationSeconds,
+		MinFreeDiskBytes:        minFreeDiskMB * bytesPerMiB,
+		FFProbePath:             strings.TrimSpace(getenv("FFPROBE_PATH", "ffprobe")),
+		LogLevel:                parseLogLevel(strings.TrimSpace(getenv("LOG_LEVEL", "info"))),
 	}
 	cfg.MediaDir = strings.TrimSpace(getenv("MEDIA_DIR", filepath.Join(cfg.DataDir, "media")))
 	cfg.LoopMediaDir = strings.TrimSpace(getenv("LOOP_MEDIA_DIR", filepath.Join(cfg.MediaDir, "loops")))
 	cfg.MusicMediaDir = strings.TrimSpace(getenv("MUSIC_MEDIA_DIR", filepath.Join(cfg.MediaDir, "music")))
-	cfg.DatabasePath = strings.TrimSpace(getenv("DATABASE_PATH", filepath.Join(cfg.DataDir, "queue.db")))
+	cfg.DatabasePath = strings.TrimSpace(os.Getenv("DATABASE_PATH"))
+	if cfg.DatabasePath == "" {
+		cfg.DatabasePath = filepath.Join(cfg.DataDir, databaseName)
+	}
 
 	if cfg.TelegramBotToken == "" {
 		return cfg, errors.New("TELEGRAM_BOT_TOKEN is required")
@@ -153,38 +130,63 @@ func Load() (Config, error) {
 	if cfg.OBSPort < 1 || cfg.OBSPort > 65535 {
 		return cfg, errors.New("OBS_PORT must be between 1 and 65535")
 	}
-	if cfg.OBSMediaSourceName == "" {
-		return cfg, errors.New("OBS_MEDIA_SOURCE_NAME is required")
-	}
 	if cfg.OBSLoopSourceName == "" {
 		return cfg, errors.New("OBS_LOOP_SOURCE_NAME is required")
 	}
 	if cfg.OBSMusicSourceName == "" {
 		return cfg, errors.New("OBS_MUSIC_SOURCE_NAME is required")
 	}
-	if !validFallbackMode(cfg.FallbackMode) {
-		return cfg, fmt.Errorf("FALLBACK_MODE must be one of random_played, file, off")
-	}
-	if !validPlayerMode(cfg.PlayerMode) {
-		return cfg, fmt.Errorf("PLAYER_MODE must be one of library, queue")
+	if cfg.OBSLoopSourceName == cfg.OBSMusicSourceName {
+		return cfg, errors.New("OBS_LOOP_SOURCE_NAME and OBS_MUSIC_SOURCE_NAME must be different")
 	}
 	if cfg.MaxVideoDurationSeconds < 0 {
 		return cfg, errors.New("MAX_VIDEO_DURATION_SECONDS must be non-negative")
 	}
-	if cfg.MaxQueueLength <= 0 {
-		return cfg, errors.New("MAX_QUEUE_LENGTH must be positive")
-	}
-	if cfg.RetentionDays < 0 {
-		return cfg, errors.New("RETENTION_DAYS must be non-negative")
-	}
-	if cfg.RetentionDays > maxRetentionDays {
-		return cfg, fmt.Errorf("RETENTION_DAYS must be at most %d", maxRetentionDays)
-	}
-	if cfg.RetentionMaxFiles < 0 {
-		return cfg, errors.New("RETENTION_MAX_FILES must be non-negative")
-	}
-
 	return cfg, nil
+}
+
+func validateLegacyPlayerMode(raw string) error {
+	switch mode := strings.TrimSpace(raw); mode {
+	case "", "library":
+		return nil
+	case "queue":
+		return errors.New("PLAYER_MODE=queue is no longer supported; configure distinct OBS_LOOP_SOURCE_NAME and OBS_MUSIC_SOURCE_NAME sources, add library media, then set PLAYER_MODE=library or remove PLAYER_MODE")
+	default:
+		return fmt.Errorf("PLAYER_MODE is deprecated; remove it or set PLAYER_MODE=library (got %q)", mode)
+	}
+}
+
+func defaultDatabaseName(rawSchemaVersion string) (string, error) {
+	rawSchemaVersion = strings.TrimSpace(rawSchemaVersion)
+	if rawSchemaVersion == "" {
+		// Configs without a schema marker predate the state.db default. Keep the
+		// historical path unless migration pins it explicitly.
+		return "queue.db", nil
+	}
+	digits := rawSchemaVersion
+	if strings.HasPrefix(digits, "-") {
+		digits = strings.TrimPrefix(digits, "-")
+	}
+	if digits == "" || strings.IndexFunc(digits, func(r rune) bool {
+		return r < '0' || r > '9'
+	}) >= 0 {
+		return "", errors.New("ENV_SCHEMA_VERSION must be an integer")
+	}
+	version, err := strconv.Atoi(rawSchemaVersion)
+	if err != nil {
+		return "", errors.New("ENV_SCHEMA_VERSION must be an integer")
+	}
+	if version > currentEnvSchemaVersion {
+		return "", fmt.Errorf(
+			"ENV_SCHEMA_VERSION %d is newer than this binary supports (%d)",
+			version,
+			currentEnvSchemaVersion,
+		)
+	}
+	if version < stateDatabaseEnvSchemaVersion {
+		return "queue.db", nil
+	}
+	return "state.db", nil
 }
 
 func validateHTTPURL(key, raw string) error {
@@ -201,198 +203,12 @@ func validateHTTPURL(key, raw string) error {
 	return nil
 }
 
-func migrateDotEnv(path string) error {
-	body, err := readPrivateDotEnv(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
+func decodeDotEnvValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+		return strings.ReplaceAll(value[1:len(value)-1], "'\\''", "'")
 	}
-
-	values := parseDotEnv(body)
-	version := 0
-	if rawVersion, ok := values["ENV_SCHEMA_VERSION"]; ok {
-		parsed, err := strconv.Atoi(strings.TrimSpace(rawVersion))
-		if err != nil {
-			return fmt.Errorf("ENV_SCHEMA_VERSION must be an integer")
-		}
-		version = parsed
-	}
-	if version > currentEnvSchemaVersion {
-		return fmt.Errorf("ENV_SCHEMA_VERSION %d is newer than this binary supports (%d)", version, currentEnvSchemaVersion)
-	}
-	if version == currentEnvSchemaVersion {
-		return nil
-	}
-
-	updatedBody := append([]byte(nil), body...)
-	if _, ok := values["ENV_SCHEMA_VERSION"]; ok {
-		updatedBody = setDotEnvValue(updatedBody, "ENV_SCHEMA_VERSION", strconv.Itoa(currentEnvSchemaVersion))
-		values["ENV_SCHEMA_VERSION"] = strconv.Itoa(currentEnvSchemaVersion)
-	}
-	additions := envMigrationAdditions(version, values)
-	if len(additions) == 0 && string(updatedBody) == string(body) {
-		return nil
-	}
-
-	backupPath := fmt.Sprintf("%s.backup.%d", path, time.Now().Unix())
-	if err := os.WriteFile(backupPath, body, 0o600); err != nil {
-		return fmt.Errorf("backup .env: %w", err)
-	}
-
-	updated := updatedBody
-	if len(updated) > 0 && updated[len(updated)-1] != '\n' {
-		updated = append(updated, '\n')
-	}
-	if len(additions) > 0 {
-		updated = append(updated, "\n# Added automatically by tg-obs-bot env migration.\n"...)
-		for _, addition := range additions {
-			updated = append(updated, addition...)
-			updated = append(updated, '\n')
-		}
-	}
-	if err := os.WriteFile(path, updated, 0o600); err != nil {
-		return fmt.Errorf("write migrated .env: %w", err)
-	}
-	return nil
-}
-
-func setDotEnvValue(body []byte, key string, value string) []byte {
-	lines := strings.Split(string(body), "\n")
-	for idx, rawLine := range lines {
-		line := strings.TrimSpace(rawLine)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		rawKey, _, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(rawKey) != key {
-			continue
-		}
-		lines[idx] = key + "=" + value
-		return []byte(strings.Join(lines, "\n"))
-	}
-	return body
-}
-
-func envMigrationAdditions(version int, values map[string]string) []string {
-	var additions []string
-	if version < 1 {
-		if _, ok := values["ENV_SCHEMA_VERSION"]; !ok {
-			additions = append(additions, fmt.Sprintf("ENV_SCHEMA_VERSION=%d", currentEnvSchemaVersion))
-		}
-		if _, ok := values["TELEGRAM_API_BASE_URL"]; !ok {
-			additions = append(additions, "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081")
-		}
-		if _, ok := values["MAX_VIDEO_SIZE_MB"]; !ok {
-			additions = append(additions, "MAX_VIDEO_SIZE_MB=2000")
-		}
-	}
-	if version < 2 {
-		if _, ok := values["TELEGRAM_API_ID"]; !ok {
-			additions = append(additions, "TELEGRAM_API_ID=replace-with-telegram-api-id")
-		}
-		if _, ok := values["TELEGRAM_API_HASH"]; !ok {
-			additions = append(additions, "TELEGRAM_API_HASH=replace-with-telegram-api-hash")
-		}
-		if _, ok := values["TELEGRAM_BOT_API_BIN"]; !ok {
-			additions = append(additions, "TELEGRAM_BOT_API_BIN=telegram-bot-api")
-		}
-		if _, ok := values["TELEGRAM_BOT_API_HOST"]; !ok {
-			additions = append(additions, "TELEGRAM_BOT_API_HOST=127.0.0.1")
-		}
-		if _, ok := values["TELEGRAM_BOT_API_PORT"]; !ok {
-			additions = append(additions, "TELEGRAM_BOT_API_PORT=8081")
-		}
-		if _, ok := values["TELEGRAM_BOT_API_DIR"]; !ok {
-			additions = append(additions, "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api")
-		}
-	}
-	if version < 3 {
-		if _, ok := values["RETENTION_DELETE_LOCAL_FILES"]; !ok {
-			additions = append(additions, "RETENTION_DELETE_LOCAL_FILES=false")
-		}
-	}
-	if version < 4 {
-		if _, ok := values["PLAYER_MODE"]; !ok {
-			additions = append(additions, "PLAYER_MODE=library")
-		}
-		if _, ok := values["OBS_LOOP_SOURCE_NAME"]; !ok {
-			additions = append(additions, "OBS_LOOP_SOURCE_NAME=tg_loop_player")
-		}
-		if _, ok := values["OBS_MUSIC_SOURCE_NAME"]; !ok {
-			additions = append(additions, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
-		}
-		mediaDir := libraryMediaDirDefault(values)
-		if _, ok := values["LOOP_MEDIA_DIR"]; !ok {
-			additions = append(additions, "LOOP_MEDIA_DIR="+joinEnvPath(mediaDir, "loops"))
-		}
-		if _, ok := values["MUSIC_MEDIA_DIR"]; !ok {
-			additions = append(additions, "MUSIC_MEDIA_DIR="+joinEnvPath(mediaDir, "music"))
-		}
-	}
-	if version < 5 {
-		if _, ok := values["MIN_FREE_DISK_MB"]; !ok {
-			additions = append(additions, "MIN_FREE_DISK_MB=512")
-		}
-	}
-	return additions
-}
-
-func libraryMediaDirDefault(values map[string]string) string {
-	if mediaDir := strings.TrimSpace(values["MEDIA_DIR"]); mediaDir != "" {
-		return mediaDir
-	}
-	if dataDir := strings.TrimSpace(values["DATA_DIR"]); dataDir != "" {
-		return joinEnvPath(dataDir, "media")
-	}
-	return "./data/media"
-}
-
-func joinEnvPath(base string, elem string) string {
-	base = strings.TrimRight(strings.TrimSpace(base), `/\`)
-	if base == "" {
-		return "/" + elem
-	}
-	return base + "/" + elem
-}
-
-func parseDotEnv(body []byte) map[string]string {
-	values := make(map[string]string)
-	for _, rawLine := range strings.Split(string(body), "\n") {
-		line := strings.TrimSpace(rawLine)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		value = strings.Trim(strings.TrimSpace(value), `"'`)
-		if key != "" {
-			values[key] = value
-		}
-	}
-	return values
-}
-
-func validFallbackMode(mode string) bool {
-	switch mode {
-	case "random_played", "file", "off":
-		return true
-	default:
-		return false
-	}
-}
-
-func validPlayerMode(mode string) bool {
-	switch mode {
-	case "library", "queue":
-		return true
-	default:
-		return false
-	}
+	return strings.Trim(value, `"'`)
 }
 
 func loadDotEnv(path string) error {
@@ -410,7 +226,7 @@ func loadDotEnv(path string) error {
 			continue
 		}
 		key = strings.TrimSpace(key)
-		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		value = decodeDotEnvValue(value)
 		if key != "" && os.Getenv(key) == "" {
 			_ = os.Setenv(key, value)
 		}
@@ -456,18 +272,6 @@ func getenvInt64(key string, fallback int64) (int64, error) {
 	return parsed, nil
 }
 
-func getenvBool(key string, fallback bool) (bool, error) {
-	value := os.Getenv(key)
-	if value == "" {
-		return fallback, nil
-	}
-	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
-	if err != nil {
-		return false, fmt.Errorf("%s must be a boolean", key)
-	}
-	return parsed, nil
-}
-
 func parseLogLevel(raw string) slog.Level {
 	switch strings.ToLower(raw) {
 	case "debug":
@@ -487,11 +291,4 @@ func (c Config) OBSURL() string {
 
 func (c Config) SensitiveValues() []string {
 	return []string{c.TelegramBotToken, c.OBSPassword}
-}
-
-func (c Config) RetentionMaxAge() time.Duration {
-	if c.RetentionDays <= 0 {
-		return 0
-	}
-	return time.Duration(c.RetentionDays) * 24 * time.Hour
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -18,8 +19,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/tiwb/tg-obs-bot/internal/journalstore"
 	"github.com/tiwb/tg-obs-bot/internal/liveness"
-	"github.com/tiwb/tg-obs-bot/internal/queue"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -34,7 +35,7 @@ func TestAdminCreatorAuthorized(t *testing.T) {
 	}
 	svc := newTestService(t, bot)
 
-	response, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
+	response, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip loop"))
 	if err != nil {
 		t.Fatalf("handle command: %v", err)
 	}
@@ -51,7 +52,7 @@ func TestAdminAdministratorAuthorized(t *testing.T) {
 	}
 	svc := newTestService(t, bot)
 
-	response, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
+	response, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip loop"))
 	if err != nil {
 		t.Fatalf("handle command: %v", err)
 	}
@@ -68,7 +69,7 @@ func TestAdminRegularMemberRejected(t *testing.T) {
 	}
 	svc := newTestService(t, bot)
 
-	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
+	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip loop"))
 	if !errors.Is(err, errAdminOnly) {
 		t.Fatalf("err = %v, want %v", err, errAdminOnly)
 	}
@@ -84,16 +85,13 @@ func TestReadOnlyAdminCheckHonorsNegativeCache(t *testing.T) {
 		},
 	}
 	svc := newTestService(t, bot)
-	svc.hooks.ListQueue = func(context.Context) (string, error) {
-		return "queue", nil
-	}
 
 	for i := 0; i < 2; i++ {
-		response, err := svc.handleCommand(context.Background(), commandMessage(42, "/queue"))
+		response, err := svc.handleCommand(context.Background(), commandMessage(42, "/library"))
 		if err != nil {
-			t.Fatalf("queue command %d: %v", i+1, err)
+			t.Fatalf("library command %d: %v", i+1, err)
 		}
-		assertNoButton(t, response.markup, "Skip")
+		assertNoButton(t, response.markup, "略過循環")
 	}
 	if bot.adminCallCount != 1 {
 		t.Fatalf("admin API calls = %d, want 1", bot.adminCallCount)
@@ -108,14 +106,11 @@ func TestMutationFreshAdminLookupAllowsPromotionAndUpdatesCache(t *testing.T) {
 		},
 	}
 	svc := newTestService(t, bot)
-	svc.hooks.ListQueue = func(context.Context) (string, error) {
-		return "queue", nil
-	}
 
-	if _, err := svc.handleCommand(context.Background(), commandMessage(42, "/queue")); err != nil {
+	if _, err := svc.handleCommand(context.Background(), commandMessage(42, "/library")); err != nil {
 		t.Fatalf("prime negative cache: %v", err)
 	}
-	response, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
+	response, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip loop"))
 	if err != nil {
 		t.Fatalf("fresh mutation command: %v", err)
 	}
@@ -141,18 +136,15 @@ func TestMutationFreshAdminLookupDeniesRevocationAndUpdatesCache(t *testing.T) {
 		},
 	}
 	svc := newTestService(t, bot)
-	svc.hooks.ListQueue = func(context.Context) (string, error) {
-		return "queue", nil
-	}
-	svc.hooks.Skip = func(context.Context) (string, error) {
+	svc.hooks.SkipLoop = func(context.Context) (string, error) {
 		t.Fatal("skip hook should not be called after admin revocation")
 		return "", nil
 	}
 
-	if _, err := svc.handleCommand(context.Background(), commandMessage(42, "/queue")); err != nil {
+	if _, err := svc.handleCommand(context.Background(), commandMessage(42, "/library")); err != nil {
 		t.Fatalf("prime positive cache: %v", err)
 	}
-	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
+	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip loop"))
 	if !errors.Is(err, errAdminOnly) {
 		t.Fatalf("err = %v, want %v", err, errAdminOnly)
 	}
@@ -175,7 +167,7 @@ func TestAdminBotAdministratorIgnored(t *testing.T) {
 	}
 	svc := newTestService(t, bot)
 
-	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
+	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip loop"))
 	if !errors.Is(err, errAdminOnly) {
 		t.Fatalf("err = %v, want %v", err, errAdminOnly)
 	}
@@ -189,7 +181,7 @@ func TestAdminLookupErrorDenies(t *testing.T) {
 	}
 	svc := newTestService(t, bot)
 
-	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
+	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip loop"))
 	if !errors.Is(err, errAdminOnly) {
 		t.Fatalf("err = %v, want %v", err, errAdminOnly)
 	}
@@ -203,12 +195,12 @@ func TestMutationAdminLookupErrorDoesNotTrustStalePositiveCache(t *testing.T) {
 	}
 	svc := newTestService(t, bot)
 	cacheOnlyAdmin(svc, 42)
-	svc.hooks.Skip = func(context.Context) (string, error) {
+	svc.hooks.SkipLoop = func(context.Context) (string, error) {
 		t.Fatal("skip hook should not be called when fresh admin lookup fails")
 		return "", nil
 	}
 
-	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
+	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip loop"))
 	if !errors.Is(err, errAdminOnly) {
 		t.Fatalf("err = %v, want %v", err, errAdminOnly)
 	}
@@ -224,13 +216,13 @@ func TestMutationAdminLookupTimeoutFailsClosed(t *testing.T) {
 	svc := newTestService(t, bot)
 	cacheOnlyAdmin(svc, 42)
 	svc.adminLookupTimeout = 20 * time.Millisecond
-	svc.hooks.Skip = func(context.Context) (string, error) {
+	svc.hooks.SkipLoop = func(context.Context) (string, error) {
 		t.Fatal("skip hook should not be called when fresh admin lookup times out")
 		return "", nil
 	}
 
 	start := time.Now()
-	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip"))
+	_, err := svc.handleCommand(context.Background(), commandMessage(42, "/skip loop"))
 	if !errors.Is(err, errAdminOnly) {
 		t.Fatalf("err = %v, want %v", err, errAdminOnly)
 	}
@@ -242,67 +234,65 @@ func TestMutationAdminLookupTimeoutFailsClosed(t *testing.T) {
 	}
 }
 
-func TestQueueCommandIncludesPublicKeyboard(t *testing.T) {
-	bot := &fakeBotAPI{
-		adminResponses: []adminResponse{
-			{admins: []tgbotapi.ChatMember{}},
-			{admins: []tgbotapi.ChatMember{}},
-		},
-	}
+func TestRemovedQueueAndListCommandsUseUnknownCommandWithoutLibrarySideEffects(t *testing.T) {
+	bot := &fakeBotAPI{}
 	svc := newTestService(t, bot)
-	svc.hooks.ListQueue = func(context.Context) (string, error) {
-		return "queue", nil
+	calls := 0
+	svc.hooks.LibraryPage = func(_ context.Context, page int) (LibraryPageResult, error) {
+		calls++
+		return LibraryPageResult{Text: "媒體庫", Page: page, TotalPages: 1}, nil
 	}
 
-	response, err := svc.handleCommand(context.Background(), commandMessage(42, "/queue"))
-	if err != nil {
-		t.Fatalf("handle command: %v", err)
+	for _, command := range []string{"/queue", "/list ignored"} {
+		t.Run(command, func(t *testing.T) {
+			response, err := svc.handleCommand(context.Background(), commandMessage(42, command))
+			if err != nil {
+				t.Fatalf("handle command: %v", err)
+			}
+			if !strings.Contains(response.text, "我不認得這個指令") {
+				t.Fatalf("response = %q, want unknown command message", response.text)
+			}
+			assertButton(t, response.markup, "媒體庫", "library")
+		})
 	}
-	assertButton(t, response.markup, "Refresh", "queue")
-	assertButton(t, response.markup, "Now", "now")
-	assertNoButton(t, response.markup, "Skip")
+	if calls != 0 {
+		t.Fatalf("library page calls = %d, want 0", calls)
+	}
+	if bot.adminCallCount != 0 {
+		t.Fatalf("admin API calls = %d, want 0 for removed commands", bot.adminCallCount)
+	}
 }
 
-func TestQueueCommandIncludesAdminKeyboard(t *testing.T) {
-	bot := &fakeBotAPI{
-		adminResponses: []adminResponse{
-			{admins: []tgbotapi.ChatMember{chatMember(42, "administrator")}},
-		},
-	}
+func TestRemovedQueueCallbacksAreNoOpsWithoutAdminLookup(t *testing.T) {
+	bot := &fakeBotAPI{}
 	svc := newTestService(t, bot)
-	svc.hooks.ListQueue = func(context.Context) (string, error) {
-		return "目前佇列：\n#10 [第 2 位] song.mp4", nil
+	calls := 0
+	svc.hooks.LibraryPage = func(_ context.Context, page int) (LibraryPageResult, error) {
+		calls++
+		return LibraryPageResult{Text: "媒體庫", Page: page, TotalPages: 1}, nil
 	}
 
-	response, err := svc.handleCommand(context.Background(), commandMessage(42, "/queue"))
-	if err != nil {
-		t.Fatalf("handle command: %v", err)
+	for _, action := range []string{
+		"queue",
+		"list:legacy-argument",
+		"history",
+		"remove:1",
+		"move:1:2",
+		"skip",
+	} {
+		svc.handleCallback(context.Background(), callbackQuery(42, action))
 	}
-	assertButton(t, response.markup, "Skip", "skip")
-	assertButton(t, response.markup, "Remove #10", "remove:10")
-	assertButton(t, response.markup, "Up", "move:10:1")
-	assertButton(t, response.markup, "Down", "move:10:3")
-}
-
-func TestCallbackRefreshEditsMessage(t *testing.T) {
-	bot := &fakeBotAPI{
-		adminResponses: []adminResponse{
-			{admins: []tgbotapi.ChatMember{}},
-			{admins: []tgbotapi.ChatMember{}},
-		},
-	}
-	svc := newTestService(t, bot)
-	svc.hooks.ListQueue = func(context.Context) (string, error) {
-		return "queue refreshed", nil
-	}
-
-	svc.handleCallback(context.Background(), callbackQuery(42, "queue"))
-
-	if bot.editTextCount != 1 {
-		t.Fatalf("edit calls = %d, want 1", bot.editTextCount)
+	if bot.adminCallCount != 0 {
+		t.Fatalf("admin API calls = %d, want 0 for removed callbacks", bot.adminCallCount)
 	}
 	if bot.sendCount != 0 {
 		t.Fatalf("send calls = %d, want 0", bot.sendCount)
+	}
+	if bot.editTextCount != 0 {
+		t.Fatalf("edit calls = %d, want 0", bot.editTextCount)
+	}
+	if calls != 0 {
+		t.Fatalf("library page calls = %d, want 0", calls)
 	}
 }
 
@@ -314,8 +304,8 @@ func TestLibraryReadOnlyCommandsForNonAdmin(t *testing.T) {
 		},
 	}
 	svc := newTestService(t, bot)
-	svc.hooks.Library = func(context.Context) (string, error) {
-		return "媒體庫", nil
+	svc.hooks.LibraryPage = func(_ context.Context, page int) (LibraryPageResult, error) {
+		return LibraryPageResult{Text: "媒體庫", Page: page, TotalPages: 1}, nil
 	}
 	svc.hooks.Preview = func(context.Context) (string, error) {
 		return "預覽", nil
@@ -341,6 +331,176 @@ func TestLibraryReadOnlyCommandsForNonAdmin(t *testing.T) {
 	}
 	assertButton(t, response.markup, "媒體庫", "library")
 	assertNoButton(t, response.markup, "略過循環")
+}
+
+func TestLibraryPaginationUsesTypedMetadata(t *testing.T) {
+	svc := newTestService(t, &fakeBotAPI{})
+	cacheAdmin(svc, 42)
+	svc.hooks.LibraryPage = func(_ context.Context, page int) (LibraryPageResult, error) {
+		return LibraryPageResult{
+			Text:       "文案刻意包含假的頁面：99/100",
+			Page:       page,
+			TotalPages: 3,
+		}, nil
+	}
+
+	tests := []struct {
+		name       string
+		command    string
+		refresh    string
+		wantPrev   string
+		wantNext   string
+		noPrevNext string
+	}{
+		{name: "first", command: "/library", refresh: "library", wantNext: "library:2", noPrevNext: "上一頁"},
+		{name: "middle", command: "/library 2", refresh: "library:2", wantPrev: "library:1", wantNext: "library:3"},
+		{name: "last", command: "/library 3", refresh: "library:3", wantPrev: "library:2", noPrevNext: "下一頁"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response, err := svc.handleCommand(context.Background(), commandMessage(42, tt.command))
+			if err != nil {
+				t.Fatalf("handle command: %v", err)
+			}
+			assertButton(t, response.markup, "刷新", tt.refresh)
+			if tt.wantPrev != "" {
+				assertButton(t, response.markup, "上一頁", tt.wantPrev)
+			}
+			if tt.wantNext != "" {
+				assertButton(t, response.markup, "下一頁", tt.wantNext)
+			}
+			if tt.noPrevNext != "" {
+				assertNoButton(t, response.markup, tt.noPrevNext)
+			}
+		})
+	}
+}
+
+func TestLibraryPaginationCallbackRequestsTypedPage(t *testing.T) {
+	svc := newTestService(t, &fakeBotAPI{})
+	cacheAdmin(svc, 42)
+	requestedPage := 0
+	svc.hooks.LibraryPage = func(_ context.Context, page int) (LibraryPageResult, error) {
+		requestedPage = page
+		return LibraryPageResult{Text: "第二頁", Page: page, TotalPages: 4}, nil
+	}
+
+	response, err := svc.routeAction(context.Background(), testChatID, &tgbotapi.User{ID: 42}, "library:2")
+	if err != nil {
+		t.Fatalf("route action: %v", err)
+	}
+	if requestedPage != 2 {
+		t.Fatalf("requested page = %d, want 2", requestedPage)
+	}
+	assertButton(t, response.markup, "刷新", "library:2")
+	assertButton(t, response.markup, "上一頁", "library:1")
+	assertButton(t, response.markup, "下一頁", "library:3")
+}
+
+func TestLibraryPaginationStaleSecondPageCallbackAfterShrink(t *testing.T) {
+	bot := &fakeBotAPI{}
+	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
+
+	shrunk := false
+	svc.hooks.LibraryPage = func(_ context.Context, page int) (LibraryPageResult, error) {
+		totalPages := 2
+		if shrunk {
+			totalPages = 1
+		}
+		if page > totalPages {
+			return LibraryPageResult{}, testPublicError(
+				fmt.Sprintf("頁碼超出範圍；媒體庫目前共有 %d 頁。", totalPages),
+			)
+		}
+		return LibraryPageResult{
+			Text:       fmt.Sprintf("媒體庫第 %d 頁", page),
+			Page:       page,
+			TotalPages: totalPages,
+		}, nil
+	}
+
+	original, err := svc.routeAction(context.Background(), testChatID, &tgbotapi.User{ID: 42}, "library:2")
+	if err != nil {
+		t.Fatalf("open original page 2: %v", err)
+	}
+	assertButton(t, original.markup, "刷新", "library:2")
+	assertButton(t, original.markup, "上一頁", "library:1")
+	assertNoButton(t, original.markup, "下一頁")
+
+	shrunk = true
+	svc.handleCallback(context.Background(), callbackQuery(42, "library:2"))
+
+	const wantError = "頁碼超出範圍；媒體庫目前共有 1 頁。"
+	if bot.editTextCount != 1 {
+		t.Fatalf("edit calls = %d, want 1", bot.editTextCount)
+	}
+	if bot.sendCount != 0 {
+		t.Fatalf("send calls = %d, want 0", bot.sendCount)
+	}
+
+	var answer *tgbotapi.CallbackConfig
+	var edit *tgbotapi.EditMessageTextConfig
+	for _, request := range bot.requests {
+		switch request := request.(type) {
+		case tgbotapi.CallbackConfig:
+			captured := request
+			answer = &captured
+		case tgbotapi.EditMessageTextConfig:
+			captured := request
+			edit = &captured
+		}
+	}
+	if answer == nil || answer.Text != wantError {
+		t.Fatalf("callback answer = %#v, want %q", answer, wantError)
+	}
+	if edit == nil || edit.Text != wantError {
+		t.Fatalf("edited message = %#v, want %q", edit, wantError)
+	}
+	if edit.ReplyMarkup != nil {
+		t.Fatalf("stale callback edit generated pagination metadata: %#v", edit.ReplyMarkup)
+	}
+}
+
+func TestLibraryPaginationRejectsInvalidHookMetadata(t *testing.T) {
+	tests := []struct {
+		name   string
+		result LibraryPageResult
+	}{
+		{name: "empty text", result: LibraryPageResult{Page: 2, TotalPages: 3}},
+		{name: "zero page", result: LibraryPageResult{Text: "page", Page: 0, TotalPages: 3}},
+		{name: "zero total", result: LibraryPageResult{Text: "page", Page: 2, TotalPages: 0}},
+		{name: "page exceeds total", result: LibraryPageResult{Text: "page", Page: 4, TotalPages: 3}},
+		{name: "page mismatch", result: LibraryPageResult{Text: "page", Page: 1, TotalPages: 3}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newTestService(t, &fakeBotAPI{})
+			cacheAdmin(svc, 42)
+			svc.hooks.LibraryPage = func(context.Context, int) (LibraryPageResult, error) {
+				return tt.result, nil
+			}
+
+			_, err := svc.handleCommand(context.Background(), commandMessage(42, "/library 2"))
+			if err == nil || !strings.Contains(err.Error(), "library page") {
+				t.Fatalf("err = %v, want invalid library page metadata error", err)
+			}
+		})
+	}
+}
+
+func TestLibraryPageArgumentBoundaries(t *testing.T) {
+	svc := newTestService(t, &fakeBotAPI{})
+	cacheAdmin(svc, 42)
+
+	for _, command := range []string{"/library 0", "/library -1", "/library nope", "/library 1 2"} {
+		t.Run(command, func(t *testing.T) {
+			_, err := svc.handleCommand(context.Background(), commandMessage(42, command))
+			if !errors.Is(err, errBadCommand) {
+				t.Fatalf("err = %v, want bad command", err)
+			}
+		})
+	}
 }
 
 func TestAdminLibraryCommandsRouteArguments(t *testing.T) {
@@ -369,6 +529,7 @@ func TestAdminLibraryCommandsRouteArguments(t *testing.T) {
 	}{
 		{name: "scan", text: "/scan", want: "scan ok"},
 		{name: "theme", text: "/theme random", want: "theme random"},
+		{name: "multi-word theme", text: "/theme Cozy Cafe", want: "theme Cozy Cafe"},
 		{name: "select", text: "/select clear", want: "select clear"},
 		{name: "skip loop", text: "/skip loop", want: "loop skipped"},
 		{name: "skip music", text: "/skip music", want: "music skipped"},
@@ -383,6 +544,100 @@ func TestAdminLibraryCommandsRouteArguments(t *testing.T) {
 				t.Fatalf("response = %q, want %q", response.text, tt.want)
 			}
 		})
+	}
+}
+
+func TestThemeArgumentBoundsBeforeHook(t *testing.T) {
+	maxTheme := strings.Repeat("t", MaxThemeUTF8Bytes)
+	if got := utf8.RuneCountInString(maxTheme); got != MaxThemeRunes {
+		t.Fatalf("maximum fixture runes = %d, want %d", got, MaxThemeRunes)
+	}
+
+	entrypoints := []struct {
+		name   string
+		invoke func(*Service, string) (botResponse, error)
+	}{
+		{
+			name: "text command",
+			invoke: func(svc *Service, theme string) (botResponse, error) {
+				return svc.handleCommand(
+					context.Background(),
+					commandMessage(42, "/theme "+theme),
+				)
+			},
+		},
+		{
+			name: "callback action",
+			invoke: func(svc *Service, theme string) (botResponse, error) {
+				return svc.routeAction(
+					context.Background(),
+					testChatID,
+					&tgbotapi.User{ID: 42},
+					"theme:"+theme,
+				)
+			},
+		},
+	}
+
+	for _, entrypoint := range entrypoints {
+		t.Run(entrypoint.name+"/maximum accepted", func(t *testing.T) {
+			svc := newTestService(t, &fakeBotAPI{})
+			cacheAdmin(svc, 42)
+			calls := 0
+			svc.hooks.SetTheme = func(_ context.Context, theme string) (string, error) {
+				calls++
+				if theme != maxTheme {
+					t.Fatalf("hook theme length = %d bytes, want maximum fixture", len(theme))
+				}
+				return "theme " + theme, nil
+			}
+
+			response, err := entrypoint.invoke(svc, maxTheme)
+			if err != nil {
+				t.Fatalf("maximum theme: %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("hook calls = %d, want 1", calls)
+			}
+			if got := utf8.RuneCountInString(response.text); got > 4096 {
+				t.Fatalf("response runes = %d, want <= Telegram limit 4096", got)
+			}
+			if got := len(response.text); got > 4096 {
+				t.Fatalf("response UTF-8 bytes = %d, want conservative bound <= 4096", got)
+			}
+		})
+
+		overlongThemes := []struct {
+			name  string
+			theme string
+		}{
+			{
+				name:  "rune and byte limit",
+				theme: strings.Repeat("t", MaxThemeRunes+1),
+			},
+			{
+				name:  "UTF-8 byte limit",
+				theme: strings.Repeat("界", MaxThemeUTF8Bytes/len("界")+1),
+			},
+		}
+		for _, overlong := range overlongThemes {
+			t.Run(entrypoint.name+"/rejects "+overlong.name, func(t *testing.T) {
+				svc := newTestService(t, &fakeBotAPI{})
+				cacheAdmin(svc, 42)
+				svc.hooks.SetTheme = func(context.Context, string) (string, error) {
+					t.Fatal("oversized theme reached persistence hook")
+					return "", nil
+				}
+
+				_, err := entrypoint.invoke(svc, overlong.theme)
+				if !errors.Is(err, errBadCommand) {
+					t.Fatalf("error = %v, want bad command", err)
+				}
+				if got := friendlyError(err); !strings.Contains(got, "240") {
+					t.Fatalf("friendly error = %q, want explicit theme bound", got)
+				}
+			})
+		}
 	}
 }
 
@@ -418,8 +673,8 @@ func TestLibraryCommandBadArguments(t *testing.T) {
 
 	tests := []string{
 		"/theme",
-		"/theme random extra",
 		"/select",
+		"/skip",
 		"/skip track",
 	}
 	for _, text := range tests {
@@ -440,8 +695,8 @@ func TestLibraryCallbackRefreshEditsMessage(t *testing.T) {
 		},
 	}
 	svc := newTestService(t, bot)
-	svc.hooks.Library = func(context.Context) (string, error) {
-		return "library refreshed", nil
+	svc.hooks.LibraryPage = func(_ context.Context, page int) (LibraryPageResult, error) {
+		return LibraryPageResult{Text: "library refreshed", Page: page, TotalPages: 1}, nil
 	}
 
 	svc.handleCallback(context.Background(), callbackQuery(42, "library"))
@@ -525,8 +780,6 @@ func TestMutationCommandsAlwaysUseOneFreshAdminLookup(t *testing.T) {
 		"/theme random",
 		"/select clear",
 		"/skip loop",
-		"/remove 1",
-		"/move 1 2",
 	} {
 		t.Run(command, func(t *testing.T) {
 			bot := &fakeBotAPI{
@@ -554,8 +807,6 @@ func TestMutationCallbacksAlwaysUseOneFreshAdminLookup(t *testing.T) {
 		"theme:random",
 		"select:clear",
 		"skip:loop",
-		"remove:1",
-		"move:1:2",
 	} {
 		t.Run(action, func(t *testing.T) {
 			bot := &fakeBotAPI{
@@ -610,32 +861,6 @@ func TestHelpAndHomeMenuExposeLibraryControls(t *testing.T) {
 	assertButton(t, adminMenu, "略過音樂", "skip:music")
 }
 
-func TestQueueModeHelpAndHomeMenuExposeQueueControls(t *testing.T) {
-	publicHelp := helpTextForMode(false, false)
-	for _, want := range []string{"/queue", "/now", "/status", "/history"} {
-		if !strings.Contains(publicHelp, want) {
-			t.Fatalf("queue public help missing %q: %q", want, publicHelp)
-		}
-	}
-	for _, notWant := range []string{"/library", "/preview", "/theme"} {
-		if strings.Contains(publicHelp, notWant) {
-			t.Fatalf("queue public help unexpectedly includes %q: %q", notWant, publicHelp)
-		}
-	}
-	adminHelp := helpTextForMode(true, false)
-	for _, want := range []string{"/move <video_id> <position>", "/remove <video_id>", "/skip"} {
-		if !strings.Contains(adminHelp, want) {
-			t.Fatalf("queue admin help missing %q: %q", want, adminHelp)
-		}
-	}
-
-	menu := homeKeyboardForMode(true, false)
-	assertButton(t, menu, "Queue", "queue")
-	assertButton(t, menu, "History", "history")
-	assertButton(t, menu, "Skip", "skip")
-	assertNoButton(t, menu, "媒體庫")
-}
-
 func TestRegisterCommandsSetsPublicAndAdminScopes(t *testing.T) {
 	bot := &fakeBotAPI{}
 	svc := newTestService(t, bot)
@@ -660,49 +885,31 @@ func TestRegisterCommandsSetsPublicAndAdminScopes(t *testing.T) {
 	for _, command := range []string{"library", "scan", "preview", "theme", "select", "skip", "now", "status", "help"} {
 		assertCommand(t, adminCommands, command)
 	}
+	for _, command := range []string{"queue", "list", "history", "remove", "move"} {
+		assertNoCommand(t, adminCommands, command)
+	}
 }
 
-func TestQueueModeRegisterCommandsSetsQueueScopes(t *testing.T) {
+func TestRemovedQueueCommandsUseUnknownCommandResponse(t *testing.T) {
 	bot := &fakeBotAPI{}
 	svc := newTestService(t, bot)
-	svc.cfg.PlayerMode = "queue"
 
-	if err := svc.registerCommands(context.Background()); err != nil {
-		t.Fatalf("register commands: %v", err)
+	for _, command := range []string{"/history", "/remove 1", "/move 1 2"} {
+		t.Run(command, func(t *testing.T) {
+			response, err := svc.handleCommand(context.Background(), commandMessage(42, command))
+			if err != nil {
+				t.Fatalf("handle command: %v", err)
+			}
+			if !strings.Contains(response.text, "我不認得這個指令") {
+				t.Fatalf("response = %q, want unknown command message", response.text)
+			}
+			assertButton(t, response.markup, "媒體庫", "library")
+			assertNoButton(t, response.markup, "Queue")
+			assertNoButton(t, response.markup, "History")
+		})
 	}
-	publicCommands := bot.setCommands[0].Commands
-	for _, command := range []string{"queue", "now", "status", "history", "help"} {
-		assertCommand(t, publicCommands, command)
-	}
-	for _, command := range []string{"library", "preview", "theme", "select"} {
-		assertNoCommand(t, publicCommands, command)
-	}
-	adminCommands := bot.setCommands[1].Commands
-	assertCommand(t, adminCommands, "skip")
-}
-
-func TestQueueModeNowStatusHistoryUseQueueKeyboards(t *testing.T) {
-	bot := &fakeBotAPI{
-		adminResponses: []adminResponse{
-			{admins: []tgbotapi.ChatMember{chatMember(42, "administrator")}},
-			{admins: []tgbotapi.ChatMember{chatMember(42, "administrator")}},
-			{admins: []tgbotapi.ChatMember{chatMember(42, "administrator")}},
-		},
-	}
-	svc := newTestService(t, bot)
-	svc.cfg.PlayerMode = "queue"
-	svc.hooks.Now = func(context.Context) (string, error) { return "now", nil }
-	svc.hooks.Status = func(context.Context) (string, error) { return "status", nil }
-	svc.hooks.History = func(context.Context) (string, error) { return "history", nil }
-
-	for _, command := range []string{"/now", "/status", "/history"} {
-		response, err := svc.handleCommand(context.Background(), commandMessage(42, command))
-		if err != nil {
-			t.Fatalf("%s: %v", command, err)
-		}
-		assertButton(t, response.markup, "Queue", "queue")
-		assertNoButton(t, response.markup, "媒體庫")
-		assertNoButton(t, response.markup, "預覽")
+	if bot.adminCallCount != 0 {
+		t.Fatalf("admin API calls = %d, want 0 for removed commands", bot.adminCallCount)
 	}
 }
 
@@ -786,7 +993,7 @@ func TestNewRequiresUpdateJournal(t *testing.T) {
 }
 
 func TestMetadataForUpdateInfersOnlyCoarseActionAndTelegramIDs(t *testing.T) {
-	command := commandMessage(42, "/queue")
+	command := commandMessage(42, "/library")
 	command.MessageID = 91
 	tests := []struct {
 		name   string
@@ -798,7 +1005,7 @@ func TestMetadataForUpdateInfersOnlyCoarseActionAndTelegramIDs(t *testing.T) {
 			update: tgbotapi.Update{Message: command},
 			want: updateMetadata{
 				kind:      "message",
-				action:    "queue",
+				action:    "library",
 				chatID:    testChatID,
 				messageID: 91,
 				actorID:   42,
@@ -836,6 +1043,22 @@ func TestMetadataForUpdateInfersOnlyCoarseActionAndTelegramIDs(t *testing.T) {
 				chatID:    testChatID,
 				messageID: 93,
 				actorID:   44,
+			},
+		},
+		{
+			name: "audio upload",
+			update: tgbotapi.Update{Message: &tgbotapi.Message{
+				MessageID: 95,
+				Chat:      &tgbotapi.Chat{ID: testChatID},
+				From:      &tgbotapi.User{ID: 46},
+				Audio:     &tgbotapi.Audio{FileID: "file"},
+			}},
+			want: updateMetadata{
+				kind:      "message",
+				action:    "upload_audio",
+				chatID:    testChatID,
+				messageID: 95,
+				actorID:   46,
 			},
 		},
 		{
@@ -1127,8 +1350,8 @@ func TestGetFileCanceledContextDoesNotCallBot(t *testing.T) {
 	cacheAdmin(svc, 42)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
-		t.Fatal("enqueue hook should not be called")
+	svc.hooks.ImportUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("import hook should not be called")
 		return "", nil
 	}
 
@@ -1153,8 +1376,8 @@ func TestGetFileInFlightCanceledContextReturnsQuickly(t *testing.T) {
 	bot := &fakeBotAPI{fileBlock: block, fileStarted: started}
 	svc := newTestService(t, bot)
 	cacheAdmin(svc, 42)
-	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
-		t.Fatal("enqueue hook should not be called")
+	svc.hooks.ImportUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("import hook should not be called")
 		return "", nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1194,7 +1417,7 @@ func TestAdminCanceledContextDoesNotCallBotAndDeniesCommand(t *testing.T) {
 	cancel()
 
 	start := time.Now()
-	_, err := svc.handleCommand(ctx, commandMessage(42, "/skip"))
+	_, err := svc.handleCommand(ctx, commandMessage(42, "/skip loop"))
 
 	if !errors.Is(err, errAdminOnly) {
 		t.Fatalf("err = %v, want %v", err, errAdminOnly)
@@ -1218,7 +1441,7 @@ func TestAdminInFlightCanceledContextReturnsQuicklyAndDeniesCommand(t *testing.T
 	errCh := make(chan error, 1)
 
 	go func() {
-		_, err := svc.handleCommand(ctx, commandMessage(42, "/skip"))
+		_, err := svc.handleCommand(ctx, commandMessage(42, "/skip loop"))
 		errCh <- err
 	}()
 	<-started
@@ -1331,11 +1554,11 @@ func TestRunRetriesMalformedUpdateBatchBeforeJournalMutation(t *testing.T) {
 	bot := &fakeBotAPI{
 		updateResponses: []updateResponse{
 			{updates: []tgbotapi.Update{
-				{UpdateID: 10, Message: commandMessage(42, "/queue")},
-				{UpdateID: math.MaxInt, Message: commandMessage(42, "/queue")},
+				{UpdateID: 10, Message: commandMessage(42, "/library")},
+				{UpdateID: math.MaxInt, Message: commandMessage(42, "/library")},
 			}},
 			{updates: []tgbotapi.Update{
-				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: 10, Message: commandMessage(42, "/library")},
 			}},
 		},
 		updateCalls: make(chan struct{}, 3),
@@ -1420,7 +1643,7 @@ func TestRunLivenessAdvancesDuringCappedPollRetryOutage(t *testing.T) {
 		{id: liveness.WorkerOBSReconnect, owner: liveness.OwnerOBSReconnect},
 		{id: liveness.WorkerOBSEvents, owner: liveness.OwnerOBSEvents},
 		{id: liveness.WorkerMaintenance, owner: liveness.OwnerMaintenance},
-		{id: liveness.WorkerPlayback, owner: liveness.OwnerPlaybackWatchdog},
+		{id: liveness.WorkerPlayback, owner: liveness.OwnerLibraryScheduler},
 	} {
 		worker, err := registry.Bind(binding.id, binding.owner)
 		if err != nil {
@@ -1430,7 +1653,7 @@ func TestRunLivenessAdvancesDuringCappedPollRetryOutage(t *testing.T) {
 			tracker = worker
 		}
 	}
-	if err := registry.Seal(liveness.OwnerPlaybackWatchdog); err != nil {
+	if err := registry.Seal(); err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
 
@@ -1485,7 +1708,7 @@ func TestRunRestartsFromDurableOffsetAndConfirmsOnSuccessfulNextPoll(t *testing.
 	firstBot := &fakeBotAPI{
 		updateResponses: []updateResponse{
 			{updates: []tgbotapi.Update{
-				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: 10, Message: commandMessage(42, "/library")},
 			}},
 		},
 		updateCalls: make(chan struct{}, 2),
@@ -1554,7 +1777,7 @@ func TestRunRestartsFromDurableOffsetAndConfirmsOnSuccessfulNextPoll(t *testing.
 func TestRunRestartAcrossTelegramGapAbandonsOnlySafeOldAttempts(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "queue.db")
-	store, err := queue.Open(ctx, dbPath)
+	store, err := journalstore.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("open real update journal: %v", err)
 	}
@@ -1586,7 +1809,7 @@ INSERT INTO telegram_update_attempts (
 	update_id, update_kind, action, chat_id, message_id, actor_id,
 	attempt_count, failure_count, status, owner_token, lease_until,
 	last_error, created_at, updated_at, finished_at
-) VALUES (?, 'message', 'queue', ?, 1, 42, 1, 0, ?, ?, ?, ?, ?, ?, NULL)
+) VALUES (?, 'message', 'library', ?, 1, 42, 1, 0, ?, ?, ?, ?, ?, ?, NULL)
 `,
 			fixture.id,
 			testChatID,
@@ -1603,7 +1826,7 @@ INSERT INTO telegram_update_attempts (
 
 	firstBot := &fakeBotAPI{
 		updateResponses: []updateResponse{{updates: []tgbotapi.Update{
-			{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			{UpdateID: 10, Message: commandMessage(42, "/library")},
 		}}},
 		updateCalls: make(chan struct{}, 2),
 	}
@@ -1745,7 +1968,7 @@ func TestRunReplaysAfterTerminalJournalWriteFailureOnRestart(t *testing.T) {
 	firstBot := &fakeBotAPI{
 		updateResponses: []updateResponse{
 			{updates: []tgbotapi.Update{
-				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: 10, Message: commandMessage(42, "/library")},
 			}},
 		},
 	}
@@ -1772,7 +1995,7 @@ func TestRunReplaysAfterTerminalJournalWriteFailureOnRestart(t *testing.T) {
 	secondBot := &fakeBotAPI{
 		updateResponses: []updateResponse{
 			{updates: []tgbotapi.Update{
-				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: 10, Message: commandMessage(42, "/library")},
 			}},
 		},
 		updateCalls: make(chan struct{}, 2),
@@ -1814,7 +2037,7 @@ func TestRunQuarantinesPanickingHandlerAfterThreeRestarts(t *testing.T) {
 		bot := &fakeBotAPI{
 			updateResponses: []updateResponse{
 				{updates: []tgbotapi.Update{
-					{UpdateID: 10, Message: commandMessage(42, "/queue")},
+					{UpdateID: 10, Message: commandMessage(42, "/library")},
 				}},
 			},
 		}
@@ -1876,7 +2099,7 @@ func TestRunRecoversHandlerPanicWithoutAcknowledgingUpdate(t *testing.T) {
 	bot := &fakeBotAPI{
 		updateResponses: []updateResponse{
 			{updates: []tgbotapi.Update{
-				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: 10, Message: commandMessage(42, "/library")},
 			}},
 		},
 	}
@@ -1941,7 +2164,7 @@ func TestRunJournalFailuresAreFailClosedBeforeAcknowledgement(t *testing.T) {
 			bot := &fakeBotAPI{
 				updateResponses: []updateResponse{
 					{updates: []tgbotapi.Update{
-						{UpdateID: 10, Message: commandMessage(42, "/queue")},
+						{UpdateID: 10, Message: commandMessage(42, "/library")},
 					}},
 				},
 			}
@@ -2026,7 +2249,7 @@ func TestRunBoundsEveryPollingJournalOperation(t *testing.T) {
 			responses := []updateResponse{{}}
 			if tt.operation == "begin" || tt.operation == "complete" {
 				responses = []updateResponse{{updates: []tgbotapi.Update{
-					{UpdateID: 10, Message: commandMessage(42, "/queue")},
+					{UpdateID: 10, Message: commandMessage(42, "/library")},
 				}}}
 			}
 			bot := &fakeBotAPI{updateResponses: responses}
@@ -2065,7 +2288,7 @@ func TestRunCancellationAfterHandlerSuccessStillCommitsTerminalAttempt(t *testin
 	}
 	bot := &fakeBotAPI{
 		updateResponses: []updateResponse{{updates: []tgbotapi.Update{
-			{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			{UpdateID: 10, Message: commandMessage(42, "/library")},
 		}}},
 	}
 	svc := newTestServiceWithJournal(t, bot, journal)
@@ -2108,7 +2331,7 @@ func TestRunThreeCooperativeShutdownsDoNotPoisonUpdate(t *testing.T) {
 	for generation := 1; generation <= 3; generation++ {
 		bot := &fakeBotAPI{
 			updateResponses: []updateResponse{{updates: []tgbotapi.Update{
-				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: 10, Message: commandMessage(42, "/library")},
 			}}},
 		}
 		svc := newTestServiceWithJournal(t, bot, journal)
@@ -2159,14 +2382,13 @@ func TestRunAdvancesUpdateOffset(t *testing.T) {
 	bot := &fakeBotAPI{
 		updateResponses: []updateResponse{
 			{updates: []tgbotapi.Update{
-				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: 10, Message: commandMessage(42, "/library")},
 				{UpdateID: 11, Message: commandMessage(42, "/now")},
 			}},
 		},
 		updateCalls: make(chan struct{}, 2),
 	}
 	svc := newTestService(t, bot)
-	svc.hooks.ListQueue = func(context.Context) (string, error) { return "queue", nil }
 	svc.hooks.Now = func(context.Context) (string, error) { return "now", nil }
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2208,7 +2430,7 @@ func TestRunCooperativeUpdateTimeoutPreservesOrderAndNextOffsets(t *testing.T) {
 	bot := &fakeBotAPI{
 		updateResponses: []updateResponse{
 			{updates: []tgbotapi.Update{
-				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: 10, Message: commandMessage(42, "/library")},
 			}},
 			{updates: []tgbotapi.Update{
 				{UpdateID: 11, Message: commandMessage(42, "/now")},
@@ -2236,13 +2458,13 @@ func TestRunCooperativeUpdateTimeoutPreservesOrderAndNextOffsets(t *testing.T) {
 			activeHandlers.Add(-1)
 		}
 	}
-	svc.hooks.ListQueue = func(ctx context.Context) (string, error) {
+	svc.hooks.LibraryPage = func(ctx context.Context, page int) (LibraryPageResult, error) {
 		defer recordActive()()
 		events <- "first-start"
 		<-ctx.Done()
 		events <- "first-deadline"
 		<-releaseFirstHook
-		return "", ctx.Err()
+		return LibraryPageResult{}, ctx.Err()
 	}
 	svc.hooks.Now = func(context.Context) (string, error) {
 		defer recordActive()()
@@ -2326,7 +2548,7 @@ func TestRunStuckUpdateHandlerReturnsSentinelWithoutNextPoll(t *testing.T) {
 	bot := &fakeBotAPI{
 		updateResponses: []updateResponse{
 			{updates: []tgbotapi.Update{
-				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: 10, Message: commandMessage(42, "/library")},
 			}},
 			{updates: []tgbotapi.Update{
 				{UpdateID: 11, Message: commandMessage(42, "/now")},
@@ -2342,11 +2564,11 @@ func TestRunStuckUpdateHandlerReturnsSentinelWithoutNextPoll(t *testing.T) {
 	handlerStarted := make(chan struct{})
 	handlerDone := make(chan struct{})
 	releaseHandler := make(chan struct{})
-	svc.hooks.ListQueue = func(context.Context) (string, error) {
+	svc.hooks.LibraryPage = func(context.Context, int) (LibraryPageResult, error) {
 		close(handlerStarted)
 		defer close(handlerDone)
 		<-releaseHandler
-		return "", nil
+		return LibraryPageResult{Text: "library", Page: 1, TotalPages: 1}, nil
 	}
 	svc.hooks.Now = func(context.Context) (string, error) {
 		t.Error("second update handler must not run after a stuck handler")
@@ -2415,7 +2637,7 @@ func TestRunStuckHandlerConvergesToDeadAcrossProcessGenerations(t *testing.T) {
 		journal.mu.Unlock()
 		bot := &fakeBotAPI{
 			updateResponses: []updateResponse{{updates: []tgbotapi.Update{
-				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: 10, Message: commandMessage(42, "/library")},
 			}}},
 		}
 		svc := newTestServiceWithJournal(t, bot, journal)
@@ -2490,7 +2712,7 @@ func TestRunBusyAttemptDoesNotExecuteHandler(t *testing.T) {
 	journal := newFakeUpdateJournal()
 	journal.attempts[10] = &fakeJournalAttempt{
 		kind:         "message",
-		action:       "queue",
+		action:       "library",
 		attemptCount: 1,
 		status:       "running",
 		ownerToken:   "other-process",
@@ -2498,7 +2720,7 @@ func TestRunBusyAttemptDoesNotExecuteHandler(t *testing.T) {
 	}
 	bot := &fakeBotAPI{
 		updateResponses: []updateResponse{{updates: []tgbotapi.Update{
-			{UpdateID: 10, Message: commandMessage(42, "/queue")},
+			{UpdateID: 10, Message: commandMessage(42, "/library")},
 		}}},
 	}
 	svc := newTestServiceWithJournal(t, bot, journal)
@@ -2524,14 +2746,14 @@ func TestRunTerminalReplayRepairsCheckpointWithoutHandler(t *testing.T) {
 	journal := newFakeUpdateJournal()
 	journal.attempts[10] = &fakeJournalAttempt{
 		kind:         "message",
-		action:       "queue",
+		action:       "library",
 		attemptCount: 1,
 		status:       "done",
 	}
 	bot := &fakeBotAPI{
 		updateResponses: []updateResponse{
 			{updates: []tgbotapi.Update{
-				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: 10, Message: commandMessage(42, "/library")},
 			}},
 			{},
 		},
@@ -2572,7 +2794,7 @@ func TestRunParentCancellationWaitsOnlyForHandlerStopGrace(t *testing.T) {
 	bot := &fakeBotAPI{
 		updateResponses: []updateResponse{
 			{updates: []tgbotapi.Update{
-				{UpdateID: 10, Message: commandMessage(42, "/queue")},
+				{UpdateID: 10, Message: commandMessage(42, "/library")},
 			}},
 		},
 		updateCalls: make(chan struct{}, 1),
@@ -2585,11 +2807,11 @@ func TestRunParentCancellationWaitsOnlyForHandlerStopGrace(t *testing.T) {
 	handlerStarted := make(chan struct{})
 	handlerDone := make(chan struct{})
 	releaseHandler := make(chan struct{})
-	svc.hooks.ListQueue = func(context.Context) (string, error) {
+	svc.hooks.LibraryPage = func(context.Context, int) (LibraryPageResult, error) {
 		close(handlerStarted)
 		defer close(handlerDone)
 		<-releaseHandler
-		return "", nil
+		return LibraryPageResult{Text: "library", Page: 1, TotalPages: 1}, nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2631,17 +2853,16 @@ func TestRunSkipsStaleUpdates(t *testing.T) {
 	bot := &fakeBotAPI{
 		updateResponses: []updateResponse{
 			{updates: []tgbotapi.Update{
-				{UpdateID: 5, Message: commandMessage(42, "/queue")},
+				{UpdateID: 5, Message: commandMessage(42, "/library")},
 			}},
 			{updates: []tgbotapi.Update{
-				{UpdateID: 5, Message: commandMessage(42, "/queue")},
-				{UpdateID: 6, Message: commandMessage(42, "/queue")},
+				{UpdateID: 5, Message: commandMessage(42, "/library")},
+				{UpdateID: 6, Message: commandMessage(42, "/library")},
 			}},
 		},
 		updateCalls: make(chan struct{}, 3),
 	}
 	svc := newTestService(t, bot)
-	svc.hooks.ListQueue = func(context.Context) (string, error) { return "queue", nil }
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
@@ -2685,17 +2906,17 @@ func TestUploadUsesLocalBotAPIFilePath(t *testing.T) {
 	svc := newTestService(t, bot)
 	cacheAdmin(svc, 42)
 	var got Upload
-	svc.hooks.EnqueueUpload = func(_ context.Context, upload Upload) (string, error) {
+	svc.hooks.ImportUpload = func(_ context.Context, upload Upload) (string, error) {
 		got = upload
-		return "queued", nil
+		return "imported", nil
 	}
 
 	response, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 0))
 	if err != nil {
 		t.Fatalf("handle upload: %v", err)
 	}
-	if response.text != "queued" {
-		t.Fatalf("response = %q, want queued", response.text)
+	if response.text != "imported" {
+		t.Fatalf("response = %q, want imported", response.text)
 	}
 	if got.LocalPath != "/tmp/video.mp4" {
 		t.Fatalf("local path = %q, want /tmp/video.mp4", got.LocalPath)
@@ -2703,6 +2924,32 @@ func TestUploadUsesLocalBotAPIFilePath(t *testing.T) {
 	if got.SizeBytes != 42 {
 		t.Fatalf("size = %d, want 42", got.SizeBytes)
 	}
+}
+
+func TestUploadDefaultResponseAndKeyboardAreLibraryOnly(t *testing.T) {
+	bot := &fakeBotAPI{
+		file: tgbotapi.File{
+			FilePath: "/tmp/video.mp4",
+			FileSize: 42,
+		},
+	}
+	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
+	svc.hooks.ImportUpload = func(context.Context, Upload) (string, error) {
+		return "", nil
+	}
+
+	response, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 42))
+	if err != nil {
+		t.Fatalf("handle upload: %v", err)
+	}
+	if !strings.Contains(response.text, "已匯入媒體庫") {
+		t.Fatalf("response = %q, want library import wording", response.text)
+	}
+	assertButton(t, response.markup, "媒體庫", "library")
+	assertButton(t, response.markup, "預覽", "preview")
+	assertNoButton(t, response.markup, "Queue")
+	assertNoButton(t, response.markup, "History")
 }
 
 func TestUploadPreflightRejectionAvoidsGetFile(t *testing.T) {
@@ -2717,8 +2964,8 @@ func TestUploadPreflightRejectionAvoidsGetFile(t *testing.T) {
 		got = upload
 		return preflightErr
 	}
-	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
-		t.Fatal("enqueue hook should not be called")
+	svc.hooks.ImportUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("import hook should not be called")
 		return "", nil
 	}
 
@@ -2741,8 +2988,8 @@ func TestUploadMissingPreflightFailsClosedBeforeGetFile(t *testing.T) {
 	svc := newTestService(t, bot)
 	cacheAdmin(svc, 42)
 	svc.hooks.PreflightUpload = nil
-	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
-		t.Fatal("enqueue hook should not be called")
+	svc.hooks.ImportUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("import hook should not be called")
 		return "", nil
 	}
 
@@ -2750,6 +2997,32 @@ func TestUploadMissingPreflightFailsClosedBeforeGetFile(t *testing.T) {
 	var hookErr errHookNotConfigured
 	if !errors.As(err, &hookErr) || hookErr != "preflight upload" {
 		t.Fatalf("err = %v, want missing preflight hook", err)
+	}
+	if bot.fileCallCount != 0 {
+		t.Fatalf("getFile calls = %d, want 0", bot.fileCallCount)
+	}
+}
+
+func TestUploadMissingImportHookFailsClosedBeforePreflightOrGetFile(t *testing.T) {
+	bot := &fakeBotAPI{
+		file: tgbotapi.File{FilePath: "/tmp/video.mp4", FileSize: 1},
+	}
+	svc := newTestService(t, bot)
+	cacheAdmin(svc, 42)
+	svc.hooks.ImportUpload = nil
+	preflightCalls := 0
+	svc.hooks.PreflightUpload = func(context.Context, Upload) error {
+		preflightCalls++
+		return nil
+	}
+
+	_, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 1))
+	var hookErr errHookNotConfigured
+	if !errors.As(err, &hookErr) || hookErr != "import upload" {
+		t.Fatalf("err = %v, want missing import hook", err)
+	}
+	if preflightCalls != 0 {
+		t.Fatalf("preflight calls = %d, want 0", preflightCalls)
 	}
 	if bot.fileCallCount != 0 {
 		t.Fatalf("getFile calls = %d, want 0", bot.fileCallCount)
@@ -2769,8 +3042,8 @@ func TestUploadRequiresAdmin(t *testing.T) {
 		preflightCalls++
 		return nil
 	}
-	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
-		t.Fatal("enqueue hook should not be called")
+	svc.hooks.ImportUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("import hook should not be called")
 		return "", nil
 	}
 
@@ -2840,7 +3113,7 @@ func TestUploadAcceptsAudioAndVideoDocuments(t *testing.T) {
 			svc := newTestService(t, bot)
 			cacheAdmin(svc, 42)
 			var got Upload
-			svc.hooks.EnqueueUpload = func(_ context.Context, upload Upload) (string, error) {
+			svc.hooks.ImportUpload = func(_ context.Context, upload Upload) (string, error) {
 				got = upload
 				return "imported", nil
 			}
@@ -2878,7 +3151,7 @@ func TestHandleMessageRoutesAudioUploads(t *testing.T) {
 	svc := newTestService(t, bot)
 	cacheAdmin(svc, 42)
 	var got Upload
-	svc.hooks.EnqueueUpload = func(_ context.Context, upload Upload) (string, error) {
+	svc.hooks.ImportUpload = func(_ context.Context, upload Upload) (string, error) {
 		got = upload
 		return "imported", nil
 	}
@@ -2896,35 +3169,14 @@ func TestHandleMessageRoutesAudioUploads(t *testing.T) {
 	}
 }
 
-func TestQueueModeRejectsAudioUploadsBeforeGetFile(t *testing.T) {
-	bot := &fakeBotAPI{
-		file: tgbotapi.File{FilePath: "/tmp/music_lofi.mp3"},
-	}
-	svc := newTestService(t, bot)
-	svc.cfg.PlayerMode = "queue"
-	cacheAdmin(svc, 42)
-	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
-		t.Fatal("enqueue hook should not be called")
-		return "", nil
-	}
-
-	_, err := svc.handleUpload(context.Background(), audioMessage("file-id", "unique-id", "music_lofi.mp3", "audio/mpeg", 12))
-	if !errors.Is(err, errUnsupportedUpload) {
-		t.Fatalf("err = %v, want %v", err, errUnsupportedUpload)
-	}
-	if bot.fileCallCount != 0 {
-		t.Fatalf("getFile calls = %d, want 0", bot.fileCallCount)
-	}
-}
-
 func TestUploadRejectsUnsupportedDocumentsBeforeGetFile(t *testing.T) {
 	bot := &fakeBotAPI{
 		file: tgbotapi.File{FilePath: "/tmp/notes.pdf"},
 	}
 	svc := newTestService(t, bot)
 	cacheAdmin(svc, 42)
-	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
-		t.Fatal("enqueue hook should not be called")
+	svc.hooks.ImportUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("import hook should not be called")
 		return "", nil
 	}
 
@@ -2942,8 +3194,8 @@ func TestUploadReturnsGetFileError(t *testing.T) {
 	bot := &fakeBotAPI{fileErr: getFileErr}
 	svc := newTestService(t, bot)
 	cacheAdmin(svc, 42)
-	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
-		t.Fatal("enqueue hook should not be called")
+	svc.hooks.ImportUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("import hook should not be called")
 		return "", nil
 	}
 
@@ -2962,8 +3214,8 @@ func TestUploadRejectsDeclaredSizeOverLimit(t *testing.T) {
 	svc := newTestService(t, bot)
 	cacheAdmin(svc, 42)
 	svc.cfg.MaxUploadSizeBytes = 10
-	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
-		t.Fatal("enqueue hook should not be called")
+	svc.hooks.ImportUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("import hook should not be called")
 		return "", nil
 	}
 
@@ -2995,8 +3247,8 @@ func TestUploadRejectsGetFileSizeOverLimit(t *testing.T) {
 		}
 		return nil
 	}
-	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
-		t.Fatal("enqueue hook should not be called")
+	svc.hooks.ImportUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("import hook should not be called")
 		return "", nil
 	}
 
@@ -3023,8 +3275,8 @@ func TestUploadAcceptsSizeAtLimit(t *testing.T) {
 	svc := newTestService(t, bot)
 	cacheAdmin(svc, 42)
 	svc.cfg.MaxUploadSizeBytes = 10
-	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
-		return "queued", nil
+	svc.hooks.ImportUpload = func(context.Context, Upload) (string, error) {
+		return "imported", nil
 	}
 
 	response, err := svc.handleUpload(context.Background(), videoMessage("file-id", "unique-id", 10))
@@ -3032,8 +3284,8 @@ func TestUploadAcceptsSizeAtLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handle upload: %v", err)
 	}
-	if response.text != "queued" {
-		t.Fatalf("response = %q, want queued", response.text)
+	if response.text != "imported" {
+		t.Fatalf("response = %q, want imported", response.text)
 	}
 }
 
@@ -3043,8 +3295,8 @@ func TestUploadRejectsRelativeLocalBotAPIFilePath(t *testing.T) {
 	}
 	svc := newTestService(t, bot)
 	cacheAdmin(svc, 42)
-	svc.hooks.EnqueueUpload = func(context.Context, Upload) (string, error) {
-		t.Fatal("enqueue hook should not be called")
+	svc.hooks.ImportUpload = func(context.Context, Upload) (string, error) {
+		t.Fatal("import hook should not be called")
 		return "", nil
 	}
 
@@ -3096,7 +3348,10 @@ func newTestServiceWithJournal(t *testing.T, bot *fakeBotAPI, journal UpdateJour
 		PreflightUpload: func(ctx context.Context, _ Upload) error {
 			return ctx.Err()
 		},
-		Skip: func(context.Context) (string, error) {
+		LibraryPage: func(_ context.Context, page int) (LibraryPageResult, error) {
+			return LibraryPageResult{Text: "媒體庫", Page: page, TotalPages: page}, nil
+		},
+		SkipLoop: func(context.Context) (string, error) {
 			return "skipped", nil
 		},
 	}, slog.Default(), WithBotAPI(bot), WithUpdateJournal(journal))
@@ -3597,6 +3852,7 @@ type fakeBotAPI struct {
 	editTextCount    int
 	setCommandsCount int
 	setCommands      []tgbotapi.SetMyCommandsConfig
+	requests         []tgbotapi.Chattable
 	fileCallCount    int
 	file             tgbotapi.File
 	fileErr          error
@@ -3653,6 +3909,7 @@ func (f *fakeBotAPI) Send(ctx context.Context, _ tgbotapi.Chattable) (tgbotapi.M
 
 func (f *fakeBotAPI) Request(ctx context.Context, req tgbotapi.Chattable) (*tgbotapi.APIResponse, error) {
 	f.requestCount++
+	f.requests = append(f.requests, req)
 	if f.requestBlock != nil {
 		select {
 		case <-f.requestBlock:

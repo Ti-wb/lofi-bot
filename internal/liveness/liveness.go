@@ -17,7 +17,7 @@ import (
 
 const (
 	// RequiredWorkerCount is deliberately fixed. Supervised deployments use
-	// the same five-worker schema in both player modes.
+	// the same five-worker library-only schema.
 	RequiredWorkerCount = 5
 
 	// DefaultProgressInterval is short relative to the supervisor's stale
@@ -94,7 +94,6 @@ const (
 	OwnerOBSEvents
 	OwnerMaintenance
 	OwnerLibraryScheduler
-	OwnerPlaybackWatchdog
 )
 
 func (owner Owner) String() string {
@@ -109,15 +108,9 @@ func (owner Owner) String() string {
 		return "maintenance"
 	case OwnerLibraryScheduler:
 		return "library-scheduler"
-	case OwnerPlaybackWatchdog:
-		return "playback-watchdog"
 	default:
 		return "unknown"
 	}
-}
-
-func (owner Owner) validPlaybackOwner() bool {
-	return owner == OwnerLibraryScheduler || owner == OwnerPlaybackWatchdog
 }
 
 // Phase is a finite, low-cardinality description of what a worker loop is
@@ -260,11 +253,10 @@ func (r *Registry) Bind(id WorkerID, owner Owner) (*Worker, error) {
 	return &Worker{state: state, progressInterval: r.progressInterval}, nil
 }
 
-// Seal verifies the complete five-worker schema and the player-mode-specific
-// owner of the single logical playback slot.
-func (r *Registry) Seal(playbackOwner Owner) error {
-	if r == nil || !playbackOwner.validPlaybackOwner() {
-		return fmt.Errorf("%w: playback owner=%s", ErrInvalidBinding, playbackOwner)
+// Seal verifies the complete five-worker library-only schema.
+func (r *Registry) Seal() error {
+	if r == nil {
+		return fmt.Errorf("%w: nil registry", ErrInvalidBinding)
 	}
 
 	r.mu.Lock()
@@ -277,12 +269,12 @@ func (r *Registry) Seal(playbackOwner Owner) error {
 			return fmt.Errorf("%w: missing worker=%s", ErrIncompleteBinding, id)
 		}
 	}
-	if got := r.workers[WorkerPlayback].owner; got != playbackOwner {
+	if got := r.workers[WorkerPlayback].owner; got != OwnerLibraryScheduler {
 		return fmt.Errorf(
 			"%w: playback owner=%s want=%s",
 			ErrInvalidBinding,
 			got,
-			playbackOwner,
+			OwnerLibraryScheduler,
 		)
 	}
 	r.sealed = true
@@ -300,7 +292,7 @@ func validBinding(id WorkerID, owner Owner) bool {
 	case WorkerMaintenance:
 		return owner == OwnerMaintenance
 	case WorkerPlayback:
-		return owner.validPlaybackOwner()
+		return owner == OwnerLibraryScheduler
 	default:
 		return false
 	}

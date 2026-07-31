@@ -5,10 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestLoadReadsDotEnvAndDefaults(t *testing.T) {
@@ -26,12 +24,11 @@ func TestLoadReadsDotEnvAndDefaults(t *testing.T) {
 	}
 
 	body := []byte(`
-ENV_SCHEMA_VERSION=5
+ENV_SCHEMA_VERSION=7
 TELEGRAM_BOT_TOKEN=token
 TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
 ALLOWED_CHAT_ID=-1001
 DATA_DIR=./state
-OBS_MEDIA_SOURCE_NAME=player
 `)
 	if err := os.WriteFile(filepath.Join(dir, ".env"), body, 0o600); err != nil {
 		t.Fatalf("write env: %v", err)
@@ -53,14 +50,8 @@ OBS_MEDIA_SOURCE_NAME=player
 	if cfg.MediaDir != "state/media" && cfg.MediaDir != "state\\media" {
 		t.Fatalf("unexpected media dir: %q", cfg.MediaDir)
 	}
-	if cfg.DatabasePath != "state/queue.db" && cfg.DatabasePath != "state\\queue.db" {
+	if cfg.DatabasePath != "state/state.db" && cfg.DatabasePath != "state\\state.db" {
 		t.Fatalf("unexpected db path: %q", cfg.DatabasePath)
-	}
-	if cfg.FallbackMode != "random_played" {
-		t.Fatalf("unexpected fallback mode: %q", cfg.FallbackMode)
-	}
-	if cfg.PlayerMode != "library" {
-		t.Fatalf("unexpected player mode: %q", cfg.PlayerMode)
 	}
 	if cfg.OBSLoopSourceName != "tg_loop_player" {
 		t.Fatalf("unexpected loop source: %q", cfg.OBSLoopSourceName)
@@ -83,8 +74,104 @@ OBS_MEDIA_SOURCE_NAME=player
 	if cfg.MinFreeDiskBytes != 512*1024*1024 {
 		t.Fatalf("unexpected minimum free disk: %d", cfg.MinFreeDiskBytes)
 	}
-	if cfg.RetentionDeleteLocalFiles {
-		t.Fatalf("retention should keep local files by default")
+}
+
+func TestLoadDatabasePathFollowsSchemaCompatibility(t *testing.T) {
+	tests := []struct {
+		name         string
+		schema       string
+		databasePath string
+		want         string
+	}{
+		{
+			name:   "missing schema keeps legacy default",
+			schema: "",
+			want:   filepath.Join("runtime", "queue.db"),
+		},
+		{
+			name:   "schema six keeps legacy default",
+			schema: "6",
+			want:   filepath.Join("runtime", "queue.db"),
+		},
+		{
+			name:   "negative legacy schema keeps legacy default",
+			schema: "-1",
+			want:   filepath.Join("runtime", "queue.db"),
+		},
+		{
+			name:   "schema seven uses state default",
+			schema: "7",
+			want:   filepath.Join("runtime", "state.db"),
+		},
+		{
+			name:         "schema six preserves explicit path",
+			schema:       "6",
+			databasePath: "./custom/library.db",
+			want:         "./custom/library.db",
+		},
+		{
+			name:         "schema seven preserves explicit path",
+			schema:       "7",
+			databasePath: "./custom/library.db",
+			want:         "./custom/library.db",
+		},
+		{
+			name:         "schema six treats empty path as legacy default",
+			schema:       "6",
+			databasePath: "",
+			want:         filepath.Join("runtime", "queue.db"),
+		},
+		{
+			name:         "schema seven treats empty path as state default",
+			schema:       "7",
+			databasePath: "",
+			want:         filepath.Join("runtime", "state.db"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			chdirTemp(t)
+			setValidConfigEnv(t)
+			t.Setenv("ENV_SCHEMA_VERSION", test.schema)
+			t.Setenv("DATA_DIR", "./runtime")
+			t.Setenv("DATABASE_PATH", test.databasePath)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.DatabasePath != test.want {
+				t.Fatalf("DatabasePath = %q, want %q", cfg.DatabasePath, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidEnvSchemaBeforeChoosingDatabase(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		want   string
+	}{
+		{name: "malformed", schema: "surprise", want: "ENV_SCHEMA_VERSION must be an integer"},
+		{name: "leading plus", schema: "+7", want: "ENV_SCHEMA_VERSION must be an integer"},
+		{name: "future", schema: "8", want: "newer than this binary supports (7)"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			chdirTemp(t)
+			setValidConfigEnv(t)
+			t.Setenv("ENV_SCHEMA_VERSION", test.schema)
+
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err = %v, want error containing %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -144,45 +231,56 @@ func TestLoadRejectsInvalidTelegramAPIBaseURL(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsInvalidFallbackMode(t *testing.T) {
+func TestLoadRejectsLegacyQueueMode(t *testing.T) {
 	clearConfigEnv(t)
-	dir := t.TempDir()
-	oldwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("get wd: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = os.Chdir(oldwd)
-	})
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("chdir: %v", err)
-	}
+	chdirTemp(t)
+	setValidConfigEnv(t)
+	t.Setenv("PLAYER_MODE", "queue")
 
-	body := []byte(`
-ENV_SCHEMA_VERSION=5
-TELEGRAM_BOT_TOKEN=token
-TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
-ALLOWED_CHAT_ID=-1001
-FALLBACK_MODE=surprise
-`)
-	if err := os.WriteFile(filepath.Join(dir, ".env"), body, 0o600); err != nil {
-		t.Fatalf("write env: %v", err)
-	}
-
-	if _, err := Load(); err == nil {
-		t.Fatal("expected invalid fallback mode error")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "PLAYER_MODE=queue is no longer supported") ||
+		!strings.Contains(err.Error(), "OBS_LOOP_SOURCE_NAME") {
+		t.Fatalf("err = %v, want actionable legacy queue mode error", err)
 	}
 }
 
-func TestLoadRejectsInvalidPlayerMode(t *testing.T) {
+func TestLoadAcceptsLegacyLibraryMode(t *testing.T) {
+	clearConfigEnv(t)
+	chdirTemp(t)
+	setValidConfigEnv(t)
+	t.Setenv("PLAYER_MODE", "library")
+
+	if _, err := Load(); err != nil {
+		t.Fatalf("load compatibility config: %v", err)
+	}
+}
+
+func TestLoadRejectsUnknownLegacyPlayerMode(t *testing.T) {
 	clearConfigEnv(t)
 	chdirTemp(t)
 	setValidConfigEnv(t)
 	t.Setenv("PLAYER_MODE", "surprise")
 
 	_, err := Load()
-	if err == nil || !strings.Contains(err.Error(), "PLAYER_MODE must be one of library, queue") {
-		t.Fatalf("err = %v, want invalid player mode error", err)
+	if err == nil || !strings.Contains(err.Error(), "PLAYER_MODE is deprecated") {
+		t.Fatalf("err = %v, want deprecated player mode error", err)
+	}
+}
+
+func TestLoadIgnoresRemovedQueueOnlySettings(t *testing.T) {
+	clearConfigEnv(t)
+	chdirTemp(t)
+	setValidConfigEnv(t)
+	t.Setenv("OBS_MEDIA_SOURCE_NAME", "obsolete")
+	t.Setenv("OBS_FALLBACK_FILE", "/obsolete/fallback.mp4")
+	t.Setenv("FALLBACK_MODE", "surprise")
+	t.Setenv("MAX_QUEUE_LENGTH", "not-an-integer")
+	t.Setenv("RETENTION_DAYS", "not-an-integer")
+	t.Setenv("RETENTION_MAX_FILES", "not-an-integer")
+	t.Setenv("RETENTION_DELETE_LOCAL_FILES", "not-a-boolean")
+
+	if _, err := Load(); err != nil {
+		t.Fatalf("removed queue-only settings should be ignored: %v", err)
 	}
 }
 
@@ -193,9 +291,6 @@ func TestLoadRejectsMalformedNumericEnv(t *testing.T) {
 		"MAX_VIDEO_SIZE_MB",
 		"MAX_VIDEO_DURATION_SECONDS",
 		"MIN_FREE_DISK_MB",
-		"MAX_QUEUE_LENGTH",
-		"RETENTION_DAYS",
-		"RETENTION_MAX_FILES",
 	}
 
 	for _, key := range tests {
@@ -213,33 +308,6 @@ func TestLoadRejectsMalformedNumericEnv(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsMalformedBooleanEnv(t *testing.T) {
-	clearConfigEnv(t)
-	chdirTemp(t)
-	setValidConfigEnv(t)
-	t.Setenv("RETENTION_DELETE_LOCAL_FILES", "sometimes")
-
-	_, err := Load()
-	if err == nil || !strings.Contains(err.Error(), "RETENTION_DELETE_LOCAL_FILES must be a boolean") {
-		t.Fatalf("err = %v, want invalid boolean error", err)
-	}
-}
-
-func TestLoadReadsRetentionDeleteLocalFiles(t *testing.T) {
-	clearConfigEnv(t)
-	chdirTemp(t)
-	setValidConfigEnv(t)
-	t.Setenv("RETENTION_DELETE_LOCAL_FILES", "true")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	if !cfg.RetentionDeleteLocalFiles {
-		t.Fatal("retention delete local files should be enabled")
-	}
-}
-
 func TestLoadRejectsInvalidNumericRanges(t *testing.T) {
 	tests := []struct {
 		key     string
@@ -253,9 +321,6 @@ func TestLoadRejectsInvalidNumericRanges(t *testing.T) {
 		{key: "MAX_VIDEO_DURATION_SECONDS", value: "-1", wantErr: "MAX_VIDEO_DURATION_SECONDS must be non-negative"},
 		{key: "MIN_FREE_DISK_MB", value: "-1", wantErr: "MIN_FREE_DISK_MB must be non-negative"},
 		{key: "MIN_FREE_DISK_MB", value: "8796093022208", wantErr: "MIN_FREE_DISK_MB is too large"},
-		{key: "MAX_QUEUE_LENGTH", value: "0", wantErr: "MAX_QUEUE_LENGTH must be positive"},
-		{key: "RETENTION_DAYS", value: "-1", wantErr: "RETENTION_DAYS must be non-negative"},
-		{key: "RETENTION_MAX_FILES", value: "-1", wantErr: "RETENTION_MAX_FILES must be non-negative"},
 	}
 
 	for _, tt := range tests {
@@ -273,14 +338,12 @@ func TestLoadRejectsInvalidNumericRanges(t *testing.T) {
 	}
 }
 
-func TestLoadAllowsZeroDurationAndRetentionLimits(t *testing.T) {
+func TestLoadAllowsZeroDurationAndDiskReserve(t *testing.T) {
 	clearConfigEnv(t)
 	chdirTemp(t)
 	setValidConfigEnv(t)
 	t.Setenv("MAX_VIDEO_DURATION_SECONDS", "0")
 	t.Setenv("MIN_FREE_DISK_MB", "0")
-	t.Setenv("RETENTION_DAYS", "0")
-	t.Setenv("RETENTION_MAX_FILES", "0")
 
 	cfg, err := Load()
 	if err != nil {
@@ -292,51 +355,6 @@ func TestLoadAllowsZeroDurationAndRetentionLimits(t *testing.T) {
 	if cfg.MinFreeDiskBytes != 0 {
 		t.Fatalf("minimum free disk = %d, want 0", cfg.MinFreeDiskBytes)
 	}
-	if cfg.RetentionDays != 0 {
-		t.Fatalf("retention days = %d, want 0", cfg.RetentionDays)
-	}
-	if cfg.RetentionMaxFiles != 0 {
-		t.Fatalf("retention max files = %d, want 0", cfg.RetentionMaxFiles)
-	}
-}
-
-func TestLoadRetentionDaysBoundaries(t *testing.T) {
-	tests := []struct {
-		name    string
-		days    int
-		wantErr string
-	}{
-		{name: "zero", days: 0},
-		{name: "maximum", days: maxRetentionDays},
-		{name: "above maximum", days: maxRetentionDays + 1, wantErr: "RETENTION_DAYS must be at most 106751"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			clearConfigEnv(t)
-			chdirTemp(t)
-			setValidConfigEnv(t)
-			t.Setenv("RETENTION_DAYS", strconv.Itoa(tt.days))
-
-			cfg, err := Load()
-			if tt.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("err = %v, want %q", err, tt.wantErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("load: %v", err)
-			}
-			if cfg.RetentionDays != tt.days {
-				t.Fatalf("retention days = %d, want %d", cfg.RetentionDays, tt.days)
-			}
-			wantAge := time.Duration(tt.days) * 24 * time.Hour
-			if got := cfg.RetentionMaxAge(); got != wantAge {
-				t.Fatalf("retention max age = %s, want %s", got, wantAge)
-			}
-		})
-	}
 }
 
 func TestRunShDoctorNumericRangesMatchGoConfig(t *testing.T) {
@@ -347,23 +365,10 @@ func TestRunShDoctorNumericRangesMatchGoConfig(t *testing.T) {
 	for _, want := range []string{
 		fmt.Sprintf(`"MAX_VIDEO_SIZE_MB:2000:1:%d"`, maxStorageMiB),
 		fmt.Sprintf(`"MIN_FREE_DISK_MB:512:0:%d"`, maxStorageMiB),
-		fmt.Sprintf(`"RETENTION_DAYS:7:0:%d"`, maxRetentionDays),
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("run.sh doctor range does not match Go limit; missing %q", want)
 		}
-	}
-}
-
-func TestLoadRejectsBlankMediaSourceName(t *testing.T) {
-	clearConfigEnv(t)
-	chdirTemp(t)
-	setValidConfigEnv(t)
-	t.Setenv("OBS_MEDIA_SOURCE_NAME", " \t ")
-
-	_, err := Load()
-	if err == nil || !strings.Contains(err.Error(), "OBS_MEDIA_SOURCE_NAME is required") {
-		t.Fatalf("err = %v, want blank media source error", err)
 	}
 }
 
@@ -391,234 +396,17 @@ func TestLoadRejectsBlankLibrarySourceNames(t *testing.T) {
 	}
 }
 
-func TestLoadMigratesOldDotEnv(t *testing.T) {
+func TestLoadRejectsSharedLibrarySourceName(t *testing.T) {
 	clearConfigEnv(t)
-	dir := chdirTemp(t)
-	envPath := filepath.Join(dir, ".env")
-	body := []byte(`
-TELEGRAM_BOT_TOKEN=token
-ALLOWED_CHAT_ID=-1001
-OBS_MEDIA_SOURCE_NAME=player
-`)
-	if err := os.WriteFile(envPath, body, 0o600); err != nil {
-		t.Fatalf("write env: %v", err)
-	}
+	chdirTemp(t)
+	setValidConfigEnv(t)
+	t.Setenv("OBS_LOOP_SOURCE_NAME", " shared-player ")
+	t.Setenv("OBS_MUSIC_SOURCE_NAME", "shared-player")
 
-	if err := migrateDotEnv(envPath); err != nil {
-		t.Fatalf("migrate env: %v", err)
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "OBS_LOOP_SOURCE_NAME and OBS_MUSIC_SOURCE_NAME must be different") {
+		t.Fatalf("err = %v, want shared library source error", err)
 	}
-	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=5")
-	assertContains(t, migrated, "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081")
-	assertContains(t, migrated, "MAX_VIDEO_SIZE_MB=2000")
-	assertContains(t, migrated, "TELEGRAM_API_ID=replace-with-telegram-api-id")
-	assertContains(t, migrated, "TELEGRAM_API_HASH=replace-with-telegram-api-hash")
-	assertContains(t, migrated, "TELEGRAM_BOT_API_BIN=telegram-bot-api")
-	assertContains(t, migrated, "TELEGRAM_BOT_API_HOST=127.0.0.1")
-	assertContains(t, migrated, "TELEGRAM_BOT_API_PORT=8081")
-	assertContains(t, migrated, "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api")
-	assertContains(t, migrated, "RETENTION_DELETE_LOCAL_FILES=false")
-	assertContains(t, migrated, "PLAYER_MODE=library")
-	assertContains(t, migrated, "OBS_LOOP_SOURCE_NAME=tg_loop_player")
-	assertContains(t, migrated, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
-	assertContains(t, migrated, "LOOP_MEDIA_DIR=./data/media/loops")
-	assertContains(t, migrated, "MUSIC_MEDIA_DIR=./data/media/music")
-	assertContains(t, migrated, "MIN_FREE_DISK_MB=512")
-	if backups := backupFiles(t, dir); len(backups) != 1 {
-		t.Fatalf("backups = %v, want 1 backup", backups)
-	}
-}
-
-func TestLoadMigratesVersionOneDotEnvToVersionTwo(t *testing.T) {
-	clearConfigEnv(t)
-	dir := chdirTemp(t)
-	envPath := filepath.Join(dir, ".env")
-	body := []byte(`
-ENV_SCHEMA_VERSION=1
-TELEGRAM_BOT_TOKEN=token
-TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
-ALLOWED_CHAT_ID=-1001
-MAX_VIDEO_SIZE_MB=2000
-`)
-	if err := os.WriteFile(envPath, body, 0o600); err != nil {
-		t.Fatalf("write env: %v", err)
-	}
-
-	if err := migrateDotEnv(envPath); err != nil {
-		t.Fatalf("migrate env: %v", err)
-	}
-	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=5")
-	assertContains(t, migrated, "TELEGRAM_API_ID=replace-with-telegram-api-id")
-	assertContains(t, migrated, "TELEGRAM_API_HASH=replace-with-telegram-api-hash")
-	assertContains(t, migrated, "TELEGRAM_BOT_API_BIN=telegram-bot-api")
-	assertContains(t, migrated, "TELEGRAM_BOT_API_HOST=127.0.0.1")
-	assertContains(t, migrated, "TELEGRAM_BOT_API_PORT=8081")
-	assertContains(t, migrated, "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api")
-	assertContains(t, migrated, "RETENTION_DELETE_LOCAL_FILES=false")
-	assertContains(t, migrated, "PLAYER_MODE=library")
-	assertContains(t, migrated, "OBS_LOOP_SOURCE_NAME=tg_loop_player")
-	assertContains(t, migrated, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
-	assertContains(t, migrated, "LOOP_MEDIA_DIR=./data/media/loops")
-	assertContains(t, migrated, "MUSIC_MEDIA_DIR=./data/media/music")
-	assertContains(t, migrated, "MIN_FREE_DISK_MB=512")
-	if backups := backupFiles(t, dir); len(backups) != 1 {
-		t.Fatalf("backups = %v, want 1 backup", backups)
-	}
-}
-
-func TestLoadMigrationDoesNotOverwriteExistingValues(t *testing.T) {
-	clearConfigEnv(t)
-	dir := chdirTemp(t)
-	envPath := filepath.Join(dir, ".env")
-	body := []byte(`
-TELEGRAM_BOT_TOKEN=token
-TELEGRAM_API_BASE_URL=http://10.0.0.1:9000
-TELEGRAM_API_ID=custom-id
-TELEGRAM_BOT_API_PORT=9090
-ALLOWED_CHAT_ID=-1001
-MAX_VIDEO_SIZE_MB=123
-`)
-	if err := os.WriteFile(envPath, body, 0o600); err != nil {
-		t.Fatalf("write env: %v", err)
-	}
-
-	if err := migrateDotEnv(envPath); err != nil {
-		t.Fatalf("migrate env: %v", err)
-	}
-	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=5")
-	if countSubstring(migrated, "TELEGRAM_API_BASE_URL=") != 1 {
-		t.Fatalf("telegram api base url should not be duplicated:\n%s", migrated)
-	}
-	if countSubstring(migrated, "TELEGRAM_API_ID=") != 1 {
-		t.Fatalf("telegram api id should not be duplicated:\n%s", migrated)
-	}
-	assertContains(t, migrated, "TELEGRAM_API_ID=custom-id")
-	if countSubstring(migrated, "TELEGRAM_BOT_API_PORT=") != 1 {
-		t.Fatalf("telegram bot api port should not be duplicated:\n%s", migrated)
-	}
-	assertContains(t, migrated, "TELEGRAM_BOT_API_PORT=9090")
-	if countSubstring(migrated, "MAX_VIDEO_SIZE_MB=") != 1 {
-		t.Fatalf("max video size should not be duplicated:\n%s", migrated)
-	}
-	assertContains(t, migrated, "RETENTION_DELETE_LOCAL_FILES=false")
-	assertContains(t, migrated, "PLAYER_MODE=library")
-	assertContains(t, migrated, "OBS_LOOP_SOURCE_NAME=tg_loop_player")
-	assertContains(t, migrated, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
-	assertContains(t, migrated, "LOOP_MEDIA_DIR=./data/media/loops")
-	assertContains(t, migrated, "MUSIC_MEDIA_DIR=./data/media/music")
-	assertContains(t, migrated, "MIN_FREE_DISK_MB=512")
-}
-
-func TestLoadMigratesVersionFourDotEnvWithDiskReserve(t *testing.T) {
-	clearConfigEnv(t)
-	dir := chdirTemp(t)
-	envPath := filepath.Join(dir, ".env")
-	body := []byte(`
-ENV_SCHEMA_VERSION=4
-TELEGRAM_BOT_TOKEN=token
-TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
-ALLOWED_CHAT_ID=-1001
-`)
-	if err := os.WriteFile(envPath, body, 0o600); err != nil {
-		t.Fatalf("write env: %v", err)
-	}
-
-	if err := migrateDotEnv(envPath); err != nil {
-		t.Fatalf("migrate env: %v", err)
-	}
-	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=5")
-	assertContains(t, migrated, "MIN_FREE_DISK_MB=512")
-	if countSubstring(migrated, "MIN_FREE_DISK_MB=") != 1 {
-		t.Fatalf("minimum free disk should be added once:\n%s", migrated)
-	}
-}
-
-func TestLoadMigrationDerivesLibraryDirsFromCustomMediaDir(t *testing.T) {
-	clearConfigEnv(t)
-	dir := chdirTemp(t)
-	envPath := filepath.Join(dir, ".env")
-	body := []byte(`
-ENV_SCHEMA_VERSION=3
-TELEGRAM_BOT_TOKEN=token
-TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
-ALLOWED_CHAT_ID=-1001
-MEDIA_DIR=/srv/lofi/media
-`)
-	if err := os.WriteFile(envPath, body, 0o600); err != nil {
-		t.Fatalf("write env: %v", err)
-	}
-
-	if err := migrateDotEnv(envPath); err != nil {
-		t.Fatalf("migrate env: %v", err)
-	}
-	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=5")
-	assertContains(t, migrated, "MEDIA_DIR=/srv/lofi/media")
-	assertContains(t, migrated, "LOOP_MEDIA_DIR=/srv/lofi/media/loops")
-	assertContains(t, migrated, "MUSIC_MEDIA_DIR=/srv/lofi/media/music")
-	if strings.Contains(migrated, "LOOP_MEDIA_DIR=./data/media/loops") || strings.Contains(migrated, "MUSIC_MEDIA_DIR=./data/media/music") {
-		t.Fatalf("migration should not hard-code default media dirs when MEDIA_DIR is set:\n%s", migrated)
-	}
-}
-
-func TestLoadMigrationDerivesLibraryDirsFromCustomDataDir(t *testing.T) {
-	clearConfigEnv(t)
-	dir := chdirTemp(t)
-	envPath := filepath.Join(dir, ".env")
-	body := []byte(`
-ENV_SCHEMA_VERSION=3
-TELEGRAM_BOT_TOKEN=token
-TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
-ALLOWED_CHAT_ID=-1001
-DATA_DIR=/srv/lofi/data
-`)
-	if err := os.WriteFile(envPath, body, 0o600); err != nil {
-		t.Fatalf("write env: %v", err)
-	}
-
-	if err := migrateDotEnv(envPath); err != nil {
-		t.Fatalf("migrate env: %v", err)
-	}
-	migrated := readFile(t, envPath)
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=5")
-	assertContains(t, migrated, "DATA_DIR=/srv/lofi/data")
-	assertContains(t, migrated, "LOOP_MEDIA_DIR=/srv/lofi/data/media/loops")
-	assertContains(t, migrated, "MUSIC_MEDIA_DIR=/srv/lofi/data/media/music")
-}
-
-func TestLoadMigrationUpdatesExplicitOldVersion(t *testing.T) {
-	clearConfigEnv(t)
-	dir := chdirTemp(t)
-	envPath := filepath.Join(dir, ".env")
-	body := []byte(`
-ENV_SCHEMA_VERSION=0
-TELEGRAM_BOT_TOKEN=token
-ALLOWED_CHAT_ID=-1001
-`)
-	if err := os.WriteFile(envPath, body, 0o600); err != nil {
-		t.Fatalf("write env: %v", err)
-	}
-
-	if err := migrateDotEnv(envPath); err != nil {
-		t.Fatalf("migrate env: %v", err)
-	}
-	migrated := readFile(t, envPath)
-	if countSubstring(migrated, "ENV_SCHEMA_VERSION=") != 1 {
-		t.Fatalf("schema version should not be duplicated:\n%s", migrated)
-	}
-	assertContains(t, migrated, "ENV_SCHEMA_VERSION=5")
-	assertContains(t, migrated, "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081")
-	assertContains(t, migrated, "TELEGRAM_BOT_API_DIR=./data/telegram-bot-api")
-	assertContains(t, migrated, "RETENTION_DELETE_LOCAL_FILES=false")
-	assertContains(t, migrated, "PLAYER_MODE=library")
-	assertContains(t, migrated, "OBS_LOOP_SOURCE_NAME=tg_loop_player")
-	assertContains(t, migrated, "OBS_MUSIC_SOURCE_NAME=tg_music_player")
-	assertContains(t, migrated, "LOOP_MEDIA_DIR=./data/media/loops")
-	assertContains(t, migrated, "MUSIC_MEDIA_DIR=./data/media/music")
-	assertContains(t, migrated, "MIN_FREE_DISK_MB=512")
 }
 
 func TestLoadDoesNotRemigrateCurrentDotEnv(t *testing.T) {
@@ -626,7 +414,7 @@ func TestLoadDoesNotRemigrateCurrentDotEnv(t *testing.T) {
 	dir := chdirTemp(t)
 	envPath := filepath.Join(dir, ".env")
 	body := []byte(`
-ENV_SCHEMA_VERSION=5
+ENV_SCHEMA_VERSION=7
 TELEGRAM_BOT_TOKEN=token
 TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
 TELEGRAM_API_ID=replace-with-telegram-api-id
@@ -635,7 +423,6 @@ TELEGRAM_BOT_API_BIN=telegram-bot-api
 TELEGRAM_BOT_API_HOST=127.0.0.1
 TELEGRAM_BOT_API_PORT=8081
 TELEGRAM_BOT_API_DIR=./data/telegram-bot-api
-RETENTION_DELETE_LOCAL_FILES=false
 PLAYER_MODE=library
 OBS_LOOP_SOURCE_NAME=tg_loop_player
 OBS_MUSIC_SOURCE_NAME=tg_music_player
@@ -666,26 +453,6 @@ ALLOWED_CHAT_ID=-1001
 	}
 	if got := readFile(t, envPath); got != string(body) {
 		t.Fatalf(".env changed:\n%s", got)
-	}
-}
-
-func TestMigrateRejectsNewerDotEnvVersion(t *testing.T) {
-	clearConfigEnv(t)
-	dir := chdirTemp(t)
-	envPath := filepath.Join(dir, ".env")
-	body := []byte(`
-ENV_SCHEMA_VERSION=99
-TELEGRAM_BOT_TOKEN=token
-TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
-ALLOWED_CHAT_ID=-1001
-`)
-	if err := os.WriteFile(envPath, body, 0o600); err != nil {
-		t.Fatalf("write env: %v", err)
-	}
-
-	err := migrateDotEnv(envPath)
-	if err == nil || !strings.Contains(err.Error(), "newer than this binary supports") {
-		t.Fatalf("err = %v, want newer version error", err)
 	}
 }
 
@@ -761,17 +528,6 @@ func readFile(t *testing.T, path string) string {
 		t.Fatalf("read file %s: %v", path, err)
 	}
 	return string(body)
-}
-
-func assertContains(t *testing.T, body string, want string) {
-	t.Helper()
-	if !strings.Contains(body, want) {
-		t.Fatalf("expected %q in:\n%s", want, body)
-	}
-}
-
-func countSubstring(body string, pattern string) int {
-	return strings.Count(body, pattern)
 }
 
 func backupFiles(t *testing.T, dir string) []string {
