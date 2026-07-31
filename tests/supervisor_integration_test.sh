@@ -917,7 +917,9 @@ while [ "$race_iteration" -le 100 ]; do
   delay_seconds=$(awk -v delay_ms="$delay_ms" 'BEGIN { printf "%.3f", delay_ms / 1000 }')
   sleep "$delay_seconds"
   kill -TERM "$race_root_pid" 2>/dev/null || true
-  wait_for_root "$race_root_pid" 3
+  # Production cleanup may use the full 1s grace plus its 2s root buffer.
+  # Keep the test watchdog beyond that boundary instead of racing it exactly.
+  wait_for_root "$race_root_pid" 4
   [ "$ROOT_STATUS" -eq 143 ] ||
     fail "launch-race iteration $race_iteration exited with $ROOT_STATUS instead of 143"
   sleep 0.02
@@ -955,7 +957,11 @@ while :; do
 done
 EOF
 chmod +x "$backoff_fixture/backoff-app"
-printf '%s\n' 'APP_BIN=./backoff-app' >>"$backoff_fixture/.env"
+# Keep the threshold above one coarse `date +%s` tick so an immediate failure
+# that crosses a wall-clock second cannot masquerade as stable uptime.
+printf '%s\n' \
+  'APP_BIN=./backoff-app' \
+  'RESTART_RESET_AFTER_SECONDS=2' >>"$backoff_fixture/.env"
 start_fixture_command_with_job_control "$backoff_fixture" up
 backoff_root_pid=$ACTIVE_ROOT_PID
 wait_for_file "$backoff_fixture/backoff-ready.pid" 150
