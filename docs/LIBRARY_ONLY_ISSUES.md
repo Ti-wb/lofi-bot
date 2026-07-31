@@ -10,13 +10,14 @@ Implementation status was re-audited on 2026-07-31 after merging the latest
 additional repository-side gaps, tracked as LOFI-LIB-009 through
 LOFI-LIB-012; their implementations and full automated verification are now
 complete. The real-system checklist in `docs/LIBRARY_ACCEPTANCE.md` has not
-been executed, so LOFI-LIB-008 and production release acceptance remain
-pending regardless of repository test results.
+been executed against real OBS and Telegram services, so LOFI-LIB-008 and
+production release acceptance remain pending regardless of repository test
+results.
 
 GitHub mirror status: pending. A read-only search of `Ti-wb/lofi-bot` on
-2026-07-31 found no issue containing `LOFI-LIB`. Creating the external issues
-still requires explicit authorization; this file remains authoritative until
-the mirror exists.
+2026-07-31 found no issue containing `LOFI-LIB`. Publishing the twelve issue
+payloads remains pending explicit external-publication approval, so this file
+remains authoritative until the mirror exists.
 
 ## LOFI-LIB-001 — Remove legacy queue playback runtime and persistence model
 
@@ -171,9 +172,11 @@ Status: pending real-system validation
 - [x] A repeatable real OBS + Telegram Local Bot API smoke checklist records
       expected evidence.
 - [x] Full Go tests, shell tests, race tests, vet, and production build pass.
-- [ ] Freeze these changes in a clean commit and record the one production
-      binary/config pair used throughout acceptance. The current worktree is
-      intentionally still uncommitted.
+- [x] Freeze the repository implementation in a clean local commit, rebuild
+      the production app and monitor from that exact revision, and confirm
+      both binaries report `vcs.modified=false`.
+- [ ] Populate and qualify the dedicated private `.env`, then record the one
+      production binary/config pair used throughout real-system acceptance.
 - [ ] Publish the clean branch and update open PR #3 before review. Its
       2026-07-31 GitHub metadata still points to the older `6091b81` head and
       incorrectly says `PLAYER_MODE=queue` remains available; the current
@@ -196,13 +199,18 @@ Status: pending real-system validation
       hypothesis was tested and fully restored to its pre-test SHA-256, and
       every diagnostic OBS process was stopped. The dedicated acceptance
       profile/collection therefore still requires a normal interactive OBS
-      launch before automation can configure it. A tracked, credential-free
-      generator now recreates exactly 12 short loops (three per period),
+      launch before automation can configure it. The installed WebSocket
+      plugin is enabled on port 4455 but authentication is currently disabled;
+      the dedicated profile must enable authentication and use the configured
+      loopback endpoint. A tracked, credential-free generator now recreates
+      exactly 12 short loops (three per period),
       short/long stale-event music, separate valid upload media, and the three
       required rejection cases, with stream/duration validation plus ffprobe,
-      size, and SHA-256 evidence for all 19 files. A preliminary ignored pack
-      remains under `data/acceptance-fixtures`, but the final run must
-      regenerate it from the frozen commit. The pack is installed into an
+      size, and SHA-256 evidence for all 19 files. It successfully regenerated
+      and validated all 19 files from a clean committed checkout. A
+      preliminary ignored pack remains under `data/acceptance-fixtures`, but
+      the final run must regenerate it into the final evidence/runtime paths
+      after configuration qualification. The pack is installed into an
       ignored isolated runtime with a synthetic legacy `videos` sentinel
       database; music uses a separate 512 MiB sparse APFS volume so `/status`
       reports visibly distinct loop/music capacity. A
@@ -211,13 +219,18 @@ Status: pending real-system validation
       exited cleanly on `TERM`, and left the historical `videos` schema/row
       hashes unchanged. A credential-scanned preliminary evidence bundle was
       generated outside the checkout. An ignored credential-free pending env
-      template exists, but a populated private `.env`, dedicated bot/group,
-      and OBS acceptance profile/scene collection are still absent.
+      template exists in mode `0600`; its Telegram token, API ID/hash, chat ID,
+      and OBS password are intentionally blank. A populated private `.env`,
+      dedicated bot/group, and OBS acceptance profile/scene collection are
+      still absent.
 - [ ] Revoke/rotate the Telegram bot token that was serialized in the legacy
       OBS queue Media Source path, remove that secret-bearing path from the
       old scene collection, and create the dedicated sources from scratch.
       The exposed credential must not be reused for acceptance or copied into
-      evidence.
+      evidence. The active scene, its backup, and two historical log artifacts
+      containing that residue have been permission-hardened from `0644` to
+      `0600`, but the credential is still present and must be revoked and
+      removed.
 - [x] Ship a bounded, credential-redacting, second-client OBS monitor and
       strict verifier for the permitted stale ended-event correlation.
 - [ ] Record and execute that monitor against the dedicated real OBS instance;
@@ -295,7 +308,7 @@ Status: complete
 
 ## Verification
 
-The following checks passed from this worktree on 2026-07-31:
+The following checks passed from a clean committed worktree on 2026-07-31:
 
 ```text
 go test ./... -count=1
