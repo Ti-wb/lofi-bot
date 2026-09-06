@@ -9,10 +9,10 @@
 - `internal/app`: orchestration between Telegram, library scheduling, media storage, and OBS.
 - `internal/telegram`: Telegram update loop, uploads/imports, commands, and live group admin checks.
 - `internal/obs`: OBS WebSocket v5 client, auth handshake, multi-source media control, playback-ended events.
-- `internal/queue`: SQLite-backed legacy queue state and ordering.
+- `internal/library`: SQLite-backed period plans, overrides, asset scanning, and selection.
+- persistent update journal: Telegram polling checkpoint, attempt fencing, poison-update handling, and bounded cleanup.
 - `internal/singleton`: canonical database and hashed Telegram identities with process-lifetime kernel locks.
 - `internal/media`: local Telegram file probing/import support, `ffprobe` metadata, disk usage.
-- `internal/library`: media filename parsing, library scanning, period helpers, and selection primitives.
 - `internal/liveness`: fixed required-worker ownership, progress snapshots, and the local FD3 reporter protocol.
 - Telegram Local Bot API Server: local Bot API endpoint configured by `TELEGRAM_API_BASE_URL`.
 
@@ -27,7 +27,7 @@
 7. Music-ended events choose another music asset while avoiding immediate repeats when possible.
 8. Period changes cause the next stored or newly selected loop plan to start.
 9. `/preview` materializes the next period's planned loop so the preview matches the later playback unless the asset is removed.
-10. Before Local Bot API `getFile`, upload metadata passes application admission: positive declared size, cache-filesystem headroom, queue capacity in queue mode, and filename/collision/destination-headroom checks in library mode. Shared cache/library filesystems reserve room for both the cached source and staging copy. The returned local path and actual file size are then revalidated; library assets are copied and validated inside an app-owned staging subdirectory before atomic publication and scan/import.
+10. Before Local Bot API `getFile`, upload metadata passes application admission: positive declared size, library filename, collision, directory-capacity, cache-filesystem, and destination-headroom checks. Shared cache/library filesystems reserve room for both the cached source and staging copy. The returned local path, source identity, actual size, stream type, and storage constraints are then revalidated; library assets are copied and validated inside an app-owned staging subdirectory before no-overwrite atomic publication and scan/import.
 
 ## Management Authorization
 
@@ -39,7 +39,7 @@ Text commands remain supported, but the bot also registers Telegram command menu
 
 ## Library Scheduling
 
-Loop filenames use `loop_<period>_<theme>_<variant>.<ext>`. Music filenames use `music_<track>.<ext>`. Library scans are non-recursive and ignore unsupported files with structured scan errors for `/status`.
+Loop filenames use `loop_<period>_<theme>_<variant>.<ext>`. Music filenames use `music_<track>.<ext>`. Library scans are non-recursive. They admit only non-empty regular files, run the same `ffprobe` stream/duration/size checks used by uploads, and retain structured scan errors for `/status`. A loop requires a video stream and music requires an audio stream.
 
 The four periods are based on local process time:
 
@@ -50,20 +50,17 @@ The four periods are based on local process time:
 
 Without an override, each period randomly chooses one theme with at least one matching loop and one loop asset for that theme. That period plan is persisted in SQLite so restarts and repeated previews do not redraw it. Today's direct loop or theme overrides expire at local midnight.
 
-## Queue States
-
-Queue states apply to `PLAYER_MODE=queue`, the legacy Telegram-submitted video mode.
-
-- `downloading`: accepted by Telegram and being probed from the Local Bot API file path.
-- `ready`: local file path validated and waiting for OBS.
-- `playing`: current OBS item.
-- `played`: completed or skipped with no replacement.
-- `canceled`: removed before playback.
-- `failed`: rejected after initial acceptance due to local path/probe/storage error.
-
 ## Data Persistence
 
-SQLite persists all queue metadata under `DATABASE_PATH`, including the absolute local file path returned by Telegram Local Bot API Server. New uploads are not copied into `MEDIA_DIR`; their file lifecycle is owned by Telegram Local Bot API Server. The app resolves upload paths and requires them to be regular files under `TELEGRAM_BOT_API_DIR` before probing or handing them to OBS.
+SQLite persists period plans, daily overrides, the last music choice, and Telegram polling-journal state under `DATABASE_PATH`. Imported production media is copied from a securely opened regular file below `TELEGRAM_BOT_API_DIR` into `LOOP_MEDIA_DIR` or `MUSIC_MEDIA_DIR`; persisted playback state references the library copy, not the Telegram cache path.
+
+Schema v7 is library-only. Fresh configurations default to `state.db`.
+Migration preserves every explicit database path and pins schema-v6-or-older
+configs that omitted it to their historical `queue.db`, so an upgrade cannot
+silently open an empty database. Existing databases may still contain
+historical `videos` tables from older releases. The service neither reads,
+plays, updates, nor deletes those rows; operators may archive them separately
+after validating the library migration.
 
 The backend opens SQLite through the same canonical path that defines `<canonical DATABASE_PATH>.tg-obs-bot.lock`. It also hashes the Telegram token with SHA-256 and locks `telegram-bot-<digest>.lock` inside a shared per-effective-UID application lock directory. The directory is rooted at `/private/tmp/tg-obs-bot-<uid>/locks` on macOS or `/tmp/tg-obs-bot-<uid>/locks` on Linux; it does not depend on `HOME`, `XDG_CONFIG_HOME`, `TMPDIR`, the checkout, or the runtime data root. Startup traverses the fixed base without following symlinks, verifies that the UID root and lock directory are real directories owned by the effective UID, and enforces mode `0700`. The raw token is neither retained in the lock object nor written to paths or errors. macOS and Linux hold both mode-`0600` files with exclusive nonblocking kernel locks for the complete service lifetime, always acquiring database identity before bot identity and releasing a partial acquisition on failure. Relative paths, `..`, and symlink aliases resolve to the same database identity; different database roots remain independent only when they also use different bot identities. Descriptors are close-on-exec, clean shutdown releases them last, and a crash or forced exit releases both through OS descriptor teardown. Persistent lock files are not PID files and are never used as evidence of ownership.
 
@@ -71,18 +68,19 @@ The Go backend, Local Bot API Server, and OBS are expected to run on the same ho
 
 On restart:
 
-- queued `ready` rows remain ordered by `queue_position`;
-- stale `downloading` rows older than 6 hours are marked `failed`;
-- after a fresh application process starts, an existing `playing` row is replayed from its persisted local file path because no in-memory playback generation remains;
-- after a same-process OBS reconnect, matching active playback with observable progress keeps its current position; inactive, terminal, stalled, or path-mismatched playback replays the persisted current row and refreshes `started_at`;
-- reconnect reconciliation does not mark the current row `played` or consume the next queue row based on OBS status alone;
-- if the current file is missing, that row is marked `failed` and playback advances;
+- the library is rescanned and the persisted current-period plan is reused while its asset remains healthy;
+- after a same-process OBS reconnect, matching active loop/music playback with observable progress keeps its current position;
+- inactive, terminal, stalled, or path-mismatched sources are reconciled independently;
+- a missing or unhealthy candidate is excluded and another matching current-period asset is selected with bounded retry;
+- an explicit OBS media-error state quarantines that exact file until its
+  identity changes; a persisted bad plan is cleared rather than pinning the
+  period;
 - the reconnect loop uses a five-second healthy cadence and a per-attempt timeout; consecutive attempted connect, probe, or playback-recovery failures back off exponentially with bounded 20% jitter to one minute, while disconnected/skipped cycles do not advance or reset those independent sequences;
-- if OBS is connected and no row is `playing`, the next `ready` row starts.
+- the scheduler restores loop and music sources when OBS is connected but either source is inactive.
 
 ## Internal Worker Liveness Contract
 
-The in-process registry has exactly five stable worker IDs: `telegram`, `obs-reconnect`, `obs-events`, `maintenance`, and `playback`. `playback` is one logical slot owned by `library-scheduler` in library mode or `playback-watchdog` in queue mode; the inactive implementation cannot also publish progress.
+The in-process registry has exactly five stable worker IDs: `telegram`, `obs-reconnect`, `obs-events`, `maintenance`, and `playback`. The `playback` wire slot is owned only by `library-scheduler`.
 
 Only the bound worker execution path advances its monotonic sequence: when it actually starts, crosses a real operation or successful checkpoint boundary, or remains schedulable in its own event, scheduled, or retry wait. A reporter or coordinator must not pulse on a worker's behalf. Long media copy, probe, durability sync, and library scan operations use fixed, bounded, tokenized scopes. Arbitrary close order leaves the newest active scope effective, the final close returns to the base phase, and an authoritative phase change such as cancellation invalidates older restores.
 
@@ -112,21 +110,14 @@ The reader requires exact field order and canonical unsigned 64-bit values. Fram
 - Handler panics and other non-terminal failures do not advance the checkpoint. A deterministic failure is retried across process restarts and becomes a `dead` poison update on the third failed attempt, at which point the durable offset advances so later updates are not blocked. A recovered panic still stops the current process after that atomic transition because unrelated in-process state may be inconsistent.
 - Terminal update journal pruning is confirmation-gated: only update IDs below `confirmed_offset` are eligible. Confirmed `done` rows are bounded to the newest 10,000 and 30 days; confirmed `dead` rows are bounded to the newest 1,000 and 90 days. Unconfirmed terminal rows are retained even when those limits are exceeded. Confirmation and periodic maintenance each remove at most 256 rows per terminal status, so a large idle backlog converges over maintenance ticks without making a poll perform an unbounded delete.
 - When Telegram confirms a higher offset after a long gap, replayable non-terminal rows strictly below it are reconciled to abandoned `dead` rows in batches of at most 256; rows with an active lease and rows at or above `confirmed_offset` remain untouched.
-- Telegram polling, OBS reconnect, OBS events, periodic maintenance, and the active library scheduler or queue watchdog are mandatory workers. An unexpected worker return is fatal. Maintenance runs outside the coordinator so a stuck cleanup cannot hide another worker's failure. After any fatal result or process cancellation, sibling workers receive cancellation and have ten seconds to drain. This outer budget reserves the Telegram handler's five-second stop grace, up to four seconds for independent journal finalization, and a scheduling cushion; failure to drain is reported as an internal stall instead of blocking shutdown indefinitely.
-- Recurring dependency failures use cancellation-aware exponential backoff with bounded 20% jitter. Telegram polling grows from three seconds to a one-minute local cap and honors a stronger Bot API `retry_after` hint up to fifteen minutes. Library reconciliation grows from fifteen seconds to five minutes, the queue watchdog from thirty seconds to five minutes, and periodic maintenance grows from its configured cadence to at most one hour (or its configured cadence when longer). Maintenance lock contention is not counted as a dependency failure: it retries after the smaller of the normal interval and one minute, logs only the first and every eighth deferral plus one recovery, and does not change the real-error backoff. Successful cycles return to the exact healthy cadence. Database journal failures retain their fail-fast semantics.
+- Telegram polling, OBS reconnect, OBS events, periodic maintenance, and the library scheduler are mandatory workers. An unexpected worker return is fatal. Maintenance runs outside the coordinator so a stuck cleanup cannot hide another worker's failure. After any fatal result or process cancellation, sibling workers receive cancellation and have ten seconds to drain. This outer budget reserves the Telegram handler's five-second stop grace, up to four seconds for independent journal finalization, and a scheduling cushion; failure to drain is reported as an internal stall instead of blocking shutdown indefinitely.
+- Recurring dependency failures use cancellation-aware exponential backoff with bounded 20% jitter. Telegram polling grows from three seconds to a one-minute local cap and honors a stronger Bot API `retry_after` hint up to fifteen minutes. Library reconciliation grows from fifteen seconds to five minutes, and periodic maintenance grows from its configured cadence to at most one hour (or its configured cadence when longer). Maintenance lock contention is not counted as a dependency failure: it retries after the smaller of the normal interval and one minute, logs only the first and every eighth deferral plus one recovery, and does not change the real-error backoff. Successful cycles return to the exact healthy cadence. Database journal failures retain their fail-fast semantics.
 - Repeated warnings use fixed-size counters rather than error-keyed maps: the first failure and every eighth consecutive failure are logged with a suppressed count, followed by one recovery message for retrying loops. Event streams are never delayed; decode, overflow, and playback-event errors use the same first/eighth sampling and silently reset only after eight consecutive healthy events. Recurring error text is redacted before being capped at 512 valid UTF-8 bytes.
 - The process-lifetime database and Telegram-identity kernel locks prevent two cooperating backend generations from executing domain side effects against either the same canonical database or the same bot. Telegram's wall-clock attempt lease remains crash/replay accounting rather than an independent side-effect fence. External writers, binaries that do not honor these locks, hard-link aliases, runtime-symlink mutation after startup, and containers or mount namespaces that do not share the per-user lock directory remain outside that guarantee.
-- OBS connection loss does not delete queue state.
-- OBS heartbeat and input reconciliation preserve matching healthy playback, replay an unhealthy persisted current item, and leave queue advancement to authoritative post-reconnect playback reconciliation.
-- After the current queue row is durably finished, the in-memory queue generation becomes idle and drops its media-progress record before the next database query or OBS operation. A next-row start is published as normal playback only after `MarkPlaying` commits; failed persistence leaves that row `ready`, attempts bounded OBS cleanup, and remains retryable by both the idle path and watchdog.
-- OBS playback failure leaves the next `ready` item in the queue instead of marking it played.
-- A canceled item cannot become `ready` after cancellation.
-- Retention cleanup removes old played queue rows by age and maximum file count. By default it keeps local Telegram Bot API media files; `RETENTION_DELETE_LOCAL_FILES=true` opts into deleting unreferenced local files with removed rows.
-- Random fallback playback locks the active history row so retention cleanup cannot remove it mid-playback.
-
-## Fallback Playback
-
-When the legacy normal queue is empty, `FALLBACK_MODE=random_played` randomly selects a previously played video whose local file still exists. The bot announces when it enters random fallback mode, then keeps rotating through history until a new ready queue item is available. `FALLBACK_MODE=file` uses `OBS_FALLBACK_FILE`, and `FALLBACK_MODE=off` leaves OBS idle when the queue is empty.
+- OBS connection loss does not delete period plans or overrides.
+- OBS heartbeat and per-source reconciliation preserve matching healthy playback and repair an unhealthy loop or music source without advancing the other source.
+- A terminal or failed loop is retried from its stable plan only while the asset remains healthy; unhealthy assets are excluded so one corrupt file cannot pin the period.
+- Maintenance prunes Telegram journal rows, stale import staging files, and obsolete library plans/overrides in bounded batches. It never deletes production library media.
 
 ## Intentional MVP Constraints
 

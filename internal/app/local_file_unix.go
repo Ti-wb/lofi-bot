@@ -25,7 +25,7 @@ func openLocalBotAPIFile(root, path string) (*os.File, error) {
 		return nil, fmt.Errorf("TELEGRAM_BOT_API_DIR is required")
 	}
 	if !filepath.IsAbs(path) {
-		return nil, fmt.Errorf("local video path must be absolute: %s", path)
+		return nil, fmt.Errorf("local media path must be absolute: %s", path)
 	}
 
 	absRoot, err := filepath.Abs(root)
@@ -38,14 +38,14 @@ func openLocalBotAPIFile(root, path string) (*os.File, error) {
 	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return nil, fmt.Errorf("resolve local video path: %w", err)
+		return nil, fmt.Errorf("resolve local media path: %w", err)
 	}
 	relativePath, ok := relativePathWithin(absRoot, absPath)
 	if !ok && resolvedRoot != absRoot {
 		relativePath, ok = relativePathWithin(resolvedRoot, absPath)
 	}
 	if !ok {
-		return nil, fmt.Errorf("local video path is outside TELEGRAM_BOT_API_DIR: %s", path)
+		return nil, fmt.Errorf("local media path is outside TELEGRAM_BOT_API_DIR: %s", path)
 	}
 
 	rootFD, err := openAbsoluteDirectoryNoFollow(resolvedRoot)
@@ -58,7 +58,7 @@ func openLocalBotAPIFile(root, path string) (*os.File, error) {
 		nextFD, openErr := unix.Openat(currentFD, component, localDirectoryOpenFlags, 0)
 		_ = unix.Close(currentFD)
 		if openErr != nil {
-			return nil, fmt.Errorf("open local video parent directory: %w", openErr)
+			return nil, fmt.Errorf("open local media parent directory: %w", openErr)
 		}
 		currentFD = nextFD
 	}
@@ -66,7 +66,7 @@ func openLocalBotAPIFile(root, path string) (*os.File, error) {
 	finalFD, openErr := unix.Openat(currentFD, components[len(components)-1], localFileOpenFlags, 0)
 	_ = unix.Close(currentFD)
 	if openErr != nil {
-		return nil, fmt.Errorf("open local video path: %w", openErr)
+		return nil, fmt.Errorf("open local media path: %w", openErr)
 	}
 	closeFinalFD := true
 	defer func() {
@@ -77,14 +77,14 @@ func openLocalBotAPIFile(root, path string) (*os.File, error) {
 
 	var stat unix.Stat_t
 	if err := unix.Fstat(finalFD, &stat); err != nil {
-		return nil, fmt.Errorf("stat local video path: %w", err)
+		return nil, fmt.Errorf("stat local media path: %w", err)
 	}
 	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
-		return nil, fmt.Errorf("local video path is not a regular file: %s", path)
+		return nil, fmt.Errorf("local media path is not a regular file: %s", path)
 	}
 	file := os.NewFile(uintptr(finalFD), absPath)
 	if file == nil {
-		return nil, fmt.Errorf("open local video path: invalid file descriptor")
+		return nil, fmt.Errorf("open local media path: invalid file descriptor")
 	}
 	closeFinalFD = false
 	return file, nil

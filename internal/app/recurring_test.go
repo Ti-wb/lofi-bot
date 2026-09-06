@@ -21,7 +21,7 @@ import (
 )
 
 func TestObserveOBSResultSkippedCycleDoesNotMutateRetryState(t *testing.T) {
-	svc, _, _ := newFallbackTestService(t, config.Config{FallbackMode: "off"})
+	svc, _, _ := newRuntimeTestService(t)
 	state := newOBSRetryState(func() uint64 { return 0 })
 
 	first := svc.observeOBSResult(state, obsMaintenanceResult{
@@ -58,8 +58,8 @@ func TestObserveOBSResultSkippedCycleDoesNotMutateRetryState(t *testing.T) {
 }
 
 func TestConnectedProbeWithoutResumeAttemptPreservesResumeFailures(t *testing.T) {
-	svc, _, _ := newFallbackTestService(t, config.Config{FallbackMode: "off"})
-	svc.setPlaybackState(playbackNormal, 0, "")
+	svc, _, _ := newRuntimeTestService(t)
+	svc.activeLoopPath = "/active-loop.mp4"
 	state := newOBSRetryState(func() uint64 { return 0 })
 	svc.observeOBSResult(state, obsMaintenanceResult{
 		failure: obsRetryResume,
@@ -82,22 +82,8 @@ func TestConnectedProbeWithoutResumeAttemptPreservesResumeFailures(t *testing.T)
 	}
 }
 
-func TestSchedulerAttemptHelpersDistinguishDisconnectedAndRecoverySkips(t *testing.T) {
+func TestLibrarySchedulerAttemptHelpersDistinguishDisconnectedAndRecoverySkips(t *testing.T) {
 	ctx := context.Background()
-	queueSvc, queueOBS, _ := newFallbackTestService(t, config.Config{FallbackMode: "off"})
-	queueOBS.state = obs.StateDisconnected
-	if attempted, err := queueSvc.checkPlaybackWatchdogAttempt(ctx); err != nil || attempted {
-		t.Fatalf("disconnected watchdog attempted=%t error=%v, want clean skip", attempted, err)
-	}
-	if _, attempted, err := queueSvc.advancePlaybackForEndedEventAttempt(ctx, obs.Event{Type: obs.EventMediaEnded}); err != nil || attempted {
-		t.Fatalf("disconnected queue event attempted=%t error=%v, want clean skip", attempted, err)
-	}
-	queueOBS.state = obs.StateConnected
-	queueSvc.obsRecoveryInProgress.Store(true)
-	if attempted, err := queueSvc.checkPlaybackWatchdogAttempt(ctx); err != nil || attempted {
-		t.Fatalf("recovering watchdog attempted=%t error=%v, want clean skip", attempted, err)
-	}
-
 	librarySvc, libraryOBS := newLibraryTestService(t)
 	libraryOBS.state = obs.StateDisconnected
 	if attempted, err := librarySvc.reconcileLibraryPlaybackAttempt(ctx); err != nil || attempted {
@@ -237,26 +223,10 @@ func TestMaintenanceDeferralsRetrySoonWithoutMutatingErrorBackoff(t *testing.T) 
 
 func TestMaintenanceSkipsBusyStorageWithoutBlockingAndRecoversNextCycle(t *testing.T) {
 	ctx := context.Background()
-	mediaRoot := t.TempDir()
-	loopDir := filepath.Join(mediaRoot, "loops")
-	musicDir := filepath.Join(mediaRoot, "music")
-	for _, dir := range []string{loopDir, musicDir} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatalf("create media directory: %v", err)
-		}
-	}
-	svc, _, _ := newFallbackTestService(t, config.Config{
-		FallbackMode:      "off",
-		RetentionMaxFiles: 1,
-		LoopMediaDir:      loopDir,
-		MusicMediaDir:     musicDir,
-	})
-	removeCandidate := addPlayedVideo(t, ctx, svc, "maintenance-old.mp4", true)
-	time.Sleep(time.Millisecond)
-	_ = addPlayedVideo(t, ctx, svc, "maintenance-new.mp4", true)
+	svc, _, _ := newRuntimeTestService(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	svc.now = func() time.Time { return now }
-	stagingDir, err := ensureLibraryStagingDir(loopDir)
+	stagingDir, err := ensureLibraryStagingDir(svc.cfg.LoopMediaDir)
 	if err != nil {
 		t.Fatalf("create staging dir: %v", err)
 	}
@@ -293,16 +263,8 @@ func TestMaintenanceSkipsBusyStorageWithoutBlockingAndRecoversNextCycle(t *testi
 			<-cycle
 			t.Fatalf("maintenance cycle %d blocked behind busy storage", attempt)
 		}
-		if !svc.playbackMu.TryLock() {
-			svc.storageMu.Unlock()
-			t.Fatalf("busy storage cycle %d leaked the partially acquired playback lock", attempt)
-		}
-		svc.playbackMu.Unlock()
 	}
 	svc.storageMu.Unlock()
-	if _, err := svc.store.Get(ctx, removeCandidate.ID); err != nil {
-		t.Fatalf("busy maintenance cycle mutated skipped retention row: %v", err)
-	}
 	if !fileExists(staleTemp) {
 		t.Fatal("busy maintenance cycle removed a deferred stale temp")
 	}
@@ -312,14 +274,11 @@ func TestMaintenanceSkipsBusyStorageWithoutBlockingAndRecoversNextCycle(t *testi
 	if result.err != nil || result.deferred {
 		t.Fatalf("recovered maintenance cycle = %+v, want complete success", result)
 	}
-	if _, err := svc.store.Get(ctx, removeCandidate.ID); err == nil {
-		t.Fatal("next maintenance cycle did not resume skipped retention")
-	}
 	if fileExists(staleTemp) {
 		t.Fatal("next maintenance cycle did not resume skipped stale-temp sweep")
 	}
 	if worker.Snapshot().Sequence <= beforeRecovery {
-		t.Fatal("recovered retention/sweep did not record an actual item checkpoint")
+		t.Fatal("recovered stale-temp sweep did not record an actual item checkpoint")
 	}
 }
 
@@ -414,185 +373,16 @@ func TestLibraryRecoveryScanWarningsAreSampled(t *testing.T) {
 	}
 }
 
-func TestInvalidRandomFallbackDiagnosticsAreAggregatedAndRedacted(t *testing.T) {
-	const token = "123456:ABCdefghi_jklmnop"
+func TestLibraryRecoveryUnlocksAfterPanic(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir() + "/bot" + token
-	svc, _, _ := newFallbackTestService(t, config.Config{
-		FallbackMode:      "random_played",
-		TelegramBotToken:  token,
-		TelegramBotAPIDir: root,
+	svc, _ := newLibraryTestService(t)
+	svc.now = func() time.Time {
+		panic("clock panic")
+	}
+	requirePanic(t, func() {
+		_ = svc.recoverLibraryPlaybackAfterOBSConnect(ctx)
 	})
-	var logs bytes.Buffer
-	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
-	for index := range 3 {
-		_ = addPlayedVideo(t, ctx, svc, fmt.Sprintf("missing-%d.mp4", index), false)
-	}
-
-	if video, err := svc.advancePlayback(ctx); err != nil || video != nil {
-		t.Fatalf("advancePlayback video=%#v error=%v", video, err)
-	}
-
-	got := logs.String()
-	if strings.Contains(got, token) {
-		t.Fatalf("invalid fallback log leaked token: %q", got)
-	}
-	if count := strings.Count(got, `msg="skip invalid random fallback file"`); count != 1 {
-		t.Fatalf("invalid fallback warning count = %d, want one aggregate", count)
-	}
-	if !strings.Contains(got, "count=3") || !strings.Contains(got, "<redacted>") {
-		t.Fatalf("invalid fallback aggregate lacks count or redaction: %q", got)
-	}
-	if lastErr := svc.lastError(); lastErr == "" || strings.Contains(lastErr, token) {
-		t.Fatalf("last error was not retained safely: %q", lastErr)
-	}
-}
-
-func TestRetentionInvalidDeleteDiagnosticsAreAggregatedAndRedacted(t *testing.T) {
-	const token = "123456:ABCdefghi_jklmnop"
-	ctx := context.Background()
-	outsidePath := filepath.Join(t.TempDir(), "outside-"+token+".mp4")
-	writeTestFile(t, outsidePath)
-	svc, _, _ := newFallbackTestService(t, config.Config{
-		FallbackMode:              "off",
-		TelegramBotToken:          token,
-		TelegramBotAPIDir:         t.TempDir(),
-		RetentionMaxFiles:         1,
-		RetentionDeleteLocalFiles: true,
-	})
-	old := addPlayedVideoWithPath(t, ctx, svc, "outside.mp4", outsidePath)
-	time.Sleep(time.Millisecond)
-	_ = addPlayedVideo(t, ctx, svc, "inside.mp4", true)
-	var logs bytes.Buffer
-	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
-
-	if err := svc.CleanupRetention(ctx); err != nil {
-		t.Fatalf("CleanupRetention: %v", err)
-	}
-	if !fileExists(outsidePath) {
-		t.Fatal("retention deleted a file outside TELEGRAM_BOT_API_DIR")
-	}
-	if _, err := svc.store.Get(ctx, old.ID); err == nil {
-		t.Fatal("retention kept terminal metadata after safely skipping the external file")
-	}
-	got := logs.String()
-	if strings.Contains(got, token) {
-		t.Fatalf("retention aggregate leaked token: %q", got)
-	}
-	if count := strings.Count(got, `msg="skip retention local file deletes"`); count != 1 {
-		t.Fatalf("retention aggregate count = %d, want one log entry", count)
-	}
-	if !strings.Contains(got, "count=1") ||
-		!strings.Contains(got, fmt.Sprintf("first_video_id=%d", old.ID)) ||
-		!strings.Contains(got, "<redacted>") {
-		t.Fatalf("retention aggregate lacks count, first id, or redaction: %q", got)
-	}
-}
-
-func TestPlaybackNoticeLoggingRunsOutsidePlaybackLock(t *testing.T) {
-	blocker := &playbackBlockingLogHandler{
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	svc := &Service{
-		logger: slog.New(blocker),
-	}
-	svc.playbackMu.Lock()
-	svc.recordPlaybackNotice(
-		playbackNoticeInvalidReady,
-		1,
-		"/tmp/missing.mp4",
-		errors.New("missing"),
-	)
-	select {
-	case <-blocker.started:
-		t.Fatal("recordPlaybackNotice invoked the logger while playbackMu was held")
-	default:
-	}
-	svc.playbackMu.Unlock()
-
-	flushed := make(chan struct{})
-	go func() {
-		svc.flushPlaybackNotices()
-		close(flushed)
-	}()
-	select {
-	case <-blocker.started:
-	case <-time.After(time.Second):
-		t.Fatal("flush did not reach blocking logger")
-	}
-
-	lockAcquired := make(chan struct{})
-	go func() {
-		svc.playbackMu.Lock()
-		svc.playbackMu.Unlock()
-		close(lockAcquired)
-	}()
-	select {
-	case <-lockAcquired:
-	case <-time.After(time.Second):
-		t.Fatal("playbackMu remained held while logger was blocked")
-	}
-
-	close(blocker.release)
-	select {
-	case <-flushed:
-	case <-time.After(time.Second):
-		t.Fatal("flush did not finish after logger was released")
-	}
-}
-
-func TestDeferredUnlocksSurvivePanicsBeforePostLockLogging(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("advance playback", func(t *testing.T) {
-		svc, _, _ := newFallbackTestService(t, config.Config{FallbackMode: "off"})
-		_ = addReadyVideo(t, ctx, svc, "panic-advance.mp4")
-		svc.obs = nil
-		requirePanic(t, func() {
-			_, _ = svc.advancePlayback(ctx)
-		})
-		requireMutexUnlocked(t, &svc.playbackMu, "playbackMu")
-	})
-
-	t.Run("play if idle", func(t *testing.T) {
-		svc, _, _ := newFallbackTestService(t, config.Config{FallbackMode: "off"})
-		svc.obs = nil
-		requirePanic(t, func() {
-			_ = svc.playIfIdle(ctx)
-		})
-		requireMutexUnlocked(t, &svc.playbackMu, "playbackMu")
-	})
-
-	t.Run("retention", func(t *testing.T) {
-		svc, _, _ := newFallbackTestService(t, config.Config{
-			FallbackMode:              "off",
-			RetentionMaxFiles:         1,
-			RetentionDeleteLocalFiles: true,
-		})
-		_ = addPlayedVideo(t, ctx, svc, "panic-old.mp4", true)
-		time.Sleep(time.Millisecond)
-		_ = addPlayedVideo(t, ctx, svc, "panic-new.mp4", true)
-		svc.removeFile = func(string) error {
-			panic("remove panic")
-		}
-		requirePanic(t, func() {
-			_ = svc.CleanupRetention(ctx)
-		})
-		requireMutexUnlocked(t, &svc.playbackMu, "playbackMu")
-		requireMutexUnlocked(t, &svc.storageMu, "storageMu")
-	})
-
-	t.Run("library recovery", func(t *testing.T) {
-		svc, _ := newLibraryTestService(t)
-		svc.now = func() time.Time {
-			panic("clock panic")
-		}
-		requirePanic(t, func() {
-			_ = svc.recoverLibraryPlaybackAfterOBSConnect(ctx)
-		})
-		requireMutexUnlocked(t, &svc.playbackMu, "playbackMu")
-	})
+	requireMutexUnlocked(t, &svc.playbackMu, "playbackMu")
 }
 
 func requirePanic(t *testing.T, fn func()) {
@@ -615,30 +405,4 @@ func requireMutexUnlocked(t *testing.T, mutex *sync.Mutex, name string) {
 		t.Fatalf("%s remained locked after panic", name)
 	}
 	mutex.Unlock()
-}
-
-type playbackBlockingLogHandler struct {
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (*playbackBlockingLogHandler) Enabled(context.Context, slog.Level) bool {
-	return true
-}
-
-func (h *playbackBlockingLogHandler) Handle(context.Context, slog.Record) error {
-	h.once.Do(func() {
-		close(h.started)
-	})
-	<-h.release
-	return nil
-}
-
-func (h *playbackBlockingLogHandler) WithAttrs([]slog.Attr) slog.Handler {
-	return h
-}
-
-func (h *playbackBlockingLogHandler) WithGroup(string) slog.Handler {
-	return h
 }

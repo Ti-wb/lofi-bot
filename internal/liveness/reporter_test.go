@@ -439,7 +439,7 @@ func TestOpenSupervisorFD3EnvironmentContract(t *testing.T) {
 }
 
 func TestReporterPublishesImmediatelyWithoutMutatingRegistry(t *testing.T) {
-	registry, workers := completeRegistry(t, OwnerPlaybackWatchdog, time.Millisecond)
+	registry, workers := completeRegistry(t, time.Millisecond)
 	for _, id := range RequiredWorkerIDs() {
 		workers[id].Advance(PhaseOperation)
 	}
@@ -481,7 +481,7 @@ func TestReporterPublishesImmediatelyWithoutMutatingRegistry(t *testing.T) {
 }
 
 func TestReporterAdvancesFrameOnDropAndReturnsPermanentFailure(t *testing.T) {
-	registry, _ := completeRegistry(t, OwnerLibraryScheduler, time.Millisecond)
+	registry, _ := completeRegistry(t, time.Millisecond)
 	wantErr := errors.New("supervisor vanished")
 	sink := &recordingFrameSink{
 		results: []sinkResult{
@@ -522,7 +522,7 @@ func TestReporterAdvancesFrameOnDropAndReturnsPermanentFailure(t *testing.T) {
 }
 
 func TestReporterInitialFailureIsSynchronousAndClosesSink(t *testing.T) {
-	registry, _ := completeRegistry(t, OwnerPlaybackWatchdog, time.Millisecond)
+	registry, _ := completeRegistry(t, time.Millisecond)
 	wantErr := errors.New("initial write failed")
 	sink := &recordingFrameSink{results: []sinkResult{{err: wantErr}}}
 	reporter, err := NewReporter(registry, sink, nil, time.Second)
@@ -547,7 +547,7 @@ func fixedSnapshots() [RequiredWorkerCount]Snapshot {
 		{ID: WorkerOBSReconnect, Owner: OwnerOBSReconnect},
 		{ID: WorkerOBSEvents, Owner: OwnerOBSEvents},
 		{ID: WorkerMaintenance, Owner: OwnerMaintenance},
-		{ID: WorkerPlayback, Owner: OwnerPlaybackWatchdog},
+		{ID: WorkerPlayback, Owner: OwnerLibraryScheduler},
 	}
 }
 
@@ -764,7 +764,7 @@ func (sink *recordingFrameSink) isClosed() bool {
 }
 
 func TestReporterDropLoggingIsSampledAndRecoveryIsSingle(t *testing.T) {
-	registry, _ := completeRegistry(t, OwnerPlaybackWatchdog, time.Millisecond)
+	registry, _ := completeRegistry(t, time.Millisecond)
 	results := make([]sinkResult, droppedFrameLogEvery)
 	results = append(results, sinkResult{delivered: true})
 	sink := &recordingFrameSink{results: results}

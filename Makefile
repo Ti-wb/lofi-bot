@@ -12,6 +12,7 @@ tidy:
 test:
 	mkdir -p $(GOCACHE_DIR) $(GOMODCACHE_DIR)
 	$(GOENV) $(GO) test ./...
+	sh -n scripts/generate-acceptance-fixtures.sh
 	./tests/permissions_test.sh
 	./tests/liveness_reader_test.sh
 	./tests/supervisor_integration_test.sh
@@ -29,6 +30,7 @@ test-supervisor:
 build:
 	mkdir -p dist $(GOCACHE_DIR) $(GOMODCACHE_DIR)
 	$(GOENV) $(GO) build -o dist/tg-obs-bot ./cmd/tg-obs-bot
+	$(GOENV) $(GO) build -o dist/obs-stale-monitor ./cmd/obs-stale-monitor
 
 run:
 	./run.sh up

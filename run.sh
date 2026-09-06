@@ -9,7 +9,9 @@ BOT_API_LOGOUT="$REPO_ROOT/deploy/telegram-bot-api/logout-public.sh"
 LIVENESS_READER_AWK="$REPO_ROOT/scripts/liveness-reader.awk"
 GO_CACHE_DIR="$REPO_ROOT/.cache/go-build"
 GO_MOD_CACHE_DIR="$REPO_ROOT/.cache/go-mod"
-CURRENT_ENV_SCHEMA_VERSION=5
+CURRENT_ENV_SCHEMA_VERSION=7
+STATE_DATABASE_ENV_SCHEMA_VERSION=7
+OBSOLETE_QUEUE_ENV_KEYS='OBS_MEDIA_SOURCE_NAME OBS_FALLBACK_FILE FALLBACK_MODE PLAYER_MODE MAX_QUEUE_LENGTH RETENTION_DAYS RETENTION_MAX_FILES RETENTION_DELETE_LOCAL_FILES'
 DEFAULT_APP_BIN="$REPO_ROOT/dist/tg-obs-bot"
 MAX_RESTART_DELAY_SECONDS=86400
 ROOT_SHUTDOWN_BUFFER_SECONDS=2
@@ -69,7 +71,7 @@ Commands:
   health          Check Local Bot API /getMe
   doctor          Check local config, tools, data dirs, and common ports
   env             Print sanitized runtime config
-  migrate-env     Back up and append missing .env fields for the supported schema
+  migrate-env     Back up, remove queue-only fields, and add required .env fields
   logout-public   Manually log the bot out from the public Telegram Bot API
   test            Run make test
   build           Run make build
@@ -115,9 +117,16 @@ dotenv_value() {
       sub(/[[:space:]]+$/, "", rawKey)
       sub(/^[[:space:]]+/, "", value)
       sub(/[[:space:]]+$/, "", value)
-      if ((substr(value, 1, 1) == "\"" && substr(value, length(value), 1) == "\"") ||
-          (substr(value, 1, 1) == "'"'"'" && substr(value, length(value), 1) == "'"'"'")) {
+      if (substr(value, 1, 1) == "\"" && substr(value, length(value), 1) == "\"") {
         value = substr(value, 2, length(value) - 2)
+      } else if (substr(value, 1, 1) == "'"'"'" && substr(value, length(value), 1) == "'"'"'") {
+        value = substr(value, 2, length(value) - 2)
+        single_quote = sprintf("%c", 39)
+        escaped_single_quote = single_quote "\\" single_quote single_quote
+        while ((escaped_pos = index(value, escaped_single_quote)) > 0) {
+          value = substr(value, 1, escaped_pos - 1) single_quote \
+            substr(value, escaped_pos + length(escaped_single_quote))
+        }
       }
       if (rawKey == want) {
         print value
@@ -162,6 +171,62 @@ add_env_migration_line() {
 "
 }
 
+join_env_path() {
+  base=$(printf '%s' "$1" | sed 's#[/\\]*$##')
+  if [ -z "$base" ]; then
+    printf '/%s' "$2"
+  else
+    printf '%s/%s' "$base" "$2"
+  fi
+}
+
+quote_env_value() {
+  escaped_value=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+  printf "'%s'" "$escaped_value"
+}
+
+legacy_data_dir_default_from_env_file() {
+  if dotenv_has_key DATA_DIR; then
+    legacy_data_dir=$(dotenv_value DATA_DIR)
+  else
+    legacy_data_dir=${DATA_DIR:-}
+  fi
+  legacy_data_dir=$(printf '%s' "$legacy_data_dir" |
+    sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  if [ -z "$legacy_data_dir" ]; then
+    legacy_data_dir=./data
+  fi
+  printf '%s' "$legacy_data_dir"
+}
+
+validate_legacy_player_mode() {
+  case "$1" in
+    ""|library)
+      return 0
+      ;;
+    queue)
+      die "PLAYER_MODE=queue is no longer supported; configure distinct OBS_LOOP_SOURCE_NAME and OBS_MUSIC_SOURCE_NAME sources, add library media, then set PLAYER_MODE=library or remove PLAYER_MODE"
+      ;;
+    *)
+      die "PLAYER_MODE is deprecated; remove it or set PLAYER_MODE=library (got: $1)"
+      ;;
+  esac
+}
+
+library_media_dir_default_from_env_file() {
+  media_dir=$(dotenv_value MEDIA_DIR)
+  if [ -n "$media_dir" ]; then
+    printf '%s' "$media_dir"
+    return
+  fi
+  data_dir=$(dotenv_value DATA_DIR)
+  if [ -n "$data_dir" ]; then
+    join_env_path "$data_dir" media
+    return
+  fi
+  printf './data/media'
+}
+
 migrate_env() {
   [ -f "$ENV_FILE" ] || die ".env is required at repo root"
   secure_env_file
@@ -179,11 +244,42 @@ migrate_env() {
     die "ENV_SCHEMA_VERSION $version is newer than this helper supports ($CURRENT_ENV_SCHEMA_VERSION)"
   fi
 
+  validate_legacy_player_mode "${PLAYER_MODE:-}"
+  validate_legacy_player_mode "$(dotenv_value PLAYER_MODE)"
+
   ENV_MIGRATION_ADDITIONS=
   update_schema_version=0
+  remove_obsolete_queue_keys=0
+  replace_empty_database_path=0
 
   if [ "$version" -lt "$CURRENT_ENV_SCHEMA_VERSION" ] && dotenv_has_key ENV_SCHEMA_VERSION; then
     update_schema_version=1
+  fi
+  for key in $OBSOLETE_QUEUE_ENV_KEYS; do
+    if dotenv_has_key "$key"; then
+      remove_obsolete_queue_keys=1
+      break
+    fi
+  done
+
+  if [ "$version" -lt "$STATE_DATABASE_ENV_SCHEMA_VERSION" ]; then
+    database_path_in_file=$(dotenv_value DATABASE_PATH)
+    database_path_trimmed=$(printf '%s' "$database_path_in_file" |
+      sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    pin_legacy_database_path=0
+    if dotenv_has_key DATABASE_PATH; then
+      if [ -z "$database_path_trimmed" ]; then
+        replace_empty_database_path=1
+        pin_legacy_database_path=1
+      fi
+    elif [ -z "${DATABASE_PATH:-}" ]; then
+      pin_legacy_database_path=1
+    fi
+    if [ "$pin_legacy_database_path" -eq 1 ]; then
+      legacy_data_dir=$(legacy_data_dir_default_from_env_file)
+      legacy_database_path=$(join_env_path "$legacy_data_dir" queue.db)
+      add_env_migration_line "DATABASE_PATH=$(quote_env_value "$legacy_database_path")"
+    fi
   fi
 
   if [ "$version" -lt 1 ]; then
@@ -211,24 +307,25 @@ migrate_env() {
       add_env_migration_line "$line"
     fi
   done
-  if [ "$version" -lt 3 ]; then
-    if ! dotenv_has_key RETENTION_DELETE_LOCAL_FILES; then
-      add_env_migration_line "RETENTION_DELETE_LOCAL_FILES=false"
-    fi
-  fi
   if [ "$version" -lt 4 ]; then
     for line in \
-      "PLAYER_MODE=library" \
       "OBS_LOOP_SOURCE_NAME=tg_loop_player" \
-      "OBS_MUSIC_SOURCE_NAME=tg_music_player" \
-      "LOOP_MEDIA_DIR=./data/media/loops" \
-      "MUSIC_MEDIA_DIR=./data/media/music"
+      "OBS_MUSIC_SOURCE_NAME=tg_music_player"
     do
       key=${line%%=*}
       if ! dotenv_has_key "$key"; then
         add_env_migration_line "$line"
       fi
     done
+    library_media_dir=$(library_media_dir_default_from_env_file)
+    if ! dotenv_has_key LOOP_MEDIA_DIR; then
+      loop_media_dir=$(join_env_path "$library_media_dir" loops)
+      add_env_migration_line "LOOP_MEDIA_DIR=$(quote_env_value "$loop_media_dir")"
+    fi
+    if ! dotenv_has_key MUSIC_MEDIA_DIR; then
+      music_media_dir=$(join_env_path "$library_media_dir" music)
+      add_env_migration_line "MUSIC_MEDIA_DIR=$(quote_env_value "$music_media_dir")"
+    fi
   fi
   if [ "$version" -lt 5 ]; then
     if ! dotenv_has_key MIN_FREE_DISK_MB; then
@@ -236,7 +333,10 @@ migrate_env() {
     fi
   fi
 
-  if [ "$update_schema_version" -eq 0 ] && [ -z "$ENV_MIGRATION_ADDITIONS" ]; then
+  if [ "$update_schema_version" -eq 0 ] &&
+     [ "$remove_obsolete_queue_keys" -eq 0 ] &&
+     [ "$replace_empty_database_path" -eq 0 ] &&
+     [ -z "$ENV_MIGRATION_ADDITIONS" ]; then
     return 0
   fi
 
@@ -245,23 +345,42 @@ migrate_env() {
   (umask 077 && cp "$ENV_FILE" "$backup_path")
   chmod 600 "$backup_path"
 
-  if [ "$update_schema_version" -eq 1 ]; then
+  if [ "$update_schema_version" -eq 1 ] ||
+     [ "$remove_obsolete_queue_keys" -eq 1 ] ||
+     [ "$replace_empty_database_path" -eq 1 ]; then
     (
       umask 077
-      awk -v want="ENV_SCHEMA_VERSION" -v replacement="ENV_SCHEMA_VERSION=$CURRENT_ENV_SCHEMA_VERSION" '
+      awk \
+        -v want="ENV_SCHEMA_VERSION" \
+        -v replacement="ENV_SCHEMA_VERSION=$CURRENT_ENV_SCHEMA_VERSION" \
+        -v update_schema="$update_schema_version" \
+        -v replace_empty_database_path="$replace_empty_database_path" \
+        -v obsolete_keys="$OBSOLETE_QUEUE_ENV_KEYS" '
+        BEGIN {
+          count = split(obsolete_keys, keys, " ")
+          for (item = 1; item <= count; item++) {
+            obsolete[keys[item]] = 1
+          }
+        }
         {
           line = $0
           trimmed = line
           sub(/^[[:space:]]+/, "", trimmed)
           sub(/[[:space:]]+$/, "", trimmed)
           pos = index(trimmed, "=")
-          if (!done && trimmed != "" && substr(trimmed, 1, 1) != "#" && pos > 0) {
+          if (trimmed != "" && substr(trimmed, 1, 1) != "#" && pos > 0) {
             rawKey = substr(trimmed, 1, pos - 1)
             sub(/^[[:space:]]+/, "", rawKey)
             sub(/[[:space:]]+$/, "", rawKey)
-            if (rawKey == want) {
+            if (!done && rawKey == want && update_schema == 1) {
               print replacement
               done = 1
+              next
+            }
+            if (rawKey == "DATABASE_PATH" && replace_empty_database_path == 1) {
+              next
+            }
+            if (rawKey in obsolete) {
               next
             }
           }
@@ -290,18 +409,24 @@ load_env() {
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   disable_xtrace
+  validate_legacy_player_mode "${PLAYER_MODE:-}"
 
   : "${TELEGRAM_BOT_API_BIN:=telegram-bot-api}"
   : "${TELEGRAM_BOT_API_HOST:=127.0.0.1}"
   : "${TELEGRAM_BOT_API_PORT:=8081}"
   : "${FFPROBE_PATH:=ffprobe}"
   : "${GO:=go}"
-  : "${PLAYER_MODE:=library}"
   : "${OBS_LOOP_SOURCE_NAME:=tg_loop_player}"
   : "${OBS_MUSIC_SOURCE_NAME:=tg_music_player}"
-  : "${MEDIA_DIR:=./data/media}"
-  : "${LOOP_MEDIA_DIR:=./data/media/loops}"
-  : "${MUSIC_MEDIA_DIR:=./data/media/music}"
+  DATA_DIR=$(printf '%s' "${DATA_DIR:-}" |
+    sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  : "${DATA_DIR:=./data}"
+  DATABASE_PATH=$(printf '%s' "${DATABASE_PATH:-}" |
+    sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  : "${DATABASE_PATH:=$(join_env_path "$DATA_DIR" state.db)}"
+  : "${MEDIA_DIR:=$(join_env_path "$DATA_DIR" media)}"
+  : "${LOOP_MEDIA_DIR:=$(join_env_path "$MEDIA_DIR" loops)}"
+  : "${MUSIC_MEDIA_DIR:=$(join_env_path "$MEDIA_DIR" music)}"
   : "${MIN_FREE_DISK_MB:=512}"
 }
 
@@ -376,23 +501,6 @@ check_nonzero_integer_env() {
   return 0
 }
 
-check_bool_env() {
-  key=$1
-  default_value=$2
-  eval "value=\${$key:-}"
-  if [ -z "$value" ]; then
-    value=$default_value
-  fi
-  case "$value" in
-    true|false|TRUE|FALSE|True|False|1|0)
-      printf 'ok   %s boolean value\n' "$key"
-      return 0
-      ;;
-  esac
-  printf 'fail %s must be true or false\n' "$key"
-  return 1
-}
-
 check_http_url_env() {
   key=$1
   eval "value=\${$key:-}"
@@ -430,10 +538,14 @@ bot_api_dir_abs() {
 }
 
 media_dir_default() {
+  default_media_dir=${MEDIA_DIR:-}
+  if [ -z "$default_media_dir" ]; then
+    default_media_dir=$(join_env_path "${DATA_DIR:-./data}" media)
+  fi
   case "$1" in
-    MEDIA_DIR) printf './data/media' ;;
-    LOOP_MEDIA_DIR) printf './data/media/loops' ;;
-    MUSIC_MEDIA_DIR) printf './data/media/music' ;;
+    MEDIA_DIR) printf '%s' "$default_media_dir" ;;
+    LOOP_MEDIA_DIR) join_env_path "$default_media_dir" loops ;;
+    MUSIC_MEDIA_DIR) join_env_path "$default_media_dir" music ;;
     *) printf '' ;;
   esac
 }
@@ -1325,20 +1437,9 @@ doctor() {
   if ! check_http_url_env TELEGRAM_API_BASE_URL; then
     failures=$((failures + 1))
   fi
-  if ! check_bool_env RETENTION_DELETE_LOCAL_FILES false; then
-    failures=$((failures + 1))
-  fi
-  case "${PLAYER_MODE:-library}" in
-    library|queue)
-      printf 'ok   PLAYER_MODE: %s\n' "${PLAYER_MODE:-library}"
-      ;;
-    *)
-      printf 'fail PLAYER_MODE must be library or queue\n'
-      failures=$((failures + 1))
-      ;;
-  esac
-  for key in OBS_MEDIA_SOURCE_NAME OBS_LOOP_SOURCE_NAME OBS_MUSIC_SOURCE_NAME; do
-    eval "value=\${$key:-}"
+  for key in OBS_LOOP_SOURCE_NAME OBS_MUSIC_SOURCE_NAME; do
+    eval "raw_value=\${$key:-}"
+    value=$(printf '%s' "$raw_value" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     if [ -n "$value" ]; then
       printf 'ok   %s\n' "$key"
     else
@@ -1346,15 +1447,18 @@ doctor() {
       failures=$((failures + 1))
     fi
   done
+  loop_source=$(printf '%s' "${OBS_LOOP_SOURCE_NAME:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  music_source=$(printf '%s' "${OBS_MUSIC_SOURCE_NAME:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  if [ -n "$loop_source" ] && [ "$loop_source" = "$music_source" ]; then
+    printf 'fail OBS_LOOP_SOURCE_NAME and OBS_MUSIC_SOURCE_NAME must be different\n'
+    failures=$((failures + 1))
+  fi
   for item in \
     "OBS_PORT:4455:1:65535" \
     "TELEGRAM_BOT_API_PORT:8081:1:65535" \
     "MAX_VIDEO_SIZE_MB:2000:1:8796093022207" \
     "MAX_VIDEO_DURATION_SECONDS:7200:0:2147483647" \
-    "MIN_FREE_DISK_MB:512:0:8796093022207" \
-    "MAX_QUEUE_LENGTH:50:1:2147483647" \
-    "RETENTION_DAYS:7:0:106751" \
-    "RETENTION_MAX_FILES:100:0:2147483647"
+    "MIN_FREE_DISK_MB:512:0:8796093022207"
   do
     key=${item%%:*}
     rest=${item#*:}
@@ -1388,7 +1492,10 @@ doctor() {
     failures=$((failures + 1))
   fi
 
-  for key in MEDIA_DIR LOOP_MEDIA_DIR MUSIC_MEDIA_DIR; do
+  # MEDIA_DIR is only the default base for the two effective library paths.
+  # Explicit loop/music directories must not depend on that unused base being
+  # writable.
+  for key in LOOP_MEDIA_DIR MUSIC_MEDIA_DIR; do
     eval "raw_dir=\${$key:-}"
     [ -n "$raw_dir" ] || raw_dir=$(media_dir_default "$key")
     case "$raw_dir" in
@@ -1426,17 +1533,14 @@ print_env() {
   printf 'OBS_HOST=%s\n' "${OBS_HOST:-127.0.0.1}"
   printf 'OBS_PORT=%s\n' "${OBS_PORT:-4455}"
   printf 'OBS_PASSWORD=%s\n' "$(masked_state "${OBS_PASSWORD:-}")"
-  printf 'OBS_MEDIA_SOURCE_NAME=%s\n' "${OBS_MEDIA_SOURCE_NAME:-tg_queue_player}"
   printf 'OBS_LOOP_SOURCE_NAME=%s\n' "${OBS_LOOP_SOURCE_NAME:-tg_loop_player}"
   printf 'OBS_MUSIC_SOURCE_NAME=%s\n' "${OBS_MUSIC_SOURCE_NAME:-tg_music_player}"
-  printf 'PLAYER_MODE=%s\n' "${PLAYER_MODE:-library}"
   printf 'DATA_DIR=%s\n' "${DATA_DIR:-./data}"
   printf 'MEDIA_DIR=%s\n' "${MEDIA_DIR:-./data/media}"
   printf 'LOOP_MEDIA_DIR=%s\n' "${LOOP_MEDIA_DIR:-./data/media/loops}"
   printf 'MUSIC_MEDIA_DIR=%s\n' "${MUSIC_MEDIA_DIR:-./data/media/music}"
-  printf 'DATABASE_PATH=%s\n' "${DATABASE_PATH:-./data/queue.db}"
+  printf 'DATABASE_PATH=%s\n' "$DATABASE_PATH"
   printf 'MIN_FREE_DISK_MB=%s\n' "${MIN_FREE_DISK_MB:-512}"
-  printf 'RETENTION_DELETE_LOCAL_FILES=%s\n' "${RETENTION_DELETE_LOCAL_FILES:-false}"
   printf 'FFPROBE_PATH=%s\n' "${FFPROBE_PATH:-ffprobe}"
   printf 'LOG_LEVEL=%s\n' "${LOG_LEVEL:-info}"
 }

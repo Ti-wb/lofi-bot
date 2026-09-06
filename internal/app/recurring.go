@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"log/slog"
-	"math"
 	"math/rand"
 	"time"
 
@@ -17,7 +16,6 @@ const (
 	obsReconnectInterval     = 5 * time.Second
 	obsRetryMaxDelay         = time.Minute
 	libraryRetryMaxDelay     = 5 * time.Minute
-	watchdogRetryMaxDelay    = 5 * time.Minute
 	maintenanceRetryMaxDelay = time.Hour
 	eventRecoveryThreshold   = 8
 )
@@ -233,84 +231,6 @@ func maintenanceDeferredDelay(interval time.Duration) time.Duration {
 type eventErrorSampler struct {
 	sampler         *retryloop.Sampler
 	consecutiveGood uint64
-}
-
-type playbackNoticeKind uint8
-
-const (
-	playbackNoticeInvalidReady playbackNoticeKind = iota
-	playbackNoticeInvalidCurrent
-	playbackNoticeInvalidRandom
-	playbackNoticeRecovered
-	playbackNoticeKinds
-)
-
-type playbackNotice struct {
-	count     uint64
-	videoID   int64
-	path      string
-	errorText string
-}
-
-// recordPlaybackNotice stores only a fixed-size, redacted summary while
-// playbackMu is held. It intentionally does not log.
-func (s *Service) recordPlaybackNotice(kind playbackNoticeKind, videoID int64, path string, err error) {
-	if kind >= playbackNoticeKinds {
-		return
-	}
-	path = retryloop.BoundedText(
-		s.redactString(path),
-		retryloop.RecurringErrorMaxBytes,
-	)
-	errorText := retryloop.BoundedErrorText(
-		s.redactError(err),
-		retryloop.RecurringErrorMaxBytes,
-	)
-
-	s.mu.Lock()
-	notice := &s.playbackNotices[kind]
-	if notice.count < math.MaxUint64 {
-		notice.count++
-	}
-	if notice.count == 1 {
-		notice.videoID = videoID
-		notice.path = path
-		notice.errorText = errorText
-	}
-	s.mu.Unlock()
-}
-
-// flushPlaybackNotices moves summaries out from under both playbackMu and mu
-// before invoking the logger, which may be slow or backpressured.
-func (s *Service) flushPlaybackNotices() {
-	s.mu.Lock()
-	notices := s.playbackNotices
-	s.playbackNotices = [playbackNoticeKinds]playbackNotice{}
-	s.mu.Unlock()
-
-	for kind, notice := range notices {
-		if notice.count == 0 {
-			continue
-		}
-		attrs := []any{
-			"count", notice.count,
-			"video_id", notice.videoID,
-			"path", notice.path,
-		}
-		switch playbackNoticeKind(kind) {
-		case playbackNoticeInvalidReady:
-			attrs = append(attrs, "error", notice.errorText)
-			s.logger.Warn("skip invalid ready video path", attrs...)
-		case playbackNoticeInvalidCurrent:
-			attrs = append(attrs, "error", notice.errorText)
-			s.logger.Warn("mark invalid current video failed", attrs...)
-		case playbackNoticeInvalidRandom:
-			attrs = append(attrs, "error", notice.errorText)
-			s.logger.Warn("skip invalid random fallback file", attrs...)
-		case playbackNoticeRecovered:
-			s.logger.Info("recovered OBS playback", attrs...)
-		}
-	}
 }
 
 func (s *Service) observeLibraryRecoveryScan(err error) {

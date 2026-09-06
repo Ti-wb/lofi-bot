@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func TestRequiredWorkerSchemaIsFixedAcrossPlaybackOwners(t *testing.T) {
+func TestRequiredWorkerSchemaIsFixedForLibraryScheduler(t *testing.T) {
 	wantIDs := []string{
 		"telegram",
 		"obs-reconnect",
@@ -17,21 +17,19 @@ func TestRequiredWorkerSchemaIsFixedAcrossPlaybackOwners(t *testing.T) {
 		"maintenance",
 		"playback",
 	}
-	for _, playbackOwner := range []Owner{OwnerLibraryScheduler, OwnerPlaybackWatchdog} {
-		registry, workers := completeRegistry(t, playbackOwner, time.Millisecond)
-		snapshots := registry.Snapshots()
-		if len(snapshots) != RequiredWorkerCount {
-			t.Fatalf("snapshot count = %d, want %d", len(snapshots), RequiredWorkerCount)
+	registry, workers := completeRegistry(t, time.Millisecond)
+	snapshots := registry.Snapshots()
+	if len(snapshots) != RequiredWorkerCount {
+		t.Fatalf("snapshot count = %d, want %d", len(snapshots), RequiredWorkerCount)
+	}
+	for index, snapshot := range snapshots {
+		if got := snapshot.ID.String(); got != wantIDs[index] {
+			t.Fatalf("snapshot %d ID = %q, want %q", index, got, wantIDs[index])
 		}
-		for index, snapshot := range snapshots {
-			if got := snapshot.ID.String(); got != wantIDs[index] {
-				t.Fatalf("snapshot %d ID = %q, want %q", index, got, wantIDs[index])
-			}
-			if snapshot.ID == WorkerPlayback && snapshot.Owner != playbackOwner {
-				t.Fatalf("playback owner = %s, want %s", snapshot.Owner, playbackOwner)
-			}
-			workers[snapshot.ID].Advance(PhaseStarting)
+		if snapshot.ID == WorkerPlayback && snapshot.Owner != OwnerLibraryScheduler {
+			t.Fatalf("playback owner = %s, want %s", snapshot.Owner, OwnerLibraryScheduler)
 		}
+		workers[snapshot.ID].Advance(PhaseStarting)
 	}
 }
 
@@ -65,7 +63,7 @@ func TestPhaseSchemaIsFiniteAndStable(t *testing.T) {
 }
 
 func TestPhaseScopeRestoresPreviousAndNestedPhases(t *testing.T) {
-	_, workers := completeRegistry(t, OwnerPlaybackWatchdog, time.Millisecond)
+	_, workers := completeRegistry(t, time.Millisecond)
 	worker := workers[WorkerTelegram]
 	worker.Advance(PhaseOperation)
 
@@ -88,7 +86,7 @@ func TestPhaseScopeRestoresPreviousAndNestedPhases(t *testing.T) {
 }
 
 func TestPhaseScopeDistinctScopesRestoreOutOfOrder(t *testing.T) {
-	_, workers := completeRegistry(t, OwnerPlaybackWatchdog, time.Millisecond)
+	_, workers := completeRegistry(t, time.Millisecond)
 	worker := workers[WorkerTelegram]
 	worker.Advance(PhaseOperation)
 
@@ -105,7 +103,7 @@ func TestPhaseScopeDistinctScopesRestoreOutOfOrder(t *testing.T) {
 }
 
 func TestPhaseScopeSamePhaseOverlapRestoresToBase(t *testing.T) {
-	_, workers := completeRegistry(t, OwnerPlaybackWatchdog, time.Millisecond)
+	_, workers := completeRegistry(t, time.Millisecond)
 	worker := workers[WorkerTelegram]
 	worker.Advance(PhaseRetryWait)
 
@@ -122,7 +120,7 @@ func TestPhaseScopeSamePhaseOverlapRestoresToBase(t *testing.T) {
 }
 
 func TestPhaseScopeCheckpointRejectsABASamePhaseToken(t *testing.T) {
-	_, workers := completeRegistry(t, OwnerPlaybackWatchdog, time.Millisecond)
+	_, workers := completeRegistry(t, time.Millisecond)
 	worker := workers[WorkerTelegram]
 	worker.Advance(PhaseOperation)
 
@@ -156,7 +154,7 @@ func TestPhaseScopeCheckpointRejectsABASamePhaseToken(t *testing.T) {
 }
 
 func TestPhaseScopeCheckpointRequiresEffectiveToken(t *testing.T) {
-	_, workers := completeRegistry(t, OwnerPlaybackWatchdog, time.Millisecond)
+	_, workers := completeRegistry(t, time.Millisecond)
 	worker := workers[WorkerTelegram]
 	worker.Advance(PhaseOperation)
 
@@ -188,7 +186,7 @@ func TestPhaseScopeCheckpointRequiresEffectiveToken(t *testing.T) {
 }
 
 func TestPhaseScopeRestoresOnErrorAndPanic(t *testing.T) {
-	_, workers := completeRegistry(t, OwnerLibraryScheduler, time.Millisecond)
+	_, workers := completeRegistry(t, time.Millisecond)
 	worker := workers[WorkerTelegram]
 	worker.Advance(PhaseRetryWait)
 
@@ -221,7 +219,7 @@ func TestPhaseScopeRestoresOnErrorAndPanic(t *testing.T) {
 }
 
 func TestDistinctPhaseScopeRestoresAreConcurrentAndBounded(t *testing.T) {
-	_, workers := completeRegistry(t, OwnerLibraryScheduler, time.Millisecond)
+	_, workers := completeRegistry(t, time.Millisecond)
 	worker := workers[WorkerTelegram]
 	worker.Advance(PhaseOperation)
 
@@ -262,7 +260,7 @@ func TestDistinctPhaseScopeRestoresAreConcurrentAndBounded(t *testing.T) {
 }
 
 func TestPhaseScopeConcurrentCloseCheckpointRace(t *testing.T) {
-	_, workers := completeRegistry(t, OwnerPlaybackWatchdog, time.Millisecond)
+	_, workers := completeRegistry(t, time.Millisecond)
 	worker := workers[WorkerTelegram]
 
 	for iteration := 0; iteration < 100; iteration++ {
@@ -333,7 +331,7 @@ func TestPhaseScopeRestoreIsRaceSafeAndIdempotent(t *testing.T) {
 }
 
 func TestPhaseScopeRejectsNormalPhasesAndBoundOverflow(t *testing.T) {
-	_, workers := completeRegistry(t, OwnerPlaybackWatchdog, time.Millisecond)
+	_, workers := completeRegistry(t, time.Millisecond)
 	worker := workers[WorkerTelegram]
 
 	assertPanics(t, "normal scope phase", func() {
@@ -366,7 +364,7 @@ func TestPhaseScopeNoOpContextHandle(t *testing.T) {
 }
 
 func TestSpecialScopeDoesNotLeakLeaseIntoSubsequentStalledOperation(t *testing.T) {
-	_, workers := completeRegistry(t, OwnerPlaybackWatchdog, time.Millisecond)
+	_, workers := completeRegistry(t, time.Millisecond)
 	worker := workers[WorkerTelegram]
 	worker.Advance(PhaseOperation)
 	func() {
@@ -384,11 +382,11 @@ func TestSpecialScopeDoesNotLeakLeaseIntoSubsequentStalledOperation(t *testing.T
 	}
 }
 
-func TestRegistryRejectsMissingDuplicateAndModeMismatchedOwners(t *testing.T) {
+func TestRegistryRejectsMissingDuplicateAndInvalidOwners(t *testing.T) {
 	t.Run("missing", func(t *testing.T) {
 		registry := NewRegistry(Options{})
 		bindNonPlaybackWorkers(t, registry)
-		if err := registry.Seal(OwnerLibraryScheduler); !errors.Is(err, ErrIncompleteBinding) {
+		if err := registry.Seal(); !errors.Is(err, ErrIncompleteBinding) {
 			t.Fatalf("Seal error = %v, want %v", err, ErrIncompleteBinding)
 		}
 	})
@@ -403,20 +401,17 @@ func TestRegistryRejectsMissingDuplicateAndModeMismatchedOwners(t *testing.T) {
 		}
 	})
 
-	t.Run("inactive playback alternative", func(t *testing.T) {
+	t.Run("invalid playback owner", func(t *testing.T) {
 		registry := NewRegistry(Options{})
 		bindNonPlaybackWorkers(t, registry)
-		if _, err := registry.Bind(WorkerPlayback, OwnerPlaybackWatchdog); err != nil {
-			t.Fatalf("Bind playback: %v", err)
-		}
-		if err := registry.Seal(OwnerLibraryScheduler); !errors.Is(err, ErrInvalidBinding) {
-			t.Fatalf("Seal error = %v, want %v", err, ErrInvalidBinding)
+		if _, err := registry.Bind(WorkerPlayback, OwnerMaintenance); !errors.Is(err, ErrInvalidBinding) {
+			t.Fatalf("Bind playback error = %v, want %v", err, ErrInvalidBinding)
 		}
 	})
 }
 
 func TestOneStuckWorkerCannotBeHiddenByOtherWorkerProgress(t *testing.T) {
-	registry, workers := completeRegistry(t, OwnerLibraryScheduler, time.Millisecond)
+	registry, workers := completeRegistry(t, time.Millisecond)
 	for _, worker := range workers {
 		worker.Advance(PhaseOperation)
 	}
@@ -446,7 +441,7 @@ func TestOneStuckWorkerCannotBeHiddenByOtherWorkerProgress(t *testing.T) {
 }
 
 func TestRetryWaitAdvancesWithoutExternalSuccess(t *testing.T) {
-	_, workers := completeRegistry(t, OwnerPlaybackWatchdog, 2*time.Millisecond)
+	_, workers := completeRegistry(t, 2*time.Millisecond)
 	worker := workers[WorkerTelegram]
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -478,7 +473,7 @@ func TestRetryWaitAdvancesWithoutExternalSuccess(t *testing.T) {
 }
 
 func TestWaitRejectsSyntheticProgressForOperationScopes(t *testing.T) {
-	_, workers := completeRegistry(t, OwnerPlaybackWatchdog, time.Millisecond)
+	_, workers := completeRegistry(t, time.Millisecond)
 	worker := workers[WorkerTelegram]
 	defer func() {
 		if recovered := recover(); recovered == nil {
@@ -490,18 +485,17 @@ func TestWaitRejectsSyntheticProgressForOperationScopes(t *testing.T) {
 
 func completeRegistry(
 	t *testing.T,
-	playbackOwner Owner,
 	progressInterval time.Duration,
 ) (*Registry, map[WorkerID]*Worker) {
 	t.Helper()
 	registry := NewRegistry(Options{ProgressInterval: progressInterval})
 	workers := bindNonPlaybackWorkers(t, registry)
-	playback, err := registry.Bind(WorkerPlayback, playbackOwner)
+	playback, err := registry.Bind(WorkerPlayback, OwnerLibraryScheduler)
 	if err != nil {
 		t.Fatalf("Bind playback: %v", err)
 	}
 	workers[WorkerPlayback] = playback
-	if err := registry.Seal(playbackOwner); err != nil {
+	if err := registry.Seal(); err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
 	return registry, workers

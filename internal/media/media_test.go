@@ -2,8 +2,6 @@ package media
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,41 +10,12 @@ import (
 	"github.com/tiwb/tg-obs-bot/internal/liveness"
 )
 
-func TestDownloadRejectsHTTP500(t *testing.T) {
-	manager, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "boom", http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	path, meta, err := manager.Download(context.Background(), server.URL, "clip.mp4", 1024)
-	if err == nil {
-		t.Fatal("expected HTTP error")
-	}
-	if !strings.Contains(err.Error(), "HTTP 500") {
-		t.Fatalf("expected HTTP 500 error, got %v", err)
-	}
-	if path != "" {
-		t.Fatalf("expected no path, got %q", path)
-	}
-	if meta != (Metadata{}) {
-		t.Fatalf("expected empty metadata, got %#v", meta)
-	}
-	requireNoFiles(t, manager.Dir())
-}
-
 func TestProbeRecordsOnlyEntryAndExitBoundaries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "clip.mp4")
 	if err := os.WriteFile(path, []byte("media"), 0o600); err != nil {
 		t.Fatalf("write media: %v", err)
 	}
-	manager, err := NewManager(t.TempDir(), fakeFFProbe(t, "printf '%s\\n' '{\"format\":{\"duration\":\"1\"}}'\n"))
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
+	manager := NewManager(fakeFFProbe(t, "printf '%s\\n' '{\"format\":{\"duration\":\"1\"}}'\n"))
 	registry := liveness.NewRegistry(liveness.Options{})
 	worker, err := registry.Bind(liveness.WorkerTelegram, liveness.OwnerTelegram)
 	if err != nil {
@@ -63,100 +32,10 @@ func TestProbeRecordsOnlyEntryAndExitBoundaries(t *testing.T) {
 	}
 }
 
-func TestDownloadRejectsContentLengthOverLimit(t *testing.T) {
-	manager, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", "11")
-		_, _ = w.Write([]byte("too large!!"))
-	}))
-	defer server.Close()
-
-	path, meta, err := manager.Download(context.Background(), server.URL, "clip.mp4", 10)
-	if err == nil {
-		t.Fatal("expected oversized content-length error")
-	}
-	if !strings.Contains(err.Error(), "file is too large") {
-		t.Fatalf("expected file is too large error, got %v", err)
-	}
-	if path != "" {
-		t.Fatalf("expected no path, got %q", path)
-	}
-	if meta != (Metadata{}) {
-		t.Fatalf("expected empty metadata, got %#v", meta)
-	}
-	requireNoFiles(t, manager.Dir())
-}
-
-func TestDownloadRejectsStreamingOverLimitAndCleansTempFile(t *testing.T) {
-	manager, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			t.Fatal("response writer does not support flushing")
-		}
-		w.WriteHeader(http.StatusOK)
-		flusher.Flush()
-		_, _ = w.Write([]byte("12345678901"))
-	}))
-	defer server.Close()
-
-	path, meta, err := manager.Download(context.Background(), server.URL, "clip.mp4", 10)
-	if err == nil {
-		t.Fatal("expected streaming oversized error")
-	}
-	if !strings.Contains(err.Error(), "file exceeds max size") {
-		t.Fatalf("expected file exceeds max size error, got %v", err)
-	}
-	if path != "" {
-		t.Fatalf("expected no path, got %q", path)
-	}
-	if meta != (Metadata{}) {
-		t.Fatalf("expected empty metadata, got %#v", meta)
-	}
-	requireNoFiles(t, manager.Dir())
-}
-
-func TestDownloadLeavesFinalFileWhenProbeFailsAndCleansTempFile(t *testing.T) {
-	manager, err := NewManager(t.TempDir(), fakeFFProbe(t, "exit 7\n"))
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("video"))
-	}))
-	defer server.Close()
-
-	path, meta, err := manager.Download(context.Background(), server.URL, "clip.mp4", 10)
-	if err == nil {
-		t.Fatal("expected probe error")
-	}
-	if !strings.Contains(err.Error(), "ffprobe failed") {
-		t.Fatalf("expected ffprobe failure, got %v", err)
-	}
-	if path == "" {
-		t.Fatal("expected final path on probe failure")
-	}
-	if meta.SizeBytes != 5 {
-		t.Fatalf("expected size metadata from download, got %#v", meta)
-	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("expected final file to remain: %v", err)
-	}
-	requireNoTmpFiles(t, manager.Dir())
-}
-
 func TestProbeRoundsDurationUp(t *testing.T) {
-	manager, err := NewManager(t.TempDir(), fakeFFProbe(t, "printf '%s\\n' '{\"format\":{\"duration\":\"1.01\"}}'\n"))
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
-	path := writeMediaFile(t, manager.Dir(), "clip.mp4", "video")
+	dir := t.TempDir()
+	manager := NewManager(fakeFFProbe(t, "printf '%s\\n' '{\"format\":{\"duration\":\"1.01\"},\"streams\":[{\"codec_type\":\"video\"},{\"codec_type\":\"audio\"}]}'\n"))
+	path := writeMediaFile(t, dir, "clip.mp4", "video")
 
 	meta, err := manager.Probe(context.Background(), path)
 	if err != nil {
@@ -168,6 +47,9 @@ func TestProbeRoundsDurationUp(t *testing.T) {
 	if meta.DurationSeconds != 2 {
 		t.Fatalf("expected ceiling duration 2, got %d", meta.DurationSeconds)
 	}
+	if !meta.HasVideoStream || !meta.HasAudioStream {
+		t.Fatalf("stream metadata = %#v, want video and audio", meta)
+	}
 }
 
 func TestValidateFailsClosedForUnavailableOrInvalidDuration(t *testing.T) {
@@ -178,11 +60,9 @@ func TestValidateFailsClosedForUnavailableOrInvalidDuration(t *testing.T) {
 			if raw != "" {
 				body = "printf '%s\\n' '{\"format\":{\"duration\":\"" + raw + "\"}}'\n"
 			}
-			manager, err := NewManager(t.TempDir(), fakeFFProbe(t, body))
-			if err != nil {
-				t.Fatalf("new manager: %v", err)
-			}
-			path := writeMediaFile(t, manager.Dir(), "clip.mp4", "video")
+			dir := t.TempDir()
+			manager := NewManager(fakeFFProbe(t, body))
+			path := writeMediaFile(t, dir, "clip.mp4", "video")
 			meta, err := manager.Probe(context.Background(), path)
 			if err != nil {
 				t.Fatalf("probe: %v", err)
@@ -201,11 +81,9 @@ func TestValidateFailsClosedForUnavailableOrInvalidDuration(t *testing.T) {
 }
 
 func TestValidateFailsClosedWhenFFProbeIsDisabledAndDurationLimitIsEnabled(t *testing.T) {
-	manager, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
-	path := writeMediaFile(t, manager.Dir(), "clip.mp4", "video")
+	dir := t.TempDir()
+	manager := NewManager("")
+	path := writeMediaFile(t, dir, "clip.mp4", "video")
 	meta, err := manager.Probe(context.Background(), path)
 	if err != nil {
 		t.Fatalf("probe: %v", err)
@@ -216,11 +94,9 @@ func TestValidateFailsClosedWhenFFProbeIsDisabledAndDurationLimitIsEnabled(t *te
 }
 
 func TestProbeRejectsInvalidJSON(t *testing.T) {
-	manager, err := NewManager(t.TempDir(), fakeFFProbe(t, "printf '%s\\n' 'not-json'\n"))
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
-	path := writeMediaFile(t, manager.Dir(), "clip.mp4", "video")
+	dir := t.TempDir()
+	manager := NewManager(fakeFFProbe(t, "printf '%s\\n' 'not-json'\n"))
+	path := writeMediaFile(t, dir, "clip.mp4", "video")
 
 	if _, err := manager.Probe(context.Background(), path); err == nil {
 		t.Fatal("expected invalid JSON error")
@@ -228,11 +104,9 @@ func TestProbeRejectsInvalidJSON(t *testing.T) {
 }
 
 func TestProbeReturnsFFProbeFailure(t *testing.T) {
-	manager, err := NewManager(t.TempDir(), fakeFFProbe(t, "exit 7\n"))
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
-	path := writeMediaFile(t, manager.Dir(), "clip.mp4", "video")
+	dir := t.TempDir()
+	manager := NewManager(fakeFFProbe(t, "exit 7\n"))
+	path := writeMediaFile(t, dir, "clip.mp4", "video")
 
 	if _, err := manager.Probe(context.Background(), path); err == nil || !strings.Contains(err.Error(), "ffprobe failed") {
 		t.Fatalf("expected ffprobe failure, got %v", err)
@@ -240,10 +114,7 @@ func TestProbeReturnsFFProbeFailure(t *testing.T) {
 }
 
 func TestValidateRejectsEmptyOversizedAndLongVideos(t *testing.T) {
-	manager, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
+	manager := NewManager("")
 
 	if err := manager.Validate(Metadata{SizeBytes: 0}, 100, 10); err == nil {
 		t.Fatal("expected empty file rejection")
@@ -259,12 +130,33 @@ func TestValidateRejectsEmptyOversizedAndLongVideos(t *testing.T) {
 	}
 }
 
-func TestDiskUsage(t *testing.T) {
-	manager, err := NewManager(t.TempDir(), "")
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
+func TestValidateVideoAndAudioRequireMatchingStreams(t *testing.T) {
+	manager := NewManager("")
+	base := Metadata{SizeBytes: 50, DurationSeconds: 10}
+	if err := manager.ValidateVideo(base, 100, 10); err == nil || !strings.Contains(err.Error(), "video stream") {
+		t.Fatalf("video validation error = %v", err)
 	}
-	usage, err := manager.DiskUsage()
+	if err := manager.ValidateAudio(base, 100, 10); err == nil || !strings.Contains(err.Error(), "audio stream") {
+		t.Fatalf("audio validation error = %v", err)
+	}
+	if err := manager.ValidateVideo(
+		Metadata{SizeBytes: 50, DurationSeconds: 10, HasVideoStream: true},
+		100,
+		10,
+	); err != nil {
+		t.Fatalf("valid video metadata: %v", err)
+	}
+	if err := manager.ValidateAudio(
+		Metadata{SizeBytes: 50, DurationSeconds: 10, HasAudioStream: true},
+		100,
+		10,
+	); err != nil {
+		t.Fatalf("valid audio metadata: %v", err)
+	}
+}
+
+func TestDiskUsage(t *testing.T) {
+	usage, err := DiskUsageForPath(t.TempDir())
 	if err != nil {
 		t.Fatalf("disk usage: %v", err)
 	}
@@ -290,26 +182,4 @@ func writeMediaFile(t *testing.T, dir, name, contents string) string {
 		t.Fatalf("write media file: %v", err)
 	}
 	return path
-}
-
-func requireNoFiles(t *testing.T, dir string) {
-	t.Helper()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("read media dir: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("expected media dir to be empty, found %d files", len(entries))
-	}
-}
-
-func requireNoTmpFiles(t *testing.T, dir string) {
-	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(dir, "download-*.tmp"))
-	if err != nil {
-		t.Fatalf("glob tmp files: %v", err)
-	}
-	if len(matches) != 0 {
-		t.Fatalf("expected no tmp files, found %v", matches)
-	}
 }

@@ -1,6 +1,7 @@
 package library
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -21,7 +22,8 @@ const (
 
 	// MaxDirectoryEntries bounds both persistent library growth and one scan's
 	// top-level directory read.
-	MaxDirectoryEntries = 10_000
+	MaxDirectoryEntries    = 10_000
+	scanDirectoryBatchSize = 128
 )
 
 var supportedLoopExtensions = map[string]struct{}{
@@ -191,14 +193,52 @@ func ScanDirs(loopDir string, musicDir string) (Library, error) {
 	return scanDirsWithLimit(loopDir, musicDir, MaxDirectoryEntries)
 }
 
+// ScanDirsContext is the cancellable, progress-aware form used by the runtime.
+// progress is called only after a directory batch or entry has actually been
+// processed; callers can therefore use it as an authoritative liveness
+// checkpoint rather than a synthetic heartbeat.
+func ScanDirsContext(
+	ctx context.Context,
+	loopDir string,
+	musicDir string,
+	progress func(),
+) (Library, error) {
+	return scanDirsWithLimitContext(
+		ctx,
+		loopDir,
+		musicDir,
+		MaxDirectoryEntries,
+		scanDirectoryBatchSize,
+		progress,
+	)
+}
+
 func scanDirsWithLimit(loopDir string, musicDir string, limit int) (Library, error) {
+	return scanDirsWithLimitContext(
+		context.Background(),
+		loopDir,
+		musicDir,
+		limit,
+		scanDirectoryBatchSize,
+		nil,
+	)
+}
+
+func scanDirsWithLimitContext(
+	ctx context.Context,
+	loopDir string,
+	musicDir string,
+	limit int,
+	batchSize int,
+	progress func(),
+) (Library, error) {
 	var (
 		lib    Library
 		issues []*Error
 	)
 
-	loops, loopIssues := scanLoops(loopDir, limit)
-	music, musicIssues := scanMusic(musicDir, limit)
+	loops, loopIssues := scanLoops(ctx, loopDir, limit, batchSize, progress)
+	music, musicIssues := scanMusic(ctx, musicDir, limit, batchSize, progress)
 	lib.Loops = loops
 	lib.Music = music
 	issues = append(issues, loopIssues...)
@@ -252,9 +292,18 @@ func (l Library) Summary() Summary {
 	return summary
 }
 
-func scanLoops(mediaDir string, limit int) ([]Loop, []*Error) {
-	dir := mediaDir
-	entries, issue := readDirectoryEntries(dir, KindLoop, limit)
+func scanLoops(
+	ctx context.Context,
+	mediaDir string,
+	limit int,
+	batchSize int,
+	progress func(),
+) ([]Loop, []*Error) {
+	dir, err := filepath.Abs(mediaDir)
+	if err != nil {
+		return nil, []*Error{fileError(ErrorReadDirectory, KindLoop, "", "directory", mediaDir, err)}
+	}
+	entries, issue := readDirectoryEntries(ctx, dir, KindLoop, limit, batchSize, progress)
 	if issue != nil {
 		return nil, []*Error{issue}
 	}
@@ -264,25 +313,43 @@ func scanLoops(mediaDir string, limit int) ([]Loop, []*Error) {
 		issues []*Error
 	)
 	for _, entry := range entries {
-		if entry.IsDir() || !IsSupportedLoopExtension(filepath.Ext(entry.Name())) {
-			continue
+		if err := ctx.Err(); err != nil {
+			issues = append(issues, fileError(
+				ErrorReadDirectory,
+				KindLoop,
+				"",
+				"directory",
+				dir,
+				err,
+			))
+			break
 		}
-		parsed, err := ParseLoopFilename(entry.Name())
-		relPath := slashRel(filepath.Join("loops", entry.Name()))
-		if err != nil {
-			issues = append(issues, withFile(err, KindLoop, relPath))
-			continue
-		}
-		loops = append(loops, Loop{
-			ID:       StableID(KindLoop, relPath),
-			Path:     filepath.Join(dir, entry.Name()),
-			RelPath:  relPath,
-			Filename: entry.Name(),
-			Period:   parsed.Period,
-			Theme:    parsed.Theme,
-			Variant:  parsed.Variant,
-			Ext:      parsed.Ext,
-		})
+		func() {
+			defer reportScanProgress(progress)
+			if entry.IsDir() || !IsSupportedLoopExtension(filepath.Ext(entry.Name())) {
+				return
+			}
+			relPath := slashRel(filepath.Join("loops", entry.Name()))
+			if issue := validateScannedAsset(entry, KindLoop, relPath); issue != nil {
+				issues = append(issues, issue)
+				return
+			}
+			parsed, err := ParseLoopFilename(entry.Name())
+			if err != nil {
+				issues = append(issues, withFile(err, KindLoop, relPath))
+				return
+			}
+			loops = append(loops, Loop{
+				ID:       StableID(KindLoop, relPath),
+				Path:     filepath.Join(dir, entry.Name()),
+				RelPath:  relPath,
+				Filename: entry.Name(),
+				Period:   parsed.Period,
+				Theme:    parsed.Theme,
+				Variant:  parsed.Variant,
+				Ext:      parsed.Ext,
+			})
+		}()
 	}
 	sort.Slice(loops, func(i, j int) bool {
 		return loops[i].RelPath < loops[j].RelPath
@@ -290,9 +357,18 @@ func scanLoops(mediaDir string, limit int) ([]Loop, []*Error) {
 	return loops, issues
 }
 
-func scanMusic(mediaDir string, limit int) ([]Music, []*Error) {
-	dir := mediaDir
-	entries, issue := readDirectoryEntries(dir, KindMusic, limit)
+func scanMusic(
+	ctx context.Context,
+	mediaDir string,
+	limit int,
+	batchSize int,
+	progress func(),
+) ([]Music, []*Error) {
+	dir, err := filepath.Abs(mediaDir)
+	if err != nil {
+		return nil, []*Error{fileError(ErrorReadDirectory, KindMusic, "", "directory", mediaDir, err)}
+	}
+	entries, issue := readDirectoryEntries(ctx, dir, KindMusic, limit, batchSize, progress)
 	if issue != nil {
 		return nil, []*Error{issue}
 	}
@@ -302,23 +378,41 @@ func scanMusic(mediaDir string, limit int) ([]Music, []*Error) {
 		issues []*Error
 	)
 	for _, entry := range entries {
-		if entry.IsDir() || !IsSupportedMusicExtension(filepath.Ext(entry.Name())) {
-			continue
+		if err := ctx.Err(); err != nil {
+			issues = append(issues, fileError(
+				ErrorReadDirectory,
+				KindMusic,
+				"",
+				"directory",
+				dir,
+				err,
+			))
+			break
 		}
-		parsed, err := ParseMusicFilename(entry.Name())
-		relPath := slashRel(filepath.Join("music", entry.Name()))
-		if err != nil {
-			issues = append(issues, withFile(err, KindMusic, relPath))
-			continue
-		}
-		music = append(music, Music{
-			ID:       StableID(KindMusic, relPath),
-			Path:     filepath.Join(dir, entry.Name()),
-			RelPath:  relPath,
-			Filename: entry.Name(),
-			Track:    parsed.Track,
-			Ext:      parsed.Ext,
-		})
+		func() {
+			defer reportScanProgress(progress)
+			if entry.IsDir() || !IsSupportedMusicExtension(filepath.Ext(entry.Name())) {
+				return
+			}
+			relPath := slashRel(filepath.Join("music", entry.Name()))
+			if issue := validateScannedAsset(entry, KindMusic, relPath); issue != nil {
+				issues = append(issues, issue)
+				return
+			}
+			parsed, err := ParseMusicFilename(entry.Name())
+			if err != nil {
+				issues = append(issues, withFile(err, KindMusic, relPath))
+				return
+			}
+			music = append(music, Music{
+				ID:       StableID(KindMusic, relPath),
+				Path:     filepath.Join(dir, entry.Name()),
+				RelPath:  relPath,
+				Filename: entry.Name(),
+				Track:    parsed.Track,
+				Ext:      parsed.Ext,
+			})
+		}()
 	}
 	sort.Slice(music, func(i, j int) bool {
 		return music[i].RelPath < music[j].RelPath
@@ -326,7 +420,52 @@ func scanMusic(mediaDir string, limit int) ([]Music, []*Error) {
 	return music, issues
 }
 
-func readDirectoryEntries(dir string, kind Kind, limit int) ([]os.DirEntry, *Error) {
+func validateScannedAsset(entry os.DirEntry, kind Kind, relPath string) *Error {
+	if entry.Type()&os.ModeSymlink != 0 {
+		return fileError(
+			ErrorInvalidAsset,
+			kind,
+			relPath,
+			"type",
+			entry.Type().String(),
+			errors.New("asset must not be a symbolic link"),
+		)
+	}
+	info, err := entry.Info()
+	if err != nil {
+		return fileError(ErrorInvalidAsset, kind, relPath, "stat", "", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fileError(
+			ErrorInvalidAsset,
+			kind,
+			relPath,
+			"type",
+			info.Mode().String(),
+			errors.New("asset must be a regular file"),
+		)
+	}
+	if info.Size() <= 0 {
+		return fileError(
+			ErrorInvalidAsset,
+			kind,
+			relPath,
+			"size",
+			fmt.Sprintf("%d", info.Size()),
+			errors.New("asset must not be empty"),
+		)
+	}
+	return nil
+}
+
+func readDirectoryEntries(
+	ctx context.Context,
+	dir string,
+	kind Kind,
+	limit int,
+	batchSize int,
+	progress func(),
+) ([]os.DirEntry, *Error) {
 	if limit <= 0 {
 		return nil, fileError(
 			ErrorDirectoryCapacity,
@@ -346,9 +485,29 @@ func readDirectoryEntries(dir string, kind Kind, limit int) ([]os.DirEntry, *Err
 	}
 	defer handle.Close()
 
-	entries, err := handle.ReadDir(limit + 1)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, fileError(ErrorReadDirectory, kind, "", "directory", dir, err)
+	if batchSize <= 0 {
+		batchSize = scanDirectoryBatchSize
+	}
+	entries := make([]os.DirEntry, 0, min(limit+1, batchSize))
+	for len(entries) <= limit {
+		if err := ctx.Err(); err != nil {
+			return nil, fileError(ErrorReadDirectory, kind, "", "directory", dir, err)
+		}
+		readSize := min(batchSize, limit+1-len(entries))
+		batch, readErr := handle.ReadDir(readSize)
+		entries = append(entries, batch...)
+		if len(batch) > 0 {
+			reportScanProgress(progress)
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return nil, fileError(ErrorReadDirectory, kind, "", "directory", dir, readErr)
+		}
+		if len(entries) > limit {
+			break
+		}
 	}
 	if len(entries) > limit {
 		return nil, fileError(
@@ -364,6 +523,12 @@ func readDirectoryEntries(dir string, kind Kind, limit int) ([]os.DirEntry, *Err
 		return entries[i].Name() < entries[j].Name()
 	})
 	return entries, nil
+}
+
+func reportScanProgress(progress func()) {
+	if progress != nil {
+		progress()
+	}
 }
 
 func withFile(err error, kind Kind, path string) *Error {

@@ -86,20 +86,19 @@ func TestDroppedEventLoggingDoesNotBlockStatusOrCloseUnderClientMutex(t *testing
 		release: make(chan struct{}),
 	}
 	client, err := NewClient(Options{
-		URL:             "ws://unused.invalid",
-		MediaSourceName: "queue",
-		EventBuffer:     1,
-		Logger:          slog.New(blocker),
+		URL:         "ws://unused.invalid",
+		EventBuffer: 1,
+		Logger:      slog.New(blocker),
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	client.currentFiles["queue"] = "/tmp/current.mp4"
+	client.currentFiles["loop"] = "/tmp/current.mp4"
 	client.events <- Event{Type: EventMediaEnded}
 
 	handled := make(chan struct{})
 	go func() {
-		client.handleEvent(mediaEndedEvent("queue").D)
+		client.handleEvent(mediaEndedEvent("loop").D)
 		close(handled)
 	}()
 	select {
@@ -136,6 +135,69 @@ func TestDroppedEventLoggingDoesNotBlockStatusOrCloseUnderClientMutex(t *testing
 	case <-handled:
 	case <-time.After(time.Second):
 		t.Fatal("event handler did not return after logger unblocked")
+	}
+}
+
+func TestDroppedSupersededEventLoggingDoesNotBlockStatusOrCloseUnderClientMutex(t *testing.T) {
+	blocker := &blockingLogHandler{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	client, err := NewClient(Options{
+		URL:         "ws://unused.invalid",
+		EventBuffer: 1,
+		Logger:      slog.New(blocker),
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	client.setCurrentFile("loop", "/tmp/current.mp4")
+	client.supersededFiles["loop"] = []supersededSourceFile{{
+		path:  "/tmp/superseded.mp4",
+		until: time.Now().Add(time.Minute),
+	}}
+	client.events <- Event{Type: EventMediaEnded}
+
+	handled := make(chan struct{})
+	go func() {
+		client.handleEvent(mediaEndedEvent("loop").D)
+		close(handled)
+	}()
+	select {
+	case <-blocker.started:
+	case <-time.After(time.Second):
+		t.Fatal("superseded event-drop warning did not reach blocking logger")
+	}
+
+	statusDone := make(chan Status, 1)
+	go func() {
+		statusDone <- client.Status()
+	}()
+	select {
+	case <-statusDone:
+		assertCurrentFile(t, client, "loop", "/tmp/current.mp4")
+	case <-time.After(time.Second):
+		t.Fatal("Status blocked behind superseded event-drop logging")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- client.Close()
+	}()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked behind superseded event-drop logging")
+	}
+
+	close(blocker.release)
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("superseded event handler did not return after logger unblocked")
 	}
 }
 
@@ -193,10 +255,9 @@ func TestClientConnectRejectsConfiguredPasswordWithoutAuthentication(t *testing.
 
 	const password = "configured-password"
 	client, err := NewClient(Options{
-		URL:             server.URL,
-		Password:        password,
-		MediaSourceName: "media",
-		RequestTimeout:  time.Second,
+		URL:            server.URL,
+		Password:       password,
+		RequestTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -484,7 +545,7 @@ func TestClientGetInputSettingsDecodesMediaLocalFile(t *testing.T) {
 		}
 	}()
 
-	settings, err := client.GetInputSettings(context.Background(), "media")
+	settings, err := client.GetInputSettings(context.Background(), "loop")
 	if err != nil {
 		t.Fatalf("GetInputSettings: %v", err)
 	}
@@ -492,8 +553,8 @@ func TestClientGetInputSettingsDecodesMediaLocalFile(t *testing.T) {
 	if req.RequestType != "GetInputSettings" {
 		t.Fatalf("request type = %q, want GetInputSettings", req.RequestType)
 	}
-	if got := req.RequestData["inputName"]; got != "media" {
-		t.Fatalf("inputName = %v, want media", got)
+	if got := req.RequestData["inputName"]; got != "loop" {
+		t.Fatalf("inputName = %v, want loop", got)
 	}
 	if settings.LocalFile != "/media/current.mp4" {
 		t.Fatalf("local file = %q, want /media/current.mp4", settings.LocalFile)
@@ -531,7 +592,7 @@ func TestMediaStateConstantsMatchOBSWebSocketProtocol(t *testing.T) {
 	}
 }
 
-func TestClientPlayFileSendsMediaRequestsAndCentersSource(t *testing.T) {
+func TestClientPlaySourceFileSendsMediaRequestsAndCentersLoopSource(t *testing.T) {
 	requests := make(chan requestDataPayload, 6)
 	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
 		if err := readIdentify(conn); err != nil {
@@ -566,23 +627,26 @@ func TestClientPlayFileSendsMediaRequestsAndCentersSource(t *testing.T) {
 		}
 	}()
 
-	if err := client.PlayFile(context.Background(), "/tmp/media.mp4"); err != nil {
-		t.Fatalf("PlayFile: %v", err)
+	if err := client.PlaySourceFile(context.Background(), "loop", "/tmp/loop.mp4", PlaySourceOptions{
+		Restart:         true,
+		CenterSceneItem: true,
+	}); err != nil {
+		t.Fatalf("PlaySourceFile: %v", err)
 	}
 
 	first := receiveRequest(t, requests)
 	if first.RequestType != "SetInputSettings" {
 		t.Fatalf("first request type = %q, want SetInputSettings", first.RequestType)
 	}
-	if got := first.RequestData["inputName"]; got != "media" {
-		t.Fatalf("SetInputSettings inputName = %v, want media", got)
+	if got := first.RequestData["inputName"]; got != "loop" {
+		t.Fatalf("SetInputSettings inputName = %v, want loop", got)
 	}
 	settings, ok := first.RequestData["inputSettings"].(map[string]any)
 	if !ok {
 		t.Fatalf("SetInputSettings inputSettings = %T, want map[string]any", first.RequestData["inputSettings"])
 	}
-	if got := settings["local_file"]; got != "/tmp/media.mp4" {
-		t.Fatalf("local_file = %v, want /tmp/media.mp4", got)
+	if got := settings["local_file"]; got != "/tmp/loop.mp4" {
+		t.Fatalf("local_file = %v, want /tmp/loop.mp4", got)
 	}
 
 	second := receiveRequest(t, requests)
@@ -602,8 +666,8 @@ func TestClientPlayFileSendsMediaRequestsAndCentersSource(t *testing.T) {
 	if got := fourth.RequestData["sceneName"]; got != "Main" {
 		t.Fatalf("GetSceneItemId sceneName = %v, want Main", got)
 	}
-	if got := fourth.RequestData["sourceName"]; got != "media" {
-		t.Fatalf("GetSceneItemId sourceName = %v, want media", got)
+	if got := fourth.RequestData["sourceName"]; got != "loop" {
+		t.Fatalf("GetSceneItemId sourceName = %v, want loop", got)
 	}
 
 	fifth := receiveRequest(t, requests)
@@ -639,19 +703,17 @@ func TestClientPlayFileSendsMediaRequestsAndCentersSource(t *testing.T) {
 	if sixth.RequestType != "TriggerMediaInputAction" {
 		t.Fatalf("sixth request type = %q, want TriggerMediaInputAction", sixth.RequestType)
 	}
-	if got := sixth.RequestData["inputName"]; got != "media" {
-		t.Fatalf("TriggerMediaInputAction inputName = %v, want media", got)
+	if got := sixth.RequestData["inputName"]; got != "loop" {
+		t.Fatalf("TriggerMediaInputAction inputName = %v, want loop", got)
 	}
 	if got := sixth.RequestData["mediaAction"]; got != mediaActionRestart {
 		t.Fatalf("mediaAction = %v, want %s", got, mediaActionRestart)
 	}
-	if got := client.Status().CurrentFile; got != "/tmp/media.mp4" {
-		t.Fatalf("Status().CurrentFile = %q, want /tmp/media.mp4", got)
-	}
+	assertCurrentFile(t, client, "loop", "/tmp/loop.mp4")
 }
 
-func TestClientPlayFileRestartsWhenCenteringFails(t *testing.T) {
-	requests := make(chan requestDataPayload, 3)
+func TestClientPlaySourceFileReportsPossibleMutationWhenCenteringFails(t *testing.T) {
+	requests := make(chan requestDataPayload, 2)
 	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
 		if err := readIdentify(conn); err != nil {
 			return err
@@ -659,7 +721,7 @@ func TestClientPlayFileRestartsWhenCenteringFails(t *testing.T) {
 		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
 			return err
 		}
-		for i := 0; i < 3; i++ {
+		for i := 0; i < 2; i++ {
 			req, err := readRequest(conn)
 			if err != nil {
 				return err
@@ -691,8 +753,12 @@ func TestClientPlayFileRestartsWhenCenteringFails(t *testing.T) {
 		}
 	}()
 
-	if err := client.PlayFile(context.Background(), "/tmp/media.mp4"); err != nil {
-		t.Fatalf("PlayFile should ignore centering failure: %v", err)
+	err := client.PlaySourceFile(context.Background(), "loop", "/tmp/loop.mp4", PlaySourceOptions{
+		Restart:         true,
+		CenterSceneItem: true,
+	})
+	if !errors.Is(err, ErrSourceMayBeMutated) {
+		t.Fatalf("PlaySourceFile error = %v, want possible-mutation sentinel", err)
 	}
 
 	if first := receiveRequest(t, requests); first.RequestType != "SetInputSettings" {
@@ -701,13 +767,7 @@ func TestClientPlayFileRestartsWhenCenteringFails(t *testing.T) {
 	if second := receiveRequest(t, requests); second.RequestType != "GetCurrentProgramScene" {
 		t.Fatalf("second request type = %q, want GetCurrentProgramScene", second.RequestType)
 	}
-	third := receiveRequest(t, requests)
-	if third.RequestType != "TriggerMediaInputAction" {
-		t.Fatalf("third request type = %q, want TriggerMediaInputAction", third.RequestType)
-	}
-	if got := third.RequestData["mediaAction"]; got != mediaActionRestart {
-		t.Fatalf("mediaAction = %v, want %s", got, mediaActionRestart)
-	}
+	assertNoCurrentFile(t, client, "loop")
 }
 
 func TestClientPlaySourceFileSendsSourceSettingsOptionsAndSkipsCentering(t *testing.T) {
@@ -797,9 +857,6 @@ func TestClientPlaySourceFileSendsSourceSettingsOptionsAndSkipsCentering(t *test
 	if got := third.RequestData["mediaAction"]; got != mediaActionRestart {
 		t.Fatalf("mediaAction = %v, want %s", got, mediaActionRestart)
 	}
-	if got := client.Status().CurrentFile; got != "" {
-		t.Fatalf("Status().CurrentFile = %q, want empty default current file", got)
-	}
 	assertCurrentFile(t, client, "music", "/tmp/music.mp3")
 }
 
@@ -838,7 +895,7 @@ func TestClientPlaySourceFileCentersRequestedSource(t *testing.T) {
 		}
 	}()
 
-	if err := client.PlaySourceFile(context.Background(), "bumper", "/tmp/bumper.mp4", PlaySourceOptions{
+	if err := client.PlaySourceFile(context.Background(), "loop", "/tmp/loop.mp4", PlaySourceOptions{
 		Restart:         true,
 		CenterSceneItem: true,
 	}); err != nil {
@@ -858,8 +915,8 @@ func TestClientPlaySourceFileCentersRequestedSource(t *testing.T) {
 	if fourth.RequestType != "GetSceneItemId" {
 		t.Fatalf("fourth request type = %q, want GetSceneItemId", fourth.RequestType)
 	}
-	if got := fourth.RequestData["sourceName"]; got != "bumper" {
-		t.Fatalf("GetSceneItemId sourceName = %v, want bumper", got)
+	if got := fourth.RequestData["sourceName"]; got != "loop" {
+		t.Fatalf("GetSceneItemId sourceName = %v, want loop", got)
 	}
 	if fifth := receiveRequest(t, requests); fifth.RequestType != "SetSceneItemTransform" {
 		t.Fatalf("fifth request type = %q, want SetSceneItemTransform", fifth.RequestType)
@@ -868,8 +925,8 @@ func TestClientPlaySourceFileCentersRequestedSource(t *testing.T) {
 	if sixth.RequestType != "TriggerMediaInputAction" {
 		t.Fatalf("sixth request type = %q, want TriggerMediaInputAction", sixth.RequestType)
 	}
-	if got := sixth.RequestData["inputName"]; got != "bumper" {
-		t.Fatalf("TriggerMediaInputAction inputName = %v, want bumper", got)
+	if got := sixth.RequestData["inputName"]; got != "loop" {
+		t.Fatalf("TriggerMediaInputAction inputName = %v, want loop", got)
 	}
 }
 
@@ -930,70 +987,6 @@ func TestClientStopSourceStopsRequestedSourceAndClearsCurrentFile(t *testing.T) 
 		t.Fatalf("mediaAction = %v, want %s", got, mediaActionStop)
 	}
 	assertNoCurrentFile(t, client, "music")
-}
-
-func TestClientStopCurrentStopsDefaultSourceAndClearsStatus(t *testing.T) {
-	requests := make(chan requestDataPayload, 2)
-	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
-		if err := readIdentify(conn); err != nil {
-			return err
-		}
-		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
-			return err
-		}
-		for i := 0; i < 2; i++ {
-			req, err := readRequest(conn)
-			if err != nil {
-				return err
-			}
-			requests <- req
-			if err := writeEnvelope(conn, successfulRequestResponse(req)); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	defer server.Close()
-
-	client := newTestClient(t, server.URL, time.Second)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := client.Connect(ctx); err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	defer func() {
-		if err := client.Close(); err != nil {
-			t.Fatalf("client.Close() error: %v", err)
-		}
-	}()
-
-	if err := client.PlaySourceFile(context.Background(), "media", "/tmp/media.mp4", PlaySourceOptions{}); err != nil {
-		t.Fatalf("PlaySourceFile: %v", err)
-	}
-	if got := client.Status().CurrentFile; got != "/tmp/media.mp4" {
-		t.Fatalf("Status().CurrentFile = %q, want /tmp/media.mp4", got)
-	}
-	if err := client.StopCurrent(context.Background()); err != nil {
-		t.Fatalf("StopCurrent: %v", err)
-	}
-
-	if first := receiveRequest(t, requests); first.RequestType != "SetInputSettings" {
-		t.Fatalf("first request type = %q, want SetInputSettings", first.RequestType)
-	}
-	second := receiveRequest(t, requests)
-	if second.RequestType != "TriggerMediaInputAction" {
-		t.Fatalf("second request type = %q, want TriggerMediaInputAction", second.RequestType)
-	}
-	if got := second.RequestData["inputName"]; got != "media" {
-		t.Fatalf("TriggerMediaInputAction inputName = %v, want media", got)
-	}
-	if got := second.RequestData["mediaAction"]; got != mediaActionStop {
-		t.Fatalf("mediaAction = %v, want %s", got, mediaActionStop)
-	}
-	if got := client.Status().CurrentFile; got != "" {
-		t.Fatalf("Status().CurrentFile = %q, want empty after StopCurrent", got)
-	}
-	assertNoCurrentFile(t, client, "media")
 }
 
 func TestClientEmitsPlayedSourceEndedEventWithPathAndIgnoresUnrelatedInputs(t *testing.T) {
@@ -1064,6 +1057,143 @@ func TestClientEmitsPlayedSourceEndedEventWithPathAndIgnoresUnrelatedInputs(t *t
 		t.Fatalf("event path = %q, want /tmp/music.mp3", event.Path)
 	}
 	waitForSignal(t, wrotePlayed, "server did not write played event")
+	assertNoCurrentFile(t, client, "music")
+}
+
+func TestClientDoesNotAttributeSupersededEndedEventToCurrentPath(t *testing.T) {
+	sendEnded := make(chan struct{})
+	wroteEnded := make(chan struct{}, 1)
+	defer close(sendEnded)
+
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		for i := 0; i < 2; i++ {
+			req, err := readRequest(conn)
+			if err != nil {
+				return err
+			}
+			if err := writeEnvelope(conn, successfulRequestResponse(req)); err != nil {
+				return err
+			}
+		}
+		<-sendEnded
+		if err := writeEnvelope(conn, mediaEndedEvent("music")); err != nil {
+			return err
+		}
+		wroteEnded <- struct{}{}
+		return nil
+	})
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
+
+	if err := client.PlaySourceFile(context.Background(), "music", "/tmp/old.mp3", PlaySourceOptions{}); err != nil {
+		t.Fatalf("PlaySourceFile old: %v", err)
+	}
+	if err := client.PlaySourceFile(context.Background(), "music", "/tmp/new.mp3", PlaySourceOptions{}); err != nil {
+		t.Fatalf("PlaySourceFile new: %v", err)
+	}
+
+	sendEnded <- struct{}{}
+	event := receiveEvent(t, client.Events())
+	if event.InputName != "music" {
+		t.Fatalf("event inputName = %q, want music", event.InputName)
+	}
+	if event.Path != "/tmp/old.mp3" {
+		t.Fatalf("event path = %q, want superseded path /tmp/old.mp3", event.Path)
+	}
+	waitForSignal(t, wroteEnded, "server did not write ended event")
+	assertCurrentFile(t, client, "music", "/tmp/new.mp3")
+}
+
+func TestClientQueuesMultipleSupersededEndedEvents(t *testing.T) {
+	sendEnded := make(chan struct{})
+	wroteEnded := make(chan struct{}, 3)
+	defer close(sendEnded)
+
+	server := newOBSTestServer(t, func(conn *websocket.Conn) error {
+		if err := readIdentify(conn); err != nil {
+			return err
+		}
+		if err := writeEnvelope(conn, envelope{Op: opIdentified}); err != nil {
+			return err
+		}
+		for i := 0; i < 3; i++ {
+			req, err := readRequest(conn)
+			if err != nil {
+				return err
+			}
+			if err := writeEnvelope(conn, successfulRequestResponse(req)); err != nil {
+				return err
+			}
+		}
+		for i := 0; i < 3; i++ {
+			<-sendEnded
+			if err := writeEnvelope(conn, mediaEndedEvent("music")); err != nil {
+				return err
+			}
+			wroteEnded <- struct{}{}
+		}
+		return nil
+	})
+	defer server.Close()
+
+	client := newTestClient(t, server.URL, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close() error: %v", err)
+		}
+	}()
+
+	if err := client.PlaySourceFile(context.Background(), "music", "/tmp/old.mp3", PlaySourceOptions{}); err != nil {
+		t.Fatalf("PlaySourceFile old: %v", err)
+	}
+	if err := client.PlaySourceFile(context.Background(), "music", "/tmp/middle.mp3", PlaySourceOptions{}); err != nil {
+		t.Fatalf("PlaySourceFile middle: %v", err)
+	}
+	if err := client.PlaySourceFile(context.Background(), "music", "/tmp/new.mp3", PlaySourceOptions{}); err != nil {
+		t.Fatalf("PlaySourceFile new: %v", err)
+	}
+
+	for _, wantPath := range []string{"/tmp/old.mp3", "/tmp/middle.mp3"} {
+		sendEnded <- struct{}{}
+		event := receiveEvent(t, client.Events())
+		if event.InputName != "music" {
+			t.Fatalf("event inputName = %q, want music", event.InputName)
+		}
+		if event.Path != wantPath {
+			t.Fatalf("event path = %q, want superseded path %q", event.Path, wantPath)
+		}
+		waitForSignal(t, wroteEnded, "server did not write superseded ended event")
+		assertCurrentFile(t, client, "music", "/tmp/new.mp3")
+	}
+
+	sendEnded <- struct{}{}
+	event := receiveEvent(t, client.Events())
+	if event.Path != "/tmp/new.mp3" {
+		t.Fatalf("event path = %q, want current path /tmp/new.mp3", event.Path)
+	}
+	waitForSignal(t, wroteEnded, "server did not write current ended event")
 	assertNoCurrentFile(t, client, "music")
 }
 
@@ -1459,9 +1589,8 @@ func newOBSTestServer(t *testing.T, handle func(*websocket.Conn) error) obsTestS
 func newTestClient(t *testing.T, url string, requestTimeout time.Duration) *Client {
 	t.Helper()
 	client, err := NewClient(Options{
-		URL:             url,
-		MediaSourceName: "media",
-		RequestTimeout:  requestTimeout,
+		URL:            url,
+		RequestTimeout: requestTimeout,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)

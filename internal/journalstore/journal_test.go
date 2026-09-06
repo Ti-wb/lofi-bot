@@ -1,4 +1,4 @@
-package queue
+package journalstore
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 
 func TestTelegramJournalMigrationIsAtomic(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	dbPath := filepath.Join(t.TempDir(), "journal.db")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("open incompatible database: %v", err)
@@ -107,14 +107,14 @@ func TestTelegramUpdateSuccessorBoundaries(t *testing.T) {
 
 func TestTelegramJournalRejectsMaxIntBeforeMutationAndKeepsMaxCheckpointValid(t *testing.T) {
 	ctx := context.Background()
-	store := openStoreAtPath(t, ctx, filepath.Join(t.TempDir(), "queue.db"))
+	store := openStoreAtPath(t, ctx, filepath.Join(t.TempDir(), "journal.db"))
 	defer store.Close()
 
 	_, _, _, err := store.BeginUpdateAttempt(
 		ctx,
 		math.MaxInt,
 		"message",
-		"queue",
+		"library",
 		-100123,
 		55,
 		42,
@@ -138,7 +138,7 @@ func TestTelegramJournalRejectsMaxIntBeforeMutationAndKeepsMaxCheckpointValid(t 
 		ctx,
 		math.MaxInt-1,
 		"message",
-		"queue",
+		"library",
 		-100123,
 		56,
 		42,
@@ -180,7 +180,7 @@ func TestTelegramJournalRejectsMaxIntBeforeMutationAndKeepsMaxCheckpointValid(t 
 
 func TestTelegramJournalAbortReleasesLegacyMaxIntClaim(t *testing.T) {
 	ctx := context.Background()
-	store := openStoreAtPath(t, ctx, filepath.Join(t.TempDir(), "queue.db"))
+	store := openStoreAtPath(t, ctx, filepath.Join(t.TempDir(), "journal.db"))
 	defer store.Close()
 
 	now := store.nowUTC()
@@ -189,7 +189,7 @@ INSERT INTO telegram_update_attempts (
 	update_id, update_kind, action, chat_id, message_id, actor_id,
 	attempt_count, failure_count, status, owner_token, lease_until,
 	last_error, created_at, updated_at, finished_at
-) VALUES (?, 'message', 'queue', -100123, 55, 42, 1, 0, ?, ?, ?, '', ?, ?, NULL)
+) VALUES (?, 'message', 'library', -100123, 55, 42, 1, 0, ?, ?, ?, '', ?, ?, NULL)
 `,
 		math.MaxInt,
 		telegramAttemptRunning,
@@ -225,7 +225,7 @@ WHERE update_id = ?
 
 func TestTelegramJournalPersistsCheckpointAndPoisonAttemptsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	dbPath := filepath.Join(t.TempDir(), "journal.db")
 
 	store := openStoreAtPath(t, ctx, dbPath)
 	next, confirmed, err := store.LoadUpdateCheckpoint(ctx)
@@ -242,7 +242,7 @@ func TestTelegramJournalPersistsCheckpointAndPoisonAttemptsAcrossReopen(t *testi
 			ctx,
 			10,
 			"message",
-			"queue",
+			"library",
 			-100123,
 			55,
 			42,
@@ -401,7 +401,7 @@ UPDATE telegram_poll_checkpoint SET next_offset = 11 WHERE singleton = 1
 
 func TestTelegramJournalCrossProcessClaimLeaseAndCrashPoison(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	dbPath := filepath.Join(t.TempDir(), "journal.db")
 	first := openStoreAtPath(t, ctx, dbPath)
 	defer first.Close()
 	second := openStoreAtPath(t, ctx, dbPath)
@@ -430,7 +430,7 @@ func TestTelegramJournalCrossProcessClaimLeaseAndCrashPoison(t *testing.T) {
 			ctx,
 			20,
 			"message",
-			"queue",
+			"library",
 			-100123,
 			1,
 			42,
@@ -483,7 +483,7 @@ func TestTelegramJournalCrossProcessClaimLeaseAndCrashPoison(t *testing.T) {
 		ctx,
 		30,
 		"message",
-		"queue",
+		"library",
 		-100123,
 		2,
 		42,
@@ -504,7 +504,7 @@ func TestTelegramJournalCrossProcessClaimLeaseAndCrashPoison(t *testing.T) {
 		ctx,
 		30,
 		"message",
-		"queue",
+		"library",
 		-100123,
 		2,
 		42,
@@ -527,7 +527,7 @@ func TestTelegramJournalCrossProcessClaimLeaseAndCrashPoison(t *testing.T) {
 			ctx,
 			30,
 			"message",
-			"queue",
+			"library",
 			-100123,
 			2,
 			42,
@@ -571,7 +571,7 @@ func TestTelegramJournalCrossProcessClaimLeaseAndCrashPoison(t *testing.T) {
 
 func TestTelegramJournalForwardClockJumpReclaimsAndFencesOldJournalOwner(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	dbPath := filepath.Join(t.TempDir(), "journal.db")
 	first := openStoreAtPath(t, ctx, dbPath)
 	defer first.Close()
 	second := openStoreAtPath(t, ctx, dbPath)
@@ -584,7 +584,7 @@ func TestTelegramJournalForwardClockJumpReclaimsAndFencesOldJournalOwner(t *test
 		ctx,
 		40,
 		"message",
-		"queue",
+		"library",
 		-100123,
 		3,
 		42,
@@ -616,7 +616,7 @@ func TestTelegramJournalForwardClockJumpReclaimsAndFencesOldJournalOwner(t *test
 		ctx,
 		40,
 		"message",
-		"queue",
+		"library",
 		-100123,
 		3,
 		42,
@@ -828,7 +828,7 @@ func TestTelegramJournalCompletionAndConfirmationFailuresDoNotAdvance(t *testing
 		ctx,
 		20,
 		"message",
-		"queue",
+		"library",
 		-100123,
 		1,
 		42,
@@ -1101,7 +1101,7 @@ func TestTelegramJournalOperationsRespectContextWhileConnectionIsHeld(t *testing
 					ctx,
 					50,
 					"message",
-					"queue",
+					"library",
 					-100123,
 					4,
 					42,
@@ -1131,7 +1131,7 @@ func TestTelegramJournalOperationsRespectContextWhileConnectionIsHeld(t *testing
 					operationCtx,
 					50,
 					"message",
-					"queue",
+					"library",
 					-100123,
 					4,
 					42,
@@ -1158,6 +1158,15 @@ func openStoreAtPath(t *testing.T, ctx context.Context, path string) *Store {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
+	return store
+}
+
+func openTestStore(t *testing.T, ctx context.Context) *Store {
+	t.Helper()
+	store := openStoreAtPath(t, ctx, filepath.Join(t.TempDir(), "journal.db"))
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
 	return store
 }
 

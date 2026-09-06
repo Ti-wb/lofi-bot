@@ -100,6 +100,8 @@ func metadataForUpdate(update tgbotapi.Update) (metadata updateMetadata) {
 			metadata.action = "upload_video"
 		case message.Document != nil:
 			metadata.action = "upload_document"
+		case message.Audio != nil:
+			metadata.action = "upload_audio"
 		}
 		return metadata
 	}
