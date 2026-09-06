@@ -44,6 +44,7 @@ func VerifyTrace(path string) (Verdict, error) {
 	records := make([]Record, 0, len(rawLines))
 	var header Record
 	var previousElapsed int64
+	seenRestart := false
 	offset := int64(0)
 
 	for idx, line := range rawLines {
@@ -71,6 +72,12 @@ func VerifyTrace(path string) (Verdict, error) {
 			header = record
 		} else if err := validateBodyRecord(record, header); err != nil {
 			return Verdict{}, err
+		}
+		if record.Kind == "media_action" && record.Action == "restart" {
+			seenRestart = true
+		}
+		if record.Kind == "playback_ended" && seenRestart && record.LastRestartSeq == 0 {
+			return Verdict{}, ErrInvalidTrace
 		}
 		if record.Kind == "stopped" {
 			if idx != len(rawLines)-1 ||
@@ -210,7 +217,7 @@ func recordFieldsAllowed(kind string, actual map[string]struct{}) bool {
 			"event", "input", "basename", "last_restart_seq",
 			"since_restart_ns",
 		}
-		requiredSpecific = specific
+		requiredSpecific = []string{"event", "input", "basename"}
 	case "integrity_failure":
 		specific = []string{"reason"}
 		requiredSpecific = specific
@@ -317,10 +324,16 @@ func validateBodyRecord(record Record, header Record) error {
 	case "playback_ended":
 		if record.Event != "MediaInputPlaybackEnded" ||
 			!validCommon() ||
-			record.LastRestartSeq == 0 ||
-			record.LastRestartSeq >= record.Seq ||
-			record.SinceRestartNS == nil ||
-			*record.SinceRestartNS < 0 {
+			record.LastRestartSeq >= record.Seq {
+			return ErrInvalidTrace
+		}
+		// A track already playing when capture starts can end before the first
+		// observed restart. Such an event cannot be a correlation candidate.
+		if record.LastRestartSeq == 0 {
+			if record.SinceRestartNS != nil {
+				return ErrInvalidTrace
+			}
+		} else if record.SinceRestartNS == nil || *record.SinceRestartNS < 0 {
 			return ErrInvalidTrace
 		}
 	case "stopped":

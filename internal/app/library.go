@@ -35,9 +35,10 @@ type libraryPlaybackSelectionSnapshot struct {
 }
 
 type obsFailClosedBudget struct {
-	once   sync.Once
-	ctx    context.Context
-	cancel context.CancelFunc
+	// Cleanup operations are serialized by playbackMu. Charge only time spent
+	// in cleanup, so later playback attempts do not consume this reserve.
+	remaining time.Duration
+	ctx       context.Context
 }
 
 type obsFailClosedBudgetContextKey struct{}
@@ -715,6 +716,9 @@ func (s *Service) playOBSFileLocked(
 	path string,
 	options obs.PlaySourceOptions,
 ) error {
+	if budget, ok := ctx.Value(obsFailClosedBudgetContextKey{}).(*obsFailClosedBudget); ok && budget.remaining <= 0 {
+		return context.DeadlineExceeded
+	}
 	playCtx, cancelPlay := s.libraryPlaybackOperationContext(ctx)
 	err := s.obs.PlaySourceFile(playCtx, sourceName, path, options)
 	cancelPlay()
@@ -759,13 +763,15 @@ func (s *Service) obsFailClosedContext(
 		cleanupTimeout = defaultOBSFailClosedBudgetTimeout
 	}
 	if budget, ok := ctx.Value(obsFailClosedBudgetContextKey{}).(*obsFailClosedBudget); ok {
-		budget.once.Do(func() {
-			budget.ctx, budget.cancel = context.WithTimeout(
-				context.WithoutCancel(ctx),
-				cleanupTimeout,
-			)
-		})
-		return budget.ctx, func() {}
+		started := time.Now()
+		cleanupCtx, cancel := context.WithTimeout(budget.ctx, budget.remaining)
+		var once sync.Once
+		return cleanupCtx, func() {
+			once.Do(func() {
+				cancel()
+				budget.remaining -= time.Since(started)
+			})
+		}
 	}
 	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 }
@@ -794,13 +800,14 @@ func (s *Service) withOBSFailClosedBudget(
 	if _, ok := ctx.Value(obsFailClosedBudgetContextKey{}).(*obsFailClosedBudget); ok {
 		return ctx, func() {}
 	}
-	budget := &obsFailClosedBudget{}
-	budgetCtx := context.WithValue(ctx, obsFailClosedBudgetContextKey{}, budget)
-	return budgetCtx, func() {
-		if budget.cancel != nil {
-			budget.cancel()
-		}
+	cleanupTimeout := s.obsCleanupTimeout
+	if cleanupTimeout <= 0 {
+		cleanupTimeout = defaultOBSFailClosedBudgetTimeout
 	}
+	cleanupCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	budget := &obsFailClosedBudget{remaining: cleanupTimeout, ctx: cleanupCtx}
+	budgetCtx := context.WithValue(ctx, obsFailClosedBudgetContextKey{}, budget)
+	return budgetCtx, cancel
 }
 
 func (s *Service) playLibraryLoopLocked(ctx context.Context, loop medialib.Loop, info medialib.PeriodInfo) error {

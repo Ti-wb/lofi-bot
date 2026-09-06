@@ -10,11 +10,51 @@ import (
 
 type verifyScenario struct {
 	delta            time.Duration
+	initialEnded     bool
+	omitRestart      bool
 	lateASnapshot    bool
 	otherBetween     bool
 	duplicateBChange bool
 	thirdRestart     bool
 	switchAfterB     bool
+}
+
+func TestVerifyTraceAllowsEndBeforeFirstObservedRestart(t *testing.T) {
+	path := writeVerificationTrace(t, verifyScenario{initialEnded: true})
+	if verdict, err := VerifyTrace(path); err != nil || verdict.Result != "pass" {
+		t.Fatalf("later A/B correlation rejected after initial ended event: verdict=%+v err=%v", verdict, err)
+	}
+}
+
+func TestVerifyTraceDoesNotCorrelateInitialEndAlone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "initial-end.jsonl")
+	start := time.Now()
+	writer, err := NewTraceWriter(path, start, DefaultMaxTraceBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.WriteHeader(start, validTestHeader(DefaultMaxTraceBytes)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write(start.Add(time.Millisecond), Record{
+		Kind: "playback_ended", Event: "MediaInputPlaybackEnded",
+		Input: "tg_music_player", Basename: "music_stale-short-a.m4a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(start.Add(time.Second), "signal"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyTrace(path); !errors.Is(err, ErrNoCorrelation) {
+		t.Fatalf("initial end error = %v, want valid trace without correlation", err)
+	}
+}
+
+func TestVerifyTraceStillRequiresMetadataAfterObservedRestart(t *testing.T) {
+	path := writeVerificationTrace(t, verifyScenario{omitRestart: true})
+	if _, err := VerifyTrace(path); !errors.Is(err, ErrInvalidTrace) {
+		t.Fatalf("VerifyTrace error = %v, want missing restart metadata rejected", err)
+	}
 }
 
 func TestVerifyTraceAcceptsOnlyBoundedSupersededACorrelation(t *testing.T) {
@@ -175,6 +215,12 @@ func writeVerificationTrace(t *testing.T, scenario verifyScenario) string {
 		Code:                 100,
 		Basename:             "music_stale-short-a.m4a",
 	})
+	if scenario.initialEnded {
+		mustWrite(start.Add(20*time.Millisecond), Record{
+			Kind: "playback_ended", Event: "MediaInputPlaybackEnded",
+			Input: "tg_music_player", Basename: "music_stale-short-a.m4a",
+		})
+	}
 	mustWrite(start.Add(100*time.Millisecond), Record{
 		Kind:     "settings_changed",
 		Event:    "InputSettingsChanged",
@@ -258,14 +304,19 @@ func writeVerificationTrace(t *testing.T, scenario verifyScenario) string {
 
 	endedAt := time.Duration(bRestart.ElapsedNS) + scenario.delta
 	since := int64(scenario.delta)
-	ended := mustWrite(start.Add(endedAt), Record{
+	endedRecord := Record{
 		Kind:           "playback_ended",
 		Event:          "MediaInputPlaybackEnded",
 		Input:          "tg_music_player",
 		Basename:       "music_stale-long-b.m4a",
 		LastRestartSeq: bRestart.Seq,
 		SinceRestartNS: &since,
-	})
+	}
+	if scenario.omitRestart {
+		endedRecord.LastRestartSeq = 0
+		endedRecord.SinceRestartNS = nil
+	}
+	ended := mustWrite(start.Add(endedAt), endedRecord)
 	immediateAt := endedAt + 10*time.Millisecond
 	mustWrite(start.Add(immediateAt), Record{
 		Kind:                 "settings_snapshot",
