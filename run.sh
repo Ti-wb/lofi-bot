@@ -244,6 +244,7 @@ migrate_env() {
     die "ENV_SCHEMA_VERSION $version is newer than this helper supports ($CURRENT_ENV_SCHEMA_VERSION)"
   fi
 
+  validate_legacy_player_mode "${PLAYER_MODE:-}"
   validate_legacy_player_mode "$(dotenv_value PLAYER_MODE)"
 
   ENV_MIGRATION_ADDITIONS=

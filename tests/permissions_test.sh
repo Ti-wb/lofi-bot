@@ -313,6 +313,19 @@ if grep -Eq '^DATABASE_PATH=' "$legacy_queue_fixture/.env"; then
 fi
 printf 'ok - legacy queue mode fails before migration changes .env\n'
 
+sed '/^PLAYER_MODE=/d' "$legacy_queue_fixture/.env.before" >"$legacy_queue_fixture/.env"
+cp "$legacy_queue_fixture/.env" "$legacy_queue_fixture/.env.before"
+if run_fixture "$legacy_queue_fixture" "$legacy_queue_fixture/inherited-queue.log" env PLAYER_MODE=queue ./run.sh env; then
+  fail "inherited queue mode unexpectedly succeeded"
+fi
+cmp "$legacy_queue_fixture/.env.before" "$legacy_queue_fixture/.env" >/dev/null ||
+  fail "rejected inherited queue mode changed .env"
+[ -z "$(find "$legacy_queue_fixture" -maxdepth 1 -name '.env.backup.*' -print)" ] ||
+  fail "rejected inherited queue mode created a backup"
+grep -Fq 'PLAYER_MODE=queue is no longer supported' "$legacy_queue_fixture/inherited-queue.log" ||
+  fail "inherited queue mode did not provide an actionable error"
+printf 'ok - inherited queue mode fails before migration changes .env\n'
+
 new_fixture spaced_paths
 spaced_paths_fixture=$FIXTURE
 awk '
